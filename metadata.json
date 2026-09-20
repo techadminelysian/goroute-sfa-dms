@@ -1,0 +1,8 @@
+{
+  "name": "GoRoute SFA-DMS-V2",
+  "description": "Enterprise C\u0026F, Super Stockist \u0026 TCD distribution management platform with tenant-isolated order capture, inventory tally, claims dashboard, billing \u0026 reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

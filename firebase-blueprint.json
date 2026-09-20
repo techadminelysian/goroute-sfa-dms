@@ -1,0 +1,279 @@
+{
+  "entities": {
+    "tenants": {
+      "title": "Tenants",
+      "description": "Enterprise distribution entities (C&F, Super Stockist, TCD)",
+      "fields": {
+        "id": { "type": "string", "description": "Unique tenant ID" },
+        "name": { "type": "string", "description": "Company / Enterprise legal entity name" },
+        "type": { "type": "string", "description": "CF | SUPER_STOCKIST | TCD" },
+        "logo_url": { "type": "string", "description": "Tenant logo URL" },
+        "accent_color": { "type": "string", "description": "Brand primary hex color" },
+        "gstin": { "type": "string", "description": "Tenant GSTIN registration number" },
+        "address": { "type": "string", "description": "Physical registered address" },
+        "phone": { "type": "string", "description": "Contact phone number" },
+        "email": { "type": "string", "description": "Official contact email" },
+        "created_at": { "type": "string", "description": "ISO timestamp of creation" }
+      }
+    },
+    "tenant_settings": {
+      "title": "Tenant Settings",
+      "description": "Tenant configuration parameters for credit, claims, and accounting",
+      "fields": {
+        "tenant_id": { "type": "string", "description": "Referenced Tenant ID" },
+        "credit_limit_default": { "type": "number", "description": "Default credit limit in INR" },
+        "credit_days_threshold": { "type": "number", "description": "Max credit duration in days" },
+        "claim_recoverable_days": { "type": "number", "description": "Window to recover below-cost claims" },
+        "stock_count_frequency": { "type": "string", "description": "DAILY | WEEKLY | BIWEEKLY | MONTHLY" },
+        "accounting_integration": { "type": "string", "description": "ZOHO | TALLY | SAP | CUSTOM | NONE" },
+        "accounting_sync_status": { "type": "string", "description": "SYNCED | PENDING | DISCONNECTED" },
+        "enabled_channels": { "type": "array", "description": "Enabled channels list (GT, MT, etc)" },
+        "require_stock_gate": { "type": "boolean", "description": "Enforce physical gate stock check" }
+      }
+    },
+    "companies": {
+      "title": "Principal FMCG Companies",
+      "description": "Principal brand manufacturing companies managed by tenant",
+      "fields": {
+        "id": { "type": "string", "description": "Unique company ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "name": { "type": "string", "description": "Company name (Britannia, Amul, etc.)" },
+        "code": { "type": "string", "description": "Short code identifier" },
+        "relationship_type": { "type": "string", "description": "CF | SS | TCD" },
+        "gstin": { "type": "string", "description": "Principal GSTIN" },
+        "contact_person": { "type": "string", "description": "Company representative" },
+        "email": { "type": "string", "description": "Company contact email" },
+        "phone": { "type": "string", "description": "Company phone" }
+      }
+    },
+    "dispatch_points": {
+      "title": "Dispatch Points / Warehouses",
+      "description": "Physical depot, godown or warehouse dispatch facilities",
+      "fields": {
+        "id": { "type": "string", "description": "Unique dispatch point ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "name": { "type": "string", "description": "Godown or depot facility name" },
+        "code": { "type": "string", "description": "Facility code" },
+        "address": { "type": "string", "description": "Physical facility address" },
+        "supervisor_name": { "type": "string", "description": "Depot supervisor name" },
+        "phone": { "type": "string", "description": "Facility contact phone" },
+        "dispatcher_user_id": { "type": "string", "description": "Assigned dispatcher user ID" }
+      }
+    },
+    "skus": {
+      "title": "SKU Product Catalog",
+      "description": "Product master list with MRP, landing cost, selling price and claim metrics",
+      "fields": {
+        "id": { "type": "string", "description": "Unique SKU ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "company_id": { "type": "string", "description": "Principal company ID" },
+        "code": { "type": "string", "description": "Product SKU code / EAN" },
+        "name": { "type": "string", "description": "Product title" },
+        "category": { "type": "string", "description": "Product category" },
+        "hsn_code": { "type": "string", "description": "GST HSN classification code" },
+        "mrp": { "type": "number", "description": "Maximum Retail Price" },
+        "landing_price": { "type": "number", "description": "Distributor procurement landing cost" },
+        "selling_price": { "type": "number", "description": "Billed distributor selling price to trade" },
+        "below_cost_flag": { "type": "boolean", "description": "True if selling below landing cost" },
+        "expected_claim_per_unit": { "type": "number", "description": "Claim recovery margin per unit" },
+        "pack_size": { "type": "string", "description": "Packaging size (e.g. 24x100g)" },
+        "tax_rate": { "type": "number", "description": "GST rate percentage (0, 5, 12, 18)" }
+      }
+    },
+    "retailers": {
+      "title": "Retailers & Outlets",
+      "description": "Retail master with credit limits, channel, and outstanding balances",
+      "fields": {
+        "id": { "type": "string", "description": "Unique retailer outlet ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "name": { "type": "string", "description": "Outlet / Store name" },
+        "code": { "type": "string", "description": "Retailer alphanumeric code" },
+        "channel": { "type": "string", "description": "GT | MT | INSTITUTIONAL | ECOMMERCE | DIRECT" },
+        "beat_name": { "type": "string", "description": "Geographic delivery beat / route" },
+        "gstin": { "type": "string", "description": "Retailer GSTIN if registered" },
+        "address": { "type": "string", "description": "Store delivery address" },
+        "contact_person": { "type": "string", "description": "Shopkeeper or manager name" },
+        "phone": { "type": "string", "description": "Contact mobile number" },
+        "phase_status": { "type": "string", "description": "LEAD | VERIFIED | ACTIVE | BLOCKED" },
+        "credit_limit": { "type": "number", "description": "Authorized credit limit in INR" },
+        "current_outstanding": { "type": "number", "description": "Current unpaid ledger balance" }
+      }
+    },
+    "distributors": {
+      "title": "Distributors & Institutions",
+      "description": "Distributor and institutional client master with credit terms, onboarded directly by Billing Executives with no beat dependencies",
+      "fields": {
+        "id": { "type": "string", "description": "Unique distributor or institution ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "name": { "type": "string", "description": "Firm or institution name" },
+        "code": { "type": "string", "description": "Unique alphanumeric code (DST-xxx / INS-xxx)" },
+        "channel": { "type": "string", "description": "DISTRIBUTOR | INSTITUTIONAL" },
+        "beat_name": { "type": "string", "description": "Direct / Institutional (No Beat)" },
+        "gstin": { "type": "string", "description": "GSTIN registration number if applicable" },
+        "pan_number": { "type": "string", "description": "Income tax PAN number" },
+        "fssai_license": { "type": "string", "description": "FSSAI food license number" },
+        "email": { "type": "string", "description": "Official email address" },
+        "address": { "type": "string", "description": "Warehouse / Delivery premise address" },
+        "city": { "type": "string", "description": "City" },
+        "state": { "type": "string", "description": "State" },
+        "pincode": { "type": "string", "description": "Pincode (6 digits)" },
+        "contact_person": { "type": "string", "description": "Primary contact / manager name" },
+        "phone": { "type": "string", "description": "10-digit Indian mobile number" },
+        "phase_status": { "type": "string", "description": "ACTIVE | BLOCKED | LEAD" },
+        "credit_limit": { "type": "number", "description": "Authorized trade credit limit in INR" },
+        "credit_days": { "type": "number", "description": "Credit grace period in days" },
+        "dispatch_point_id": { "type": "string", "description": "Default dispatch point warehouse ID" },
+        "current_outstanding": { "type": "number", "description": "Current total ledger outstanding balance" },
+        "onboarded_by_role": { "type": "string", "description": "BILLING" },
+        "onboarded_by_user_id": { "type": "string", "description": "ID of user that onboarded account" },
+        "created_at": { "type": "string", "description": "Creation timestamp" }
+      }
+    },
+    "orders": {
+      "title": "Sales Orders",
+      "description": "Captured sales orders from field agents, web punchers, and EDI",
+      "fields": {
+        "id": { "type": "string", "description": "Unique order ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "order_number": { "type": "string", "description": "Formatted order number (ORD-...)" },
+        "channel": { "type": "string", "description": "GT | MT | INSTITUTIONAL | ECOMMERCE | DIRECT" },
+        "company_id": { "type": "string", "description": "Principal company ID" },
+        "retailer_id": { "type": "string", "description": "Retailer ID if matched" },
+        "retailer_name_raw": { "type": "string", "description": "Raw punched retailer name" },
+        "beat_name": { "type": "string", "description": "Assigned beat / route" },
+        "dispatch_point_id": { "type": "string", "description": "Fulfilling depot ID" },
+        "created_by_user_id": { "type": "string", "description": "User ID who captured the order" },
+        "commission_agent_id": { "type": "string", "description": "Commission agent ID if applicable" },
+        "order_date": { "type": "string", "description": "Date of order capture" },
+        "delivery_date": { "type": "string", "description": "Target delivery date" },
+        "status": { "type": "string", "description": "PUNCHED | VERIFIED_BY_BILLING | APPROVED | DISPATCHED | DELIVERED | INVOICED | CANCELLED" },
+        "total_amount": { "type": "number", "description": "Total order monetary value" },
+        "tax_amount": { "type": "number", "description": "Total GST amount" },
+        "lines": { "type": "array", "description": "Array of OrderLine items" },
+        "has_below_cost_lines": { "type": "boolean", "description": "True if contains below landing cost SKU" },
+        "exception_flag": { "type": "string", "description": "Flag for credit breach or price deviation" },
+        "exception_comment": { "type": "string", "description": "Approver explanation or audit note" },
+        "source_type": { "type": "string", "description": "GT_AGENT | OFFICE_STAFF | APP_DIRECT_IMPORT" },
+        "order_invoicing_type": { "type": "string", "description": "UNREGISTERED_CASH | REGISTERED_GST - Invoicing classification marked by Billing Executive before approval" }
+      }
+    },
+    "stock_ledger": {
+      "title": "Depot Stock Ledger & Gate Passes",
+      "description": "Stock movements, inward factory docks, outward gate passes and digital proofs",
+      "fields": {
+        "id": { "type": "string", "description": "Unique movement entry ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "dispatch_point_id": { "type": "string", "description": "Depot ID" },
+        "company_id": { "type": "string", "description": "Principal company ID" },
+        "sku_id": { "type": "string", "description": "SKU item ID" },
+        "entry_type": { "type": "string", "description": "INWARD | DISPATCH_OUT | ADJUSTMENT_DAMAGE | RETURN" },
+        "quantity": { "type": "number", "description": "Recorded physical quantity" },
+        "expected_quantity": { "type": "number", "description": "Invoice / Challan expected quantity" },
+        "variance_quantity": { "type": "number", "description": "Shortage or excess quantity" },
+        "variance_reason": { "type": "string", "description": "Shortage / damage explanation" },
+        "reference_doc_type": { "type": "string", "description": "ORDER | INWARD_CHALLAN | AUDIT | TRANSFER_NOTE | GATE_PASS" },
+        "reference_doc_id": { "type": "string", "description": "Challan or order reference ID" },
+        "vehicle_number": { "type": "string", "description": "Freight or van vehicle number" },
+        "recipient_type": { "type": "string", "description": "Recipient classification" },
+        "recipient_name": { "type": "string", "description": "Receiver entity or driver name" },
+        "timestamp": { "type": "string", "description": "ISO timestamp of transaction" },
+        "performed_by_user_id": { "type": "string", "description": "User who recorded entry" },
+        "notes": { "type": "string", "description": "Audit notes" },
+        "ack_status": { "type": "string", "description": "PENDING | RECEIVED | DISPUTED" },
+        "ack_type": { "type": "string", "description": "DIGITAL_SIGNATURE | OTP_PIN | PAPER_PHOTO | APP_CONFIRM" },
+        "ack_by_user_name": { "type": "string", "description": "Receiver signer name" },
+        "ack_timestamp": { "type": "string", "description": "Time of receipt confirmation" },
+        "proof_image_url": { "type": "string", "description": "Signed LR / Gate pass photo URL" },
+        "signature_svg": { "type": "string", "description": "Digital captured signature vector data" }
+      }
+    },
+    "invoices": {
+      "title": "Tax Invoices & Billing",
+      "description": "Official GST sales invoices generated from orders",
+      "fields": {
+        "id": { "type": "string", "description": "Unique invoice ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "invoice_number": { "type": "string", "description": "Formatted invoice number (INV-...)" },
+        "invoice_type": { "type": "string", "description": "REGISTERED_GST | CASH_NON_GST" },
+        "order_id": { "type": "string", "description": "Originating sales order ID" },
+        "company_id": { "type": "string", "description": "Principal company ID" },
+        "retailer_id": { "type": "string", "description": "Target retailer outlet ID" },
+        "retailer_name": { "type": "string", "description": "Billed party name" },
+        "dispatch_point_id": { "type": "string", "description": "Fulfilling depot ID" },
+        "subtotal": { "type": "number", "description": "Pre-tax invoice total" },
+        "cgst": { "type": "number", "description": "Central GST component" },
+        "sgst": { "type": "number", "description": "State GST component" },
+        "igst": { "type": "number", "description": "Integrated GST component" },
+        "total_amount": { "type": "number", "description": "Grand total bill amount" },
+        "paid_amount": { "type": "number", "description": "Cumulative collected amount" },
+        "status": { "type": "string", "description": "UNPAID | PARTIAL | PAID | OVERDUE" },
+        "invoice_date": { "type": "string", "description": "Billing date" },
+        "due_date": { "type": "string", "description": "Credit payment due date" },
+        "is_locked": { "type": "boolean", "description": "Lock flag against further modifications" },
+        "e_way_bill_no": { "type": "string", "description": "NIC e-Way bill number" },
+        "irn_no": { "type": "string", "description": "e-Invoice IRN hash" },
+        "zoho_synced": { "type": "boolean", "description": "ERP synchronization status" }
+      }
+    },
+    "claims": {
+      "title": "Principal Margin & Damage Claims",
+      "description": "Distributor claims raised to Principal Companies for price subsidies, schemes, damages",
+      "fields": {
+        "id": { "type": "string", "description": "Unique claim ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "claim_number": { "type": "string", "description": "Claim reference number" },
+        "company_id": { "type": "string", "description": "Principal company ID" },
+        "company_name": { "type": "string", "description": "Principal company name" },
+        "sku_id": { "type": "string", "description": "SKU item ID" },
+        "sku_name": { "type": "string", "description": "Product title" },
+        "invoice_id": { "type": "string", "description": "Referenced sales invoice" },
+        "claim_type": { "type": "string", "description": "SCHEME_MARGIN | DAMAGE_EXPIRY | PRICE_DIFFERENCE | PROMOTIONAL" },
+        "quantity": { "type": "number", "description": "Claimed product volume" },
+        "rate_per_unit": { "type": "number", "description": "Subsidy rate per unit" },
+        "claim_amount": { "type": "number", "description": "Total claim value in INR" },
+        "status": { "type": "string", "description": "RAISED | SUBMITTED | UNDER_REVIEW | SETTLED | REJECTED" },
+        "raised_date": { "type": "string", "description": "Date raised" },
+        "submitted_date": { "type": "string", "description": "Date forwarded to company" },
+        "settled_date": { "type": "string", "description": "Date credit note received" },
+        "is_leakage_flagged": { "type": "boolean", "description": "Unclaimed price leakage alert flag" }
+      }
+    },
+    "payments": {
+      "title": "Payment Collections & Cash Reconciliation",
+      "description": "UPI, Cheque, NEFT and Cash payment collections with invoice allocations",
+      "fields": {
+        "id": { "type": "string", "description": "Unique payment record ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "payment_number": { "type": "string", "description": "Payment receipt voucher number" },
+        "retailer_id": { "type": "string", "description": "Paying outlet ID" },
+        "retailer_name": { "type": "string", "description": "Paying party name" },
+        "amount": { "type": "number", "description": "Collected amount in INR" },
+        "payment_mode": { "type": "string", "description": "UPI | NEFT_RTGS | CHEQUE | CASH" },
+        "reference_number": { "type": "string", "description": "UTR, UPI reference or cheque number" },
+        "payment_date": { "type": "string", "description": "Collection date" },
+        "matched_invoice_id": { "type": "string", "description": "Direct matched invoice ID" },
+        "allocations": { "type": "array", "description": "Multi-invoice allocation breakdown" },
+        "status": { "type": "string", "description": "VERIFIED | PENDING | FLAGGED | REJECTED" },
+        "collector_name": { "type": "string", "description": "Collecting agent or cashier name" },
+        "proof_url": { "type": "string", "description": "Proof photo or receipt image URL" },
+        "flag_reason": { "type": "string", "description": "Variance or unverified reason" },
+        "cash_status": { "type": "string", "description": "IN_SAFE | BANKED" },
+        "notes": { "type": "string", "description": "Collection ledger notes" }
+      }
+    },
+    "users": {
+      "title": "Enterprise Users & Field Staff",
+      "description": "Enterprise staff roles (Billing, Dispatcher, Agent, Accountant, Admin)",
+      "fields": {
+        "id": { "type": "string", "description": "Unique user ID" },
+        "tenant_id": { "type": "string", "description": "Tenant ID" },
+        "name": { "type": "string", "description": "Staff member full name" },
+        "email": { "type": "string", "description": "Login email address" },
+        "role": { "type": "string", "description": "ADMIN | BILLING | ORDER_PUNCHER | DISPATCHER | ACCOUNTANT | AGENT" },
+        "company_scope": { "type": "array", "description": "Restricted company IDs, or empty for all" },
+        "dispatch_point_id": { "type": "string", "description": "Assigned depot if dispatcher" },
+        "platform": { "type": "string", "description": "WEB | MOBILE" }
+      }
+    }
+  }
+}

@@ -1,0 +1,141 @@
+@import "tailwindcss";
+
+/* 
+ * GoRoute Enterprise Multi-Tenant DMS Theme System
+ * Default: Dark Theme
+ * Optional: Light Theme
+ */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Inverted Slate Scale for Clean High-Contrast Light Theme */
+  --color-slate-950: #f8fafc; /* Canvas background / page body */
+  --color-slate-900: #ffffff; /* Card / panel / modal surface */
+  --color-slate-850: #f1f5f9; /* Zebra rows / table header subtle tint */
+  --color-slate-800: #e2e8f0; /* Crisp light dividers, borders, subtle pills */
+  --color-slate-700: #cbd5e1; /* Input borders, active element boundaries */
+  --color-slate-600: #94a3b8; /* Muted controls */
+  --color-slate-500: #64748b; /* Secondary helper text, captions */
+  --color-slate-400: #475569; /* Readable secondary labels, muted icons */
+  --color-slate-300: #334155; /* Normal body text, data values */
+  --color-slate-200: #1e293b; /* Prominent titles, section headings */
+  --color-slate-100: #0f172a; /* Maximum contrast text & primary headings */
+  --color-slate-50: #020617;  /* Pitch text accents */
+}
+
+/* Light Mode Card & Panel Polish */
+[data-theme="light"] .bg-slate-900 {
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.06), 0 1px 2px -1px rgba(15, 23, 42, 0.04);
+}
+
+[data-theme="light"] .fixed.inset-0 .bg-slate-900 {
+  box-shadow: 0 20px 25px -5px rgba(15, 23, 42, 0.12), 0 8px 10px -6px rgba(15, 23, 42, 0.08);
+}
+
+/* Form Controls in Light Mode */
+[data-theme="light"] input,
+[data-theme="light"] select,
+[data-theme="light"] textarea {
+  color: #0f172a;
+}
+
+[data-theme="light"] input::placeholder,
+[data-theme="light"] textarea::placeholder {
+  color: #94a3b8;
+}
+
+[data-theme="light"] option {
+  background-color: #ffffff;
+  color: #0f172a;
+}
+
+/* Text-white inversion on neutral / light surfaces */
+[data-theme="light"] h1.text-white,
+[data-theme="light"] h2.text-white,
+[data-theme="light"] h3.text-white,
+[data-theme="light"] h4.text-white,
+[data-theme="light"] h5.text-white,
+[data-theme="light"] th.text-white,
+[data-theme="light"] td.text-white,
+[data-theme="light"] span.text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]),
+[data-theme="light"] div.text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]),
+[data-theme="light"] p.text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]) {
+  color: #0f172a;
+}
+
+/* Primary Action Buttons: Maintain crisp white text */
+[data-theme="light"] button[class*="bg-blue-600"],
+[data-theme="light"] button[class*="bg-emerald-600"],
+[data-theme="light"] button[class*="bg-rose-600"],
+[data-theme="light"] button[class*="bg-amber-600"],
+[data-theme="light"] button[class*="bg-indigo-600"],
+[data-theme="light"] button[class*="bg-purple-600"],
+[data-theme="light"] button[class*="bg-red-600"],
+[data-theme="light"] a[class*="bg-blue-600"],
+[data-theme="light"] a[class*="bg-emerald-600"] {
+  color: #ffffff !important;
+}
+
+[data-theme="light"] button[class*="bg-blue-600"] *,
+[data-theme="light"] button[class*="bg-emerald-600"] *,
+[data-theme="light"] button[class*="bg-rose-600"] *,
+[data-theme="light"] button[class*="bg-amber-600"] *,
+[data-theme="light"] button[class*="bg-indigo-600"] *,
+[data-theme="light"] button[class*="bg-purple-600"] *,
+[data-theme="light"] button[class*="bg-red-600"] * {
+  color: #ffffff !important;
+}
+
+/* High Contrast Colored Badges & Text in Light Mode (Passes WCAG AA) */
+[data-theme="light"] .text-blue-400 {
+  color: #2563eb !important;
+}
+
+[data-theme="light"] .text-emerald-400 {
+  color: #059669 !important;
+}
+
+[data-theme="light"] .text-amber-400 {
+  color: #d97706 !important;
+}
+
+[data-theme="light"] .text-rose-400 {
+  color: #e11d48 !important;
+}
+
+[data-theme="light"] .text-purple-400 {
+  color: #7c3aed !important;
+}
+
+[data-theme="light"] .text-indigo-400 {
+  color: #4f46e5 !important;
+}
+
+[data-theme="light"] .text-cyan-400 {
+  color: #0891b2 !important;
+}
+
+/* Light Theme Scrollbars */
+[data-theme="light"] ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
