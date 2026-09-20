@@ -32,7 +32,10 @@ import {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  // In Google AI Studio, container proxy routes exclusively to port 3000.
+  // In Cloud Run / Firebase App Hosting deployments, Cloud Run assigns PORT (usually 8080) via process.env.PORT.
+  const isAIStudio = Boolean(process.env.APPLET_ID || process.env.CONTROL_PLANE_PORT);
+  const PORT = isAIStudio ? 3000 : (Number(process.env.PORT) || 8080);
 
   app.use(express.json());
 
