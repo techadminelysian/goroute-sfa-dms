@@ -1499,7 +1499,7 @@ export const INITIAL_USERS: User[] = [
     tenant_id: 'tenant_ms_enterprises',
     name: 'Prashant Vasu (Admin)',
     email: 'prashantvasu099@gmail.com',
-    mobile_number: '7830260124',
+    mobile_number: '7830260134',
     password_hash: '900b73aa49e1e247_salt_prashant',
     salt: 'salt_prashant_7830260134',
     role: 'ADMIN',

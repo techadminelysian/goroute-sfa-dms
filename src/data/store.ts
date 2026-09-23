@@ -568,7 +568,7 @@ export const useAppStore = () => {
     currentUser,
     isAuthenticated,
     authToken: memoryStore.authToken,
-    isMobilePreview: Boolean(memoryStore.isMobilePreview),
+    isMobilePreview: activeUserRole === 'AGENT' || activeUserRole === 'DISPATCHER',
     theme: memoryStore.theme || ('dark' as AppTheme),
     setTheme: (newTheme: AppTheme) => {
       memoryStore.theme = newTheme;
