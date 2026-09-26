@@ -1086,6 +1086,37 @@ export const useAppStore = () => {
       }
     },
 
+    bulkUpsertCompanies: (incomingCompanies: Company[]) => {
+      const existingMap = new Map(memoryStore.companies.map((c) => [c.code.toUpperCase(), c]));
+      const updatedList: Company[] = [...memoryStore.companies];
+
+      incomingCompanies.forEach((inc) => {
+        const key = inc.code.toUpperCase();
+        if (existingMap.has(key)) {
+          const idx = updatedList.findIndex((c) => c.code.toUpperCase() === key);
+          if (idx !== -1) {
+            updatedList[idx] = { ...updatedList[idx], ...inc, id: updatedList[idx].id };
+          }
+        } else {
+          updatedList.unshift(inc);
+        }
+      });
+
+      memoryStore.companies = updatedList;
+      persist();
+
+      if (isFirebaseConfigured()) {
+        incomingCompanies.forEach((inc) => {
+          const finalRecord = memoryStore.companies.find(
+            (c) => c.code.toUpperCase() === inc.code.toUpperCase()
+          );
+          if (finalRecord) {
+            saveRecordToFirestore(COLLECTIONS.COMPANIES, finalRecord.id, finalRecord);
+          }
+        });
+      }
+    },
+
     // Dispatch Point CRUD
     addDispatchPoint: (dp: DispatchPoint) => {
       memoryStore.dispatchPoints = [dp, ...memoryStore.dispatchPoints];

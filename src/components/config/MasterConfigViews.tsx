@@ -32,7 +32,11 @@ import {
   Search,
   MapPin,
   Edit2,
-  X
+  X,
+  Download,
+  Upload,
+  FileSpreadsheet,
+  CheckSquare
 } from 'lucide-react';
 
 export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USERS' }> = ({ type }) => {
@@ -47,6 +51,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     addCompany,
     updateCompany,
     deleteCompany,
+    bulkUpsertCompanies,
     addDispatchPoint,
     addUser,
     updateBeat,
@@ -78,6 +83,24 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
   const [editCompPhone, setEditCompPhone] = useState('');
   const [editCompEmail, setEditCompEmail] = useState('');
   const [editCompError, setEditCompError] = useState<string | null>(null);
+
+  // Company Bulk Upload States
+  const [isCompBulkOpen, setIsCompBulkOpen] = useState(false);
+  const [compCsvText, setCompCsvText] = useState('');
+  const [parsedPreviewCompanies, setParsedPreviewCompanies] = useState<
+    Array<{
+      code: string;
+      name: string;
+      relationship_type: 'CF' | 'SS' | 'TCD';
+      gstin: string;
+      contact_person?: string;
+      phone?: string;
+      email?: string;
+      isValid: boolean;
+      isUpdate: boolean;
+      validationMsg: string;
+    }>
+  >([]);
 
   const [dpName, setDpName] = useState('');
   const [dpCode, setDpCode] = useState('');
@@ -319,6 +342,208 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     setTimeout(() => setCompSuccess(null), 5000);
   };
 
+  // Download CSV Template for Principal Companies
+  const handleDownloadCompanyTemplate = () => {
+    const headers = [
+      'Company Code',
+      'Company Name',
+      'Relationship Type',
+      'GSTIN',
+      'Contact Person',
+      'Phone',
+      'Email'
+    ];
+
+    const sampleRows = [
+      ['BRIT', 'Britannia Industries Ltd', 'CF', '07AAACB1234A1Z1', 'Rajesh Sharma', '9810123456', 'orders.delhi@britannia.com'],
+      ['AMUL', 'Gujarat Coop Milk Mktg Fed (Amul)', 'SS', '24AAAAG1234A1Z2', 'Vipul Patel', '9824012345', 'dispatch@amul.coop'],
+      ['NEST', 'Nestle India Limited', 'CF', '06AAACN1234A1Z3', 'Suresh Verma', '9876543210', 'fmcg.orders@nestle.com'],
+      ['PARAS', 'Paras Dairy & FMCG Ltd', 'TCD', '09AAACP1234A1Z4', 'Amit Chaudhary', '9911223344', 'supplies@paras.in']
+    ];
+
+    const csvContent =
+      'data:text/csv;charset=utf-8,' +
+      [headers.map((h) => `"${h}"`).join(','), ...sampleRows.map((r) => r.map((c) => `"${c}"`).join(','))].join('\n');
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', 'Principal_Companies_Template.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Export Current Principal Companies to CSV
+  const handleExportCompaniesCsv = () => {
+    if (companies.length === 0) {
+      alert('No principal companies configured to export.');
+      return;
+    }
+
+    const headers = [
+      'Company Code',
+      'Company Name',
+      'Relationship Type',
+      'GSTIN',
+      'Contact Person',
+      'Phone',
+      'Email'
+    ];
+
+    const rows = companies.map((c) => [
+      c.code,
+      c.name,
+      c.relationship_type,
+      c.gstin || '',
+      c.contact_person || '',
+      c.phone || '',
+      c.email || ''
+    ]);
+
+    const csvContent =
+      'data:text/csv;charset=utf-8,' +
+      [headers.map((h) => `"${h}"`).join(','), ...rows.map((r) => r.map((cell) => `"${String(cell || '').replace(/"/g, '""')}"`).join(','))].join('\n');
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', `Principal_Companies_Export_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Parse CSV text into preview array for companies
+  const handleParseCompCsvContent = (content: string) => {
+    const lines = content.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    if (lines.length < 2) {
+      setParsedPreviewCompanies([]);
+      return;
+    }
+
+    const parsed: typeof parsedPreviewCompanies = [];
+    const seenCodesInCsv = new Set<string>();
+
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      // Regex parser handling quoted strings with commas
+      const cells = line.match(/(".*?"|[^",\t]+)(?=\s*,\s*|\s*$)/g) || line.split(',');
+      const cleanCells = cells.map((c) => c.replace(/^"|"$/g, '').trim());
+
+      if (cleanCells.length < 2) continue;
+
+      const rawCode = (cleanCells[0] || '').toUpperCase();
+      const rawName = cleanCells[1] || '';
+      const rawRel = (cleanCells[2] || 'CF').toUpperCase();
+      const rawGstin = (cleanCells[3] || '').toUpperCase();
+      const rawContact = cleanCells[4] || '';
+      const rawPhone = cleanCells[5] || '';
+      const rawEmail = cleanCells[6] || '';
+
+      // Normalize relationship
+      let rel: 'CF' | 'SS' | 'TCD' = 'CF';
+      if (rawRel.includes('SS') || rawRel.includes('SUPER')) rel = 'SS';
+      else if (rawRel.includes('TCD') || rawRel.includes('TRANS')) rel = 'TCD';
+
+      // Validation
+      let isValid = true;
+      let validationMsg = '';
+
+      if (!rawCode) {
+        isValid = false;
+        validationMsg = 'Company Code is required';
+      }
+
+      const nameVal = validateStoreName(rawName);
+      if (!nameVal.isValid) {
+        isValid = false;
+        validationMsg = nameVal.error || 'Invalid Company Name';
+      }
+
+      // Mandatory GSTIN validation
+      const gstinVal = validateGSTIN(rawGstin, true);
+      if (!gstinVal.isValid) {
+        isValid = false;
+        validationMsg = gstinVal.error || 'Invalid 15-digit GSTIN';
+      }
+
+      if (seenCodesInCsv.has(rawCode)) {
+        isValid = false;
+        validationMsg = `Duplicate code "${rawCode}" in CSV`;
+      } else if (rawCode) {
+        seenCodesInCsv.add(rawCode);
+      }
+
+      const existingComp = companies.find(
+        (c) => c.code.toUpperCase() === rawCode || c.name.toLowerCase() === rawName.toLowerCase()
+      );
+
+      parsed.push({
+        code: rawCode,
+        name: nameVal.formatted || rawName,
+        relationship_type: rel,
+        gstin: gstinVal.formatted || rawGstin,
+        contact_person: rawContact || 'Manager',
+        phone: rawPhone || '+91 98000 00000',
+        email: rawEmail || 'sales@company.com',
+        isValid,
+        isUpdate: Boolean(existingComp),
+        validationMsg
+      });
+    }
+
+    setParsedPreviewCompanies(parsed);
+  };
+
+  const handleCompFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (text) {
+        setCompCsvText(text);
+        handleParseCompCsvContent(text);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleCommitCompBulkImport = () => {
+    const validRows = parsedPreviewCompanies.filter((r) => r.isValid);
+    if (validRows.length === 0) {
+      alert('No valid company records found to import.');
+      return;
+    }
+
+    const toCommit: Company[] = validRows.map((r, idx) => {
+      const existing = companies.find(
+        (c) => c.code.toUpperCase() === r.code.toUpperCase() || c.name.toLowerCase() === r.name.toLowerCase()
+      );
+
+      return {
+        id: existing ? existing.id : `comp_${Date.now()}_${idx}`,
+        tenant_id: activeTenant.id,
+        name: r.name,
+        code: r.code,
+        relationship_type: r.relationship_type,
+        gstin: r.gstin,
+        contact_person: r.contact_person || 'Manager',
+        email: r.email || 'sales@company.com',
+        phone: r.phone || '+91 98000 00000'
+      };
+    });
+
+    bulkUpsertCompanies(toCommit);
+    setIsCompBulkOpen(false);
+    setCompCsvText('');
+    setParsedPreviewCompanies([]);
+    setCompSuccess(`Successfully bulk imported / updated ${validRows.length} principal companies!`);
+    setTimeout(() => setCompSuccess(null), 6000);
+  };
+
   const handleAddDispatch = (e: React.FormEvent) => {
     e.preventDefault();
     const nameVal = validateStoreName(dpName);
@@ -533,7 +758,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       {/* Companies Management */}
       {type === 'COMPANIES' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
             <div>
               <h2 className="text-sm font-bold text-white flex items-center gap-2">
                 <Building size={16} className="text-blue-400" />
@@ -542,6 +767,40 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
               <p className="text-xs text-slate-400">
                 Principal companies associated with tenant "{activeTenant.name}".
               </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleDownloadCompanyTemplate}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs flex items-center gap-1.5 border border-slate-700 transition-colors shadow-xs cursor-pointer"
+                title="Download standard CSV template with headers & samples"
+              >
+                <Download size={13} className="text-blue-400" />
+                <span>Template</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleExportCompaniesCsv}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs flex items-center gap-1.5 border border-slate-700 transition-colors shadow-xs cursor-pointer"
+                title="Export all configured principal companies to CSV"
+              >
+                <FileSpreadsheet size={13} className="text-emerald-400" />
+                <span>Export CSV</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCompCsvText('');
+                  setParsedPreviewCompanies([]);
+                  setIsCompBulkOpen(true);
+                }}
+                className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center gap-1.5 transition-all shadow-md shadow-blue-900/30 cursor-pointer"
+                title="Bulk upload or paste CSV data"
+              >
+                <Upload size={13} />
+                <span>Bulk Upload</span>
+              </button>
             </div>
           </div>
 
@@ -813,6 +1072,205 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* BULK UPLOAD PRINCIPAL COMPANIES MODAL */}
+      {isCompBulkOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-4xl w-full p-5 space-y-4 shadow-2xl max-h-[90vh] flex flex-col animate-in fade-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
+                  <Upload size={16} />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-sm">Bulk Import Principal Companies</h3>
+                  <p className="text-xs text-slate-400">
+                    Upload a CSV file or paste raw table data to register or update manufacturing partners.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCompBulkOpen(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-4 overflow-y-auto flex-1 pr-1">
+              {/* File Upload Box */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl flex flex-col justify-center space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
+                    <FileSpreadsheet size={15} className="text-blue-400" />
+                    <span>Select CSV File from Computer:</span>
+                  </div>
+                  <input
+                    type="file"
+                    accept=".csv,text/csv"
+                    onChange={handleCompFileUpload}
+                    className="mt-1 text-xs text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-xs file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-500 cursor-pointer"
+                  />
+                  <span className="text-[11px] text-slate-500">Supports standard comma-delimited (.csv) files.</span>
+                </div>
+
+                {/* Quick CSV Template Helper */}
+                <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2 text-xs flex flex-col justify-between">
+                  <div>
+                    <span className="font-bold text-slate-200 block mb-1">Expected CSV Format (Mandatory GSTIN):</span>
+                    <code className="block bg-slate-900 p-2 rounded text-[10px] text-blue-300 font-mono overflow-x-auto whitespace-nowrap">
+                      Company Code, Company Name, Relationship Type, GSTIN, Contact Person, Phone, Email
+                    </code>
+                  </div>
+                  <div className="pt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleDownloadCompanyTemplate}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-blue-400 text-[11px] font-bold flex items-center gap-1.5 border border-slate-700 transition-colors cursor-pointer"
+                    >
+                      <Download size={13} /> Download Sample Template
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Direct CSV Text Area */}
+              <div className="space-y-1.5">
+                <label className="block text-xs font-bold text-slate-300 flex items-center justify-between">
+                  <span>Or Paste CSV Raw Data Below:</span>
+                  {compCsvText && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCompCsvText('');
+                        setParsedPreviewCompanies([]);
+                      }}
+                      className="text-[11px] text-rose-400 hover:underline cursor-pointer"
+                    >
+                      Clear Data
+                    </button>
+                  )}
+                </label>
+                <textarea
+                  rows={4}
+                  placeholder={`Company Code,Company Name,Relationship Type,GSTIN,Contact Person,Phone,Email\nBRIT,Britannia Industries Ltd,CF,07AAACB1234A1Z1,Rajesh Sharma,9810123456,orders.delhi@britannia.com\nAMUL,Gujarat Coop Milk Mktg Fed,SS,24AAAAG1234A1Z2,Vipul Patel,9824012345,dispatch@amul.coop`}
+                  value={compCsvText}
+                  onChange={(e) => {
+                    setCompCsvText(e.target.value);
+                    handleParseCompCsvContent(e.target.value);
+                  }}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl p-3 text-xs text-white font-mono placeholder-slate-600 focus:outline-hidden focus:border-blue-500"
+                />
+              </div>
+
+              {/* Parsed Preview Table */}
+              {parsedPreviewCompanies.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-bold text-white flex items-center gap-1.5">
+                      <CheckSquare size={14} className="text-emerald-400" /> Validation Preview ({parsedPreviewCompanies.filter((r) => r.isValid).length} Valid of {parsedPreviewCompanies.length} Rows)
+                    </span>
+                    <div className="flex items-center gap-3 text-[11px]">
+                      <span className="text-emerald-400 font-semibold">
+                        {parsedPreviewCompanies.filter((r) => r.isValid && !r.isUpdate).length} New
+                      </span>
+                      <span className="text-amber-400 font-semibold">
+                        {parsedPreviewCompanies.filter((r) => r.isValid && r.isUpdate).length} Updates
+                      </span>
+                      {parsedPreviewCompanies.filter((r) => !r.isValid).length > 0 && (
+                        <span className="text-rose-400 font-bold">
+                          {parsedPreviewCompanies.filter((r) => !r.isValid).length} Errors
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="max-h-56 overflow-y-auto border border-slate-800 rounded-xl bg-slate-950 text-[11px]">
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-900 border-b border-slate-800 text-slate-400 sticky top-0">
+                        <tr>
+                          <th className="p-2">Code</th>
+                          <th className="p-2">Company Name</th>
+                          <th className="p-2">Relationship</th>
+                          <th className="p-2">Mandatory GSTIN</th>
+                          <th className="p-2">Contact</th>
+                          <th className="p-2 text-center">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800 text-slate-200 font-mono">
+                        {parsedPreviewCompanies.map((r, idx) => (
+                          <tr key={idx} className={r.isValid ? 'hover:bg-slate-900/60' : 'bg-rose-950/20'}>
+                            <td className="p-2 font-bold text-white">{r.code}</td>
+                            <td className="p-2 font-sans font-medium text-slate-200">{r.name}</td>
+                            <td className="p-2 font-sans text-slate-300">
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800 border border-slate-700">
+                                {r.relationship_type === 'CF' ? 'C&F' : r.relationship_type === 'SS' ? 'Super Stockist' : 'Transporter'}
+                              </span>
+                            </td>
+                            <td className="p-2 text-emerald-400">
+                              {r.gstin || <span className="text-rose-400 italic font-sans">Missing</span>}
+                            </td>
+                            <td className="p-2 font-sans text-slate-400">
+                              {r.contact_person || '—'} {r.phone ? `(${r.phone})` : ''}
+                            </td>
+                            <td className="p-2 text-center font-sans">
+                              {r.isValid ? (
+                                r.isUpdate ? (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold text-[9px] border border-amber-500/30">
+                                    Update Existing
+                                  </span>
+                                ) : (
+                                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[9px] border border-emerald-500/30">
+                                    Ready (New)
+                                  </span>
+                                )
+                              ) : (
+                                <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold text-[9px] border border-rose-500/30" title={r.validationMsg}>
+                                  {r.validationMsg}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Actions */}
+            <div className="flex items-center justify-between border-t border-slate-800 pt-3">
+              <span className="text-xs text-slate-400">
+                {parsedPreviewCompanies.filter((r) => r.isValid).length > 0 && (
+                  <span>
+                    Ready to commit <strong className="text-white">{parsedPreviewCompanies.filter((r) => r.isValid).length}</strong> companies.
+                  </span>
+                )}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsCompBulkOpen(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCommitCompBulkImport}
+                  disabled={parsedPreviewCompanies.filter((r) => r.isValid).length === 0}
+                  className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-lg shadow-blue-900/30 transition-all cursor-pointer"
+                >
+                  <CheckCircle2 size={15} /> Commit Bulk Companies
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
