@@ -123,6 +123,10 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
   // Editing SKU Modal State
   const [editingSku, setEditingSku] = useState<SKU | null>(null);
 
+  // Deleting SKU Modal State
+  const [skuToDelete, setSkuToDelete] = useState<SKU | null>(null);
+  const [skuFeedback, setSkuFeedback] = useState<string | null>(null);
+
   // Bulk Upload Modal State
   const [isBulkImportOpen, setIsBulkImportOpen] = useState(false);
   const [csvText, setCsvText] = useState('');
@@ -1059,6 +1063,23 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
             </div>
           </form>
 
+          {/* Deletion / Modification Feedback Banner */}
+          {skuFeedback && (
+            <div className="p-3 bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 rounded-xl text-xs flex items-center justify-between shadow-sm animate-in fade-in">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+                <span className="font-semibold">{skuFeedback}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSkuFeedback(null)}
+                className="text-emerald-400 hover:text-white p-1 rounded hover:bg-emerald-900/40"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
           {/* SKU Catalog Table */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden text-xs shadow-xl">
             <div className="overflow-x-auto">
@@ -1148,13 +1169,10 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
                                 <Edit3 size={13} />
                               </button>
                               <button
-                                onClick={() => {
-                                  if (confirm(`Are you sure you want to delete SKU ${s.name} (${s.code})?`)) {
-                                    deleteSKU(s.id);
-                                  }
-                                }}
-                                className="p-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 hover:text-rose-200"
-                                title="Delete SKU from Master"
+                                type="button"
+                                onClick={() => setSkuToDelete(s)}
+                                className="p-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 hover:text-rose-200 transition-colors"
+                                title={`Delete SKU ${s.name} (${s.code})`}
                               >
                                 <Trash2 size={13} />
                               </button>
@@ -1589,6 +1607,87 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* SKU DELETE CONFIRMATION POPUP MODAL */}
+      {skuToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-sm flex items-center gap-2 text-rose-400">
+                <AlertTriangle size={18} className="text-rose-400" /> Confirm SKU Deletion
+              </h3>
+              <button
+                type="button"
+                onClick={() => setSkuToDelete(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <p className="text-slate-300">
+                Are you sure you want to permanently delete this product SKU from the database and master catalog?
+              </p>
+
+              <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">SKU Code:</span>
+                  <span className="font-mono font-bold text-white bg-slate-800 px-2 py-0.5 rounded border border-slate-700">
+                    {skuToDelete.code}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Product Name:</span>
+                  <span className="font-semibold text-white text-right max-w-[220px] truncate">{skuToDelete.name}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Category / Pack:</span>
+                  <span className="text-slate-300">{skuToDelete.category || 'FMCG'} • {skuToDelete.pack_size || 'Std'}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">MRP / PTR / PTS:</span>
+                  <span className="font-mono text-emerald-400 font-bold">
+                    ₹{skuToDelete.mrp.toFixed(2)} / ₹{skuToDelete.selling_price.toFixed(2)} / ₹{skuToDelete.landing_price.toFixed(2)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-2.5 rounded-lg bg-rose-950/40 border border-rose-500/30 text-rose-300 flex items-start gap-2">
+                <AlertCircle size={15} className="shrink-0 mt-0.5 text-rose-400" />
+                <span className="text-[11px] leading-relaxed">
+                  This SKU will be permanently removed from cloud database, price lists, order punching, and stock tally.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-slate-800 pt-3">
+              <button
+                type="button"
+                onClick={() => setSkuToDelete(null)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const targetId = skuToDelete.id;
+                  const targetName = skuToDelete.name;
+                  const targetCode = skuToDelete.code;
+                  deleteSKU(targetId);
+                  setSkuToDelete(null);
+                  setSkuFeedback(`SKU "${targetName}" (${targetCode}) was successfully deleted from the database.`);
+                  setTimeout(() => setSkuFeedback(null), 5000);
+                }}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-rose-900/30 transition-all"
+              >
+                <Trash2 size={14} /> Yes, Delete SKU
+              </button>
+            </div>
           </div>
         </div>
       )}

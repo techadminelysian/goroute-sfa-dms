@@ -56,6 +56,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   const userAssignedRole = currentUser?.role || activeRole || 'ADMIN';
   const roleInfo = roleLabelMap[userAssignedRole] || { label: userAssignedRole, platform: 'WEB' };
+  const isMobileUserRole = userAssignedRole === 'AGENT' || userAssignedRole === 'DISPATCHER';
 
   // Super-admin / backend developer check strictly scoped to user ID / mobile 7830260134
   const isSuperTechAdmin = Boolean(
@@ -176,42 +177,44 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         </div>
 
-        {/* Language Selector: English vs Hindi */}
-        <div
-          className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-0.5 text-xs shadow-xs"
-          role="radiogroup"
-          aria-label="Language Options"
-        >
-          <button
-            type="button"
-            role="radio"
-            aria-checked={language === 'en'}
-            onClick={() => setLanguage('en')}
-            className={`px-2 py-1 rounded-md font-bold text-xs flex items-center gap-1 transition-all ${
-              language === 'en'
-                ? 'bg-blue-600 text-white shadow-xs'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-            title="Switch Language to English"
+        {/* Language Selector: English vs Hindi (Restricted strictly to Commission Agents and Dispatchers) */}
+        {isMobileUserRole && (
+          <div
+            className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-0.5 text-xs shadow-xs"
+            role="radiogroup"
+            aria-label="Language Options"
           >
-            <Languages size={13} className={language === 'en' ? 'text-white' : 'text-slate-400'} />
-            <span>EN</span>
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={language === 'hi'}
-            onClick={() => setLanguage('hi')}
-            className={`px-2.5 py-1 rounded-md font-bold text-xs flex items-center gap-1 transition-all ${
-              language === 'hi'
-                ? 'bg-emerald-600 text-white shadow-xs'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-            title="हिंदी भाषा में बदलें (Switch to Hindi)"
-          >
-            <span>हिंदी</span>
-          </button>
-        </div>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={language === 'en'}
+              onClick={() => setLanguage('en')}
+              className={`px-2 py-1 rounded-md font-bold text-xs flex items-center gap-1 transition-all ${
+                language === 'en'
+                  ? 'bg-blue-600 text-white shadow-xs'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Switch Language to English"
+            >
+              <Languages size={13} className={language === 'en' ? 'text-white' : 'text-slate-400'} />
+              <span>EN</span>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={language === 'hi'}
+              onClick={() => setLanguage('hi')}
+              className={`px-2.5 py-1 rounded-md font-bold text-xs flex items-center gap-1 transition-all ${
+                language === 'hi'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="हिंदी भाषा में बदलें (Switch to Hindi)"
+            >
+              <span>हिंदी</span>
+            </button>
+          </div>
+        )}
 
         {/* Technical & Super-Admin Exclusive Controls (Visible only to User ID / Mobile: 7830260134) */}
         {isSuperTechAdmin && (

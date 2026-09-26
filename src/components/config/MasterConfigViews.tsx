@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../../data/store';
 import { Company, DispatchPoint, User, UserRole } from '../../types';
-import { validateStoreName } from '../../utils/validators';
+import { validateStoreName, validateGSTIN } from '../../utils/validators';
 import { generateSecurePassword, isValidMobileNumber, sanitizeMobileNumber } from '../../utils/authClient';
 import { CAMappingMatrix } from './CAMappingMatrix';
 import { BEAbsenceRemappingTool } from './BEAbsenceRemappingTool';
@@ -45,6 +45,8 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     beats,
     users,
     addCompany,
+    updateCompany,
+    deleteCompany,
     addDispatchPoint,
     addUser,
     updateBeat,
@@ -55,9 +57,27 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
 
   const isAdmin = (currentUser?.role === 'ADMIN' || activeRole === 'ADMIN');
 
+  // Company Creation States
   const [compName, setCompName] = useState('');
   const [compCode, setCompCode] = useState('');
   const [compRel, setCompRel] = useState<'CF' | 'SS' | 'TCD'>('CF');
+  const [compGstin, setCompGstin] = useState('');
+  const [compContact, setCompContact] = useState('');
+  const [compPhone, setCompPhone] = useState('');
+  const [compEmail, setCompEmail] = useState('');
+  const [compError, setCompError] = useState<string | null>(null);
+  const [compSuccess, setCompSuccess] = useState<string | null>(null);
+
+  // Company Editing Modal States
+  const [editingCompany, setEditingCompany] = useState<Company | null>(null);
+  const [editCompName, setEditCompName] = useState('');
+  const [editCompCode, setEditCompCode] = useState('');
+  const [editCompRel, setEditCompRel] = useState<'CF' | 'SS' | 'TCD'>('CF');
+  const [editCompGstin, setEditCompGstin] = useState('');
+  const [editCompContact, setEditCompContact] = useState('');
+  const [editCompPhone, setEditCompPhone] = useState('');
+  const [editCompEmail, setEditCompEmail] = useState('');
+  const [editCompError, setEditCompError] = useState<string | null>(null);
 
   const [dpName, setDpName] = useState('');
   const [dpCode, setDpCode] = useState('');
@@ -195,33 +215,108 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
 
   const handleAddCompany = (e: React.FormEvent) => {
     e.preventDefault();
+    setCompError(null);
+    setCompSuccess(null);
+
     const nameVal = validateStoreName(compName);
     if (!nameVal.isValid) {
-      alert(`Company Name Error:\n\n${nameVal.error}`);
+      setCompError(`Company Name Error: ${nameVal.error}`);
+      return;
+    }
+
+    // Mandatory GSTIN validation as per requirement
+    const gstinVal = validateGSTIN(compGstin, true);
+    if (!gstinVal.isValid) {
+      setCompError(`GSTIN Validation Error: ${gstinVal.error}`);
       return;
     }
 
     const code = compCode.trim() ? compCode.trim().toUpperCase() : compName.substring(0, 4).toUpperCase();
     if (companies.some((c) => c.name.toLowerCase() === compName.trim().toLowerCase() || c.code === code)) {
-      alert(`Validation Error: A company with name "${compName}" or code "${code}" already exists.`);
+      setCompError(`Validation Error: A company with name "${compName}" or code "${code}" already exists.`);
       return;
     }
+
+    const addedName = nameVal.formatted!;
+    const addedGstin = gstinVal.formatted!;
 
     addCompany({
       id: `comp_${Date.now()}`,
       tenant_id: activeTenant.id,
-      name: nameVal.formatted!,
+      name: addedName,
       code,
       relationship_type: compRel,
-      gstin: '07AABCC1234A1Z1',
-      contact_person: 'Manager',
-      email: 'sales@company.com',
-      phone: '+91 98000 00000',
+      gstin: addedGstin,
+      contact_person: compContact.trim() || 'Manager',
+      email: compEmail.trim() || 'sales@company.com',
+      phone: compPhone.trim() || '+91 98000 00000',
     });
 
     setCompName('');
     setCompCode('');
-    alert(`Company "${compName}" added to tenant ${activeTenant.name}!`);
+    setCompGstin('');
+    setCompContact('');
+    setCompPhone('');
+    setCompEmail('');
+    setCompSuccess(`Principal Company "${addedName}" successfully created with GSTIN: ${addedGstin}`);
+    setTimeout(() => setCompSuccess(null), 5000);
+  };
+
+  const handleStartEditCompany = (company: Company) => {
+    setEditingCompany(company);
+    setEditCompName(company.name);
+    setEditCompCode(company.code);
+    setEditCompRel(company.relationship_type);
+    setEditCompGstin(company.gstin || '');
+    setEditCompContact(company.contact_person || '');
+    setEditCompPhone(company.phone || '');
+    setEditCompEmail(company.email || '');
+    setEditCompError(null);
+  };
+
+  const handleSaveEditCompany = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingCompany) return;
+    setEditCompError(null);
+
+    const nameVal = validateStoreName(editCompName);
+    if (!nameVal.isValid) {
+      setEditCompError(`Company Name Error: ${nameVal.error}`);
+      return;
+    }
+
+    // Mandatory GSTIN validation on edit as well
+    const gstinVal = validateGSTIN(editCompGstin, true);
+    if (!gstinVal.isValid) {
+      setEditCompError(`GSTIN Validation Error: ${gstinVal.error}`);
+      return;
+    }
+
+    const code = editCompCode.trim() ? editCompCode.trim().toUpperCase() : editCompName.substring(0, 4).toUpperCase();
+    const isDuplicate = companies.some(
+      (c) => c.id !== editingCompany.id && (c.name.toLowerCase() === editCompName.trim().toLowerCase() || c.code === code)
+    );
+    if (isDuplicate) {
+      setEditCompError(`A company with name "${editCompName}" or code "${code}" already exists.`);
+      return;
+    }
+
+    const updatedName = nameVal.formatted!;
+    const updatedGstin = gstinVal.formatted!;
+
+    updateCompany(editingCompany.id, {
+      name: updatedName,
+      code,
+      relationship_type: editCompRel,
+      gstin: updatedGstin,
+      contact_person: editCompContact.trim() || 'Manager',
+      email: editCompEmail.trim() || 'sales@company.com',
+      phone: editCompPhone.trim() || '+91 98000 00000',
+    });
+
+    setEditingCompany(null);
+    setCompSuccess(`Principal Company "${updatedName}" updated successfully with GSTIN: ${updatedGstin}`);
+    setTimeout(() => setCompSuccess(null), 5000);
   };
 
   const handleAddDispatch = (e: React.FormEvent) => {
@@ -450,61 +545,274 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
             </div>
           </div>
 
-          <form onSubmit={handleAddCompany} className="p-3 bg-slate-900 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-4 gap-2 text-xs">
+          {/* Feedback & Error Alerts */}
+          {compError && (
+            <div className="p-3 bg-rose-950/60 border border-rose-500/40 text-rose-300 rounded-xl text-xs flex items-center justify-between shadow-sm animate-in fade-in">
+              <div className="flex items-center gap-2">
+                <AlertCircle size={15} className="text-rose-400 shrink-0" />
+                <span>{compError}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCompError(null)}
+                className="text-rose-400 hover:text-white p-1 rounded"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
+          {compSuccess && (
+            <div className="p-3 bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 rounded-xl text-xs flex items-center justify-between shadow-sm animate-in fade-in">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+                <span className="font-semibold">{compSuccess}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCompSuccess(null)}
+                className="text-emerald-400 hover:text-white p-1 rounded"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
+          {/* Add Company Form with Mandatory GST Field */}
+          <form onSubmit={handleAddCompany} className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2 text-xs">
             <input
               type="text"
-              placeholder="Company Name"
+              placeholder="Company Name *"
               value={compName}
               onChange={(e) => setCompName(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white focus:outline-hidden focus:border-blue-500"
               required
             />
             <input
               type="text"
               placeholder="Code (e.g. BRIT)"
               value={compCode}
-              onChange={(e) => setCompCode(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white uppercase font-mono"
+              onChange={(e) => setCompCode(e.target.value.toUpperCase())}
+              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white uppercase font-mono focus:outline-hidden focus:border-blue-500"
+            />
+            <input
+              type="text"
+              placeholder="Mandatory GSTIN * (15 chars)"
+              value={compGstin}
+              onChange={(e) => setCompGstin(e.target.value.toUpperCase().replace(/[\s-]/g, ''))}
+              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono uppercase font-semibold text-emerald-400 focus:outline-hidden focus:border-emerald-500"
+              maxLength={15}
+              required
             />
             <select
               value={compRel}
               onChange={(e) => setCompRel(e.target.value as any)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white focus:outline-hidden focus:border-blue-500"
             >
               <option value="CF">C&F Relationship</option>
               <option value="SS">Super Stockist</option>
               <option value="TCD">Transporter-Distributor</option>
             </select>
-            <button type="submit" className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg px-3 py-1.5">
-              + Add Company
+            <button
+              type="submit"
+              className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 shadow transition-all cursor-pointer"
+            >
+              <Plus size={14} /> Add Company
             </button>
           </form>
 
-          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden text-xs">
-            <table className="w-full text-left">
-              <thead>
-                <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase font-semibold">
-                  <th className="p-3">Company Code</th>
-                  <th className="p-3">Name</th>
-                  <th className="p-3">Type</th>
-                  <th className="p-3">GSTIN</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800 text-slate-200">
-                {companies.map((c) => (
-                  <tr key={c.id}>
-                    <td className="p-3 font-mono font-bold text-white">{c.code}</td>
-                    <td className="p-3 font-semibold">{c.name}</td>
-                    <td className="p-3">
-                      <span className="px-2 py-0.5 rounded bg-slate-800 text-blue-300 font-mono text-[10px]">
-                        {c.relationship_type}
-                      </span>
-                    </td>
-                    <td className="p-3 font-mono text-slate-400">{c.gstin}</td>
+          {/* Principal Companies Table with Edit Action Icon in Front */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden text-xs shadow-md">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase font-semibold">
+                    <th className="p-3 text-center w-20">Edit</th>
+                    <th className="p-3">Company Code</th>
+                    <th className="p-3">Name</th>
+                    <th className="p-3">Type</th>
+                    <th className="p-3">GSTIN (Mandatory)</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-slate-800 text-slate-200">
+                  {companies.map((c) => (
+                    <tr key={c.id} className="hover:bg-slate-800/40 transition-colors">
+                      {/* Edit action icon in front of each specific company */}
+                      <td className="p-3 text-center">
+                        <button
+                          type="button"
+                          onClick={() => handleStartEditCompany(c)}
+                          className="p-1.5 rounded-lg bg-blue-600/15 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 transition-all inline-flex items-center gap-1 shadow-xs cursor-pointer"
+                          title={`Edit Principal Company ${c.name}`}
+                        >
+                          <Edit2 size={13} />
+                          <span className="text-[11px] font-bold">Edit</span>
+                        </button>
+                      </td>
+                      <td className="p-3 font-mono font-bold text-white">
+                        <span className="px-2 py-0.5 rounded bg-slate-800 text-blue-400 border border-slate-700 font-mono text-[10px]">
+                          {c.code}
+                        </span>
+                      </td>
+                      <td className="p-3 font-semibold text-white">{c.name}</td>
+                      <td className="p-3">
+                        <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px]">
+                          {c.relationship_type === 'CF' ? 'C&F' : c.relationship_type === 'SS' ? 'Super Stockist' : 'Transporter-Distributor'}
+                        </span>
+                      </td>
+                      <td className="p-3 font-mono font-bold">
+                        {c.gstin ? (
+                          <span className="px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 font-mono text-xs">
+                            {c.gstin}
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded bg-rose-950/60 border border-rose-500/40 text-rose-300 text-[10px]">
+                            Missing GSTIN
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* EDIT PRINCIPAL COMPANY MODAL */}
+      {editingCompany && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-5 space-y-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-white text-sm flex items-center gap-2">
+                <Edit2 size={16} className="text-blue-400" /> Edit Principal Company: {editingCompany.name}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingCompany(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditCompany} className="space-y-4 text-xs">
+              {editCompError && (
+                <div className="p-2.5 rounded-lg bg-rose-950/50 border border-rose-500/40 text-rose-300 flex items-center gap-2">
+                  <AlertCircle size={14} className="shrink-0" />
+                  <span>{editCompError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold">Company Name *</label>
+                  <input
+                    type="text"
+                    value={editCompName}
+                    onChange={(e) => setEditCompName(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-blue-500"
+                    placeholder="e.g. Britannia Industries"
+                    required
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold">Company Code *</label>
+                  <input
+                    type="text"
+                    value={editCompCode}
+                    onChange={(e) => setEditCompCode(e.target.value.toUpperCase())}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono uppercase focus:outline-hidden focus:border-blue-500"
+                    placeholder="e.g. BRIT"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold">Relationship Type *</label>
+                  <select
+                    value={editCompRel}
+                    onChange={(e) => setEditCompRel(e.target.value as any)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-blue-500"
+                  >
+                    <option value="CF">C&F Relationship</option>
+                    <option value="SS">Super Stockist</option>
+                    <option value="TCD">Transporter-Distributor</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold flex items-center gap-1">
+                    <span>Mandatory GSTIN *</span>
+                    <span className="text-[10px] text-amber-400 font-normal">(15 digits)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={editCompGstin}
+                    onChange={(e) => setEditCompGstin(e.target.value.toUpperCase().replace(/[\s-]/g, ''))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono uppercase font-bold text-emerald-400 focus:outline-hidden focus:border-emerald-500"
+                    placeholder="07AAAAA0000A1Z5"
+                    maxLength={15}
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold">Contact Person</label>
+                  <input
+                    type="text"
+                    value={editCompContact}
+                    onChange={(e) => setEditCompContact(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-blue-500"
+                    placeholder="Key Account Mgr"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold">Phone Number</label>
+                  <input
+                    type="text"
+                    value={editCompPhone}
+                    onChange={(e) => setEditCompPhone(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-blue-500"
+                    placeholder="+91 98000 00000"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-semibold">Email Address</label>
+                  <input
+                    type="email"
+                    value={editCompEmail}
+                    onChange={(e) => setEditCompEmail(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-blue-500"
+                    placeholder="sales@company.com"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-slate-800 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setEditingCompany(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center gap-1.5 shadow cursor-pointer transition-all"
+                >
+                  <CheckCircle2 size={14} /> Save Company Changes
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -1065,6 +1065,27 @@ export const useAppStore = () => {
       }
     },
 
+    updateCompany: (companyId: string, updates: Partial<Company>) => {
+      memoryStore.companies = memoryStore.companies.map((c) =>
+        c.id === companyId ? { ...c, ...updates } : c
+      );
+      persist();
+
+      if (isFirebaseConfigured()) {
+        const updated = memoryStore.companies.find((c) => c.id === companyId);
+        if (updated) saveRecordToFirestore(COLLECTIONS.COMPANIES, companyId, updated);
+      }
+    },
+
+    deleteCompany: (companyId: string) => {
+      memoryStore.companies = memoryStore.companies.filter((c) => c.id !== companyId);
+      persist();
+
+      if (isFirebaseConfigured()) {
+        deleteRecordFromFirestore(COLLECTIONS.COMPANIES, companyId);
+      }
+    },
+
     // Dispatch Point CRUD
     addDispatchPoint: (dp: DispatchPoint) => {
       memoryStore.dispatchPoints = [dp, ...memoryStore.dispatchPoints];

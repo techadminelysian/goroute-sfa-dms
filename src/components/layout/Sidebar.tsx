@@ -11,8 +11,7 @@ import {
   BarChart3,
   Settings,
   CheckCircle2,
-  Tag,
-  Languages
+  Tag
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -29,8 +28,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     activeTenant,
     activeTenantSettings,
     activeRole = 'ADMIN',
-    language,
-    setLanguage,
     orders = [],
     claims = [],
     retailers = []
@@ -181,44 +178,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
       </div>
 
-      {/* Language Selector in Sidebar */}
-      <div className="pt-3 border-t border-slate-800/80">
-        <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800/80">
-          <div className="flex items-center justify-between text-[11px] font-medium text-slate-300 mb-1.5">
-            <span className="text-slate-400 flex items-center gap-1">
-              <Languages size={13} className="text-emerald-400" />
-              <span>Language / भाषा</span>
-            </span>
-            <span className="text-[10px] font-mono text-emerald-400 font-bold uppercase">
-              {language === 'hi' ? 'हिंदी' : 'EN'}
-            </span>
-          </div>
-          <div className="grid grid-cols-2 gap-1 bg-slate-950 p-0.5 rounded-md border border-slate-800">
-            <button
-              type="button"
-              onClick={() => setLanguage('en')}
-              className={`py-1 rounded text-xs font-bold text-center transition-all ${
-                language === 'en'
-                  ? 'bg-blue-600 text-white shadow-xs'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              English
-            </button>
-            <button
-              type="button"
-              onClick={() => setLanguage('hi')}
-              className={`py-1 rounded text-xs font-bold text-center transition-all ${
-                language === 'hi'
-                  ? 'bg-emerald-600 text-white shadow-xs'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              हिंदी
-            </button>
-          </div>
-        </div>
-      </div>
 
       {/* Footer Info: Swappable Accounting Status */}
       <div className="pt-3 border-t border-slate-800/80 text-xs text-slate-400">

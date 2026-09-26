@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAppStore } from './data/store';
 import { Header } from './components/layout/Header';
 import { Sidebar } from './components/layout/Sidebar';
@@ -28,6 +28,13 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isFirebaseOpen, setIsFirebaseOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
+
+  // Enforce English language for web view users (all roles except Commission Agent & Dispatcher)
+  useEffect(() => {
+    if (activeRole !== 'AGENT' && activeRole !== 'DISPATCHER' && language !== 'en') {
+      setLanguage('en');
+    }
+  }, [activeRole, language, setLanguage]);
 
   // If user is not authenticated, render full-screen secure authentication gate
   if (!isAuthenticated) {

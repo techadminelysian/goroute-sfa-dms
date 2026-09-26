@@ -29,10 +29,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 }) => {
   const {
     activeTenant,
+    currentUser,
     login,
     language,
     setLanguage
   } = useAppStore();
+
+  const isWebUser = Boolean(currentUser && currentUser.role !== 'AGENT' && currentUser.role !== 'DISPATCHER');
 
   // Form States
   const [mobileNumber, setMobileNumber] = useState('');
@@ -114,32 +117,34 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Language Selection */}
-            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-xs shadow-xs">
-              <button
-                type="button"
-                onClick={() => setLanguage('en')}
-                className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all flex items-center gap-1 ${
-                  language === 'en'
-                    ? 'bg-blue-600 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Languages size={11} />
-                <span>EN</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setLanguage('hi')}
-                className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all ${
-                  language === 'hi'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <span>हिंदी</span>
-              </button>
-            </div>
+            {/* Language Selection: Hidden for web view console users */}
+            {!isWebUser && (
+              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-xs shadow-xs">
+                <button
+                  type="button"
+                  onClick={() => setLanguage('en')}
+                  className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all flex items-center gap-1 ${
+                    language === 'en'
+                      ? 'bg-blue-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Languages size={11} />
+                  <span>EN</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLanguage('hi')}
+                  className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all ${
+                    language === 'hi'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <span>हिंदी</span>
+                </button>
+              </div>
+            )}
 
             {!isForcedAuth && onClose && (
               <button
