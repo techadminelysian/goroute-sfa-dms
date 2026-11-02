@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAppStore } from '../../data/store';
 import { Tenant, TenantSettings, Company, DispatchPoint, SKU, AccountingSystem } from '../../types';
+import { isOnboardingAuthorized } from '../../utils/authClient';
 import {
   Sparkles,
   Building2,
@@ -14,7 +15,8 @@ import {
   ArrowLeft,
   Plus,
   Trash2,
-  Palette
+  Palette,
+  ShieldAlert
 } from 'lucide-react';
 
 interface OnboardingWizardProps {
@@ -22,7 +24,31 @@ interface OnboardingWizardProps {
 }
 
 export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({ onComplete }) => {
-  const { addTenant, addCompany, addDispatchPoint, addSKU } = useAppStore();
+  const { addTenant, addCompany, addDispatchPoint, addSKU, currentUser } = useAppStore();
+
+  const isAuthorized = isOnboardingAuthorized(currentUser);
+
+  if (!isAuthorized) {
+    return (
+      <div className="bg-slate-900 border border-rose-800 rounded-2xl max-w-md w-full p-6 text-center space-y-4 shadow-2xl mx-auto my-12 animate-in fade-in zoom-in-95 duration-150">
+        <div className="w-12 h-12 rounded-full bg-rose-950 border border-rose-700 text-rose-400 flex items-center justify-center mx-auto">
+          <ShieldAlert size={24} />
+        </div>
+        <div>
+          <h3 className="font-bold text-white text-base">Restricted User Access</h3>
+          <p className="text-xs text-slate-400 mt-1">
+            Tenant Setup and Onboarding Wizard are strictly accessible to current user: <strong>Yash Sharma</strong>.
+          </p>
+        </div>
+        <button
+          onClick={onComplete}
+          className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-lg text-xs transition-colors"
+        >
+          Close
+        </button>
+      </div>
+    );
+  }
 
   const [step, setStep] = useState<number>(1);
 
@@ -93,6 +119,9 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({ onComplete }
 
     addTenant(newTenant, newSettings);
 
+    // Resolve primary dispatch point for companies
+    const primaryDpId = `dp_${Date.now()}_0`;
+
     // Save Companies
     companies.forEach((comp, idx) => {
       if (comp.name) {
@@ -107,6 +136,7 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({ onComplete }
           contact_person: comp.contact_person || 'Manager',
           email: 'sales@' + (comp.name || 'company').toLowerCase().replace(/\s+/g, '') + '.com',
           phone: '+91 98000 00000',
+          dispatch_point_id: primaryDpId,
         });
 
         // Save SKUs for this company

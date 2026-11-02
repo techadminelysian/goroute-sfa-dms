@@ -15,7 +15,7 @@ import {
   Moon,
   Languages
 } from 'lucide-react';
-import { sanitizeMobileNumber } from '../../utils/authClient';
+import { sanitizeMobileNumber, isTenantSettingsAuthorized, isOnboardingAuthorized } from '../../utils/authClient';
 
 interface HeaderProps {
   onOpenOnboarding: () => void;
@@ -46,24 +46,26 @@ export const Header: React.FC<HeaderProps> = ({
   } = useAppStore();
 
   const roleLabelMap: Record<UserRole, { label: string; platform: 'WEB' | 'MOBILE' }> = {
-    ADMIN: { label: 'Admin / Sub-Admin', platform: 'WEB' },
+    ADMIN: { label: 'Admin', platform: 'WEB' },
+    SUB_ADMIN: { label: 'Sub-Admin', platform: 'WEB' },
     BILLING: { label: 'Billing Executive', platform: 'WEB' },
     ORDER_PUNCHER: { label: 'Order Puncher', platform: 'WEB' },
     DISPATCHER: { label: 'Dispatcher', platform: 'MOBILE' },
     ACCOUNTANT: { label: 'Accountant', platform: 'WEB' },
-    AGENT: { label: 'Commission Agent', platform: 'MOBILE' },
+    DISTRIBUTOR: { label: 'Distributor', platform: 'WEB' },
+    SALES_EXECUTIVE: { label: 'Sales Executive', platform: 'MOBILE' },
+    COMMISSION_AGENT: { label: 'Commission Agent', platform: 'MOBILE' },
+    DELIVERY_VAN_EXECUTIVE: { label: 'Delivery Van Executive', platform: 'MOBILE' },
   };
 
   const userAssignedRole = currentUser?.role || activeRole || 'ADMIN';
   const roleInfo = roleLabelMap[userAssignedRole] || { label: userAssignedRole, platform: 'WEB' };
-  const isMobileUserRole = userAssignedRole === 'AGENT' || userAssignedRole === 'DISPATCHER';
+  const isMobileUserRole = userAssignedRole === 'COMMISSION_AGENT' || userAssignedRole === 'DISPATCHER';
 
   // Super-admin / backend developer check strictly scoped to user ID / mobile 7830260134
-  const isSuperTechAdmin = Boolean(
-    currentUser &&
-    (currentUser.id === '7830260134' ||
-     (currentUser.mobile_number && sanitizeMobileNumber(currentUser.mobile_number) === '7830260134'))
-  );
+  const isSuperTechAdmin = isTenantSettingsAuthorized(currentUser);
+  // Onboarding Wizard check strictly scoped to user Yash Sharma
+  const isYashSharma = isOnboardingAuthorized(currentUser);
 
   return (
     <header className="sticky top-0 z-40 bg-slate-950 border-b border-slate-800 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-slate-200 shadow-sm">
@@ -75,17 +77,14 @@ export const Header: React.FC<HeaderProps> = ({
             className="w-8 h-8 rounded-lg flex items-center justify-center p-1.5 shadow-inner font-black text-white text-xs uppercase"
             style={{ backgroundColor: activeTenant?.accent_color || '#2563eb' }}
           >
-            {(activeTenant?.name || 'MS').substring(0, 2)}
+            GR
           </div>
           <div>
             <div className="text-sm font-bold tracking-tight text-white leading-none flex items-center gap-2">
-              {activeTenant?.name || 'MS Enterprises'}
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 border border-slate-700 font-normal">
-                {activeTenant?.type || 'FMCG_DISTRIBUTOR'}
-              </span>
+              Go Route
             </div>
             <div className="text-[10px] font-semibold text-slate-400 mt-0.5">
-              Distributor Operations Console | GST: {activeTenant?.gstin || '27AABCU9603R1ZM'}
+              Distributor Operations Console
             </div>
           </div>
         </div>
@@ -152,12 +151,12 @@ export const Header: React.FC<HeaderProps> = ({
             onClick={() => setTheme('light')}
             className={`px-2 py-1 rounded-md font-medium text-xs flex items-center gap-1.5 transition-all ${
               theme === 'light'
-                ? 'bg-amber-500/20 text-amber-600 border border-amber-500/40 font-semibold shadow-xs'
+                ? 'bg-[#EFF6FF] text-[#1E40AF] border border-[#BFDBFE] font-semibold shadow-xs'
                 : 'text-slate-400 hover:text-slate-200 border border-transparent'
             }`}
-            title="Switch to Light Theme"
+            title="Switch to Haute-Minimalist Executive Light Theme"
           >
-            <Sun size={13} className={theme === 'light' ? 'text-amber-500' : 'text-slate-400'} />
+            <Sun size={13} className={theme === 'light' ? 'text-[#1E40AF]' : 'text-slate-400'} />
             <span className="hidden sm:inline font-semibold">Light</span>
           </button>
           <button
@@ -278,15 +277,17 @@ export const Header: React.FC<HeaderProps> = ({
               <Settings size={16} />
             </button>
 
-            {/* Run Setup Wizard */}
-            <button
-              onClick={onOpenOnboarding}
-              className="px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white transition-all shadow-sm"
-              title="Run System Setup Wizard"
-            >
-              <Sparkles size={14} />
-              <span>Client Setup</span>
-            </button>
+            {/* Run Setup Wizard - Strictly accessible to user Yash Sharma */}
+            {isYashSharma && (
+              <button
+                onClick={onOpenOnboarding}
+                className="px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white transition-all shadow-sm"
+                title="Run System Setup Wizard"
+              >
+                <Sparkles size={14} />
+                <span>Client Setup</span>
+              </button>
+            )}
 
             {/* Reset Store Data */}
             <button

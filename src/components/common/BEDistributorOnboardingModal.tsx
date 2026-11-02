@@ -14,7 +14,8 @@ import {
   User,
   Shield,
   ArrowRight,
-  Plus
+  Plus,
+  UserCheck
 } from 'lucide-react';
 import { validateGSTIN, validatePhoneNumber } from '../../utils/validators';
 
@@ -29,7 +30,7 @@ export const BEDistributorOnboardingModal: React.FC<BEDistributorOnboardingModal
   onClose,
   onSuccess,
 }) => {
-  const { activeTenant, dispatchPoints, retailers, distributors, addDistributor, currentUser, activeRole } = useAppStore();
+  const { activeTenant, dispatchPoints, retailers, distributors, addDistributor, currentUser, activeRole, users } = useAppStore();
 
   const [channel, setChannel] = useState<'DISTRIBUTOR' | 'INSTITUTIONAL'>('DISTRIBUTOR');
   const [name, setName] = useState('');
@@ -44,6 +45,9 @@ export const BEDistributorOnboardingModal: React.FC<BEDistributorOnboardingModal
   const [stateName, setStateName] = useState('Delhi NCR');
   const [pincode, setPincode] = useState('');
   const [dispatchPointId, setDispatchPointId] = useState<string>(dispatchPoints[0]?.id || '');
+  const [billingExecutiveId, setBillingExecutiveId] = useState<string>(
+    currentUser?.role === 'BILLING' ? currentUser.id : (users.find(u => u.role === 'BILLING')?.id || 'usr_billing_1')
+  );
   const [creditLimit, setCreditLimit] = useState<number>(500000);
   const [creditDays, setCreditDays] = useState<number>(21);
 
@@ -177,6 +181,7 @@ export const BEDistributorOnboardingModal: React.FC<BEDistributorOnboardingModal
       credit_limit: Number(creditLimit) || 0,
       credit_days: Number(creditDays) || 0,
       dispatch_point_id: dispatchPointId || null,
+      billing_executive_id: billingExecutiveId || currentUser?.id || 'usr_billing_1',
       current_outstanding: 0,
       onboarded_by_role: activeRole || 'BILLING',
       onboarded_by_user_id: currentUser?.id || null,
@@ -593,6 +598,33 @@ export const BEDistributorOnboardingModal: React.FC<BEDistributorOnboardingModal
                     <option value={60}>60 Days Credit</option>
                   </select>
                 </div>
+              </div>
+            </div>
+
+            {/* Section 6: Mapped Billing Executive */}
+            <div className="p-3 bg-indigo-950/30 border border-indigo-900/60 rounded-xl space-y-2">
+              <div className="text-[11px] font-bold text-indigo-300 uppercase tracking-wider flex items-center gap-1.5">
+                <UserCheck size={12} className="text-indigo-400" />
+                <span>Mapped Billing Executive (BE Verification Desk)</span>
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-300 mb-1">
+                  Designated Billing Executive <span className="text-rose-400">*</span>
+                </label>
+                <select
+                  value={billingExecutiveId}
+                  onChange={(e) => setBillingExecutiveId(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-1.5 text-xs text-white outline-none"
+                >
+                  {users.filter(u => u.role === 'BILLING').map((be) => (
+                    <option key={be.id} value={be.id}>
+                      {be.name} ({be.email || be.mobile_number}) {be.id === currentUser?.id ? '• (Current User)' : ''}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Orders placed by or for this distributor route directly to this Billing Executive's desk for order clearance and verification.
+                </p>
               </div>
             </div>
 

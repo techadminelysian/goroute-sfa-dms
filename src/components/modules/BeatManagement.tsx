@@ -60,7 +60,7 @@ export const BeatManagement: React.FC = () => {
 
   // Agents list for assignment dropdown
   const commissionAgents = users.filter(
-    (u) => u.role === 'AGENT'
+    (u) => u.role === 'COMMISSION_AGENT'
   );
 
   const openCreateModal = () => {

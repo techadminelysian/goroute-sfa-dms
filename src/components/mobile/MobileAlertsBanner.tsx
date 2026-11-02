@@ -22,7 +22,7 @@ export const MobileAlertsBanner: React.FC = () => {
   const agentAlerts = workflowNotifications.filter((n) => {
     // If target_roles is specified, check if it contains AGENT or ALL
     if (n.target_roles && n.target_roles.length > 0) {
-      if (!n.target_roles.includes('AGENT') && !n.target_roles.includes('ALL')) {
+      if (!n.target_roles.includes('COMMISSION_AGENT') && !n.target_roles.includes('ALL')) {
         return false;
       }
     }

@@ -37,6 +37,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
     orders = [],
     users = [],
     retailers = [],
+    distributors = [],
     dispatchPoints = [],
     currentUser,
     activeRole,
@@ -50,6 +51,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   const [statusFilter, setStatusFilter] = useState<'PENDING_VERIFICATION' | 'ALL' | 'VERIFIED' | 'CANCELLED'>('PENDING_VERIFICATION');
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [selectedDPFilter, setSelectedDPFilter] = useState<string>('ALL');
+  const [selectedRaiserRoleFilter, setSelectedRaiserRoleFilter] = useState<'ALL' | 'COMMISSION_AGENT' | 'SALES_EXECUTIVE' | 'DISTRIBUTOR'>('ALL');
 
   // Amendment & Partial Approval Modal
   const [activeAmendingOrder, setActiveAmendingOrder] = useState<Order | null>(null);
@@ -65,7 +67,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   const [activeCancellingOrder, setActiveCancellingOrder] = useState<Order | null>(null);
   const [cancellationReason, setCancellationReason] = useState<string>('Credit limit exposure exceeded');
 
-  // Bulk CA Re-assignment Modal (BE Absence Re-route)
+  // Bulk Raiser Re-assignment Modal (BE Absence Re-route)
   const [isReassignmentModalOpen, setIsReassignmentModalOpen] = useState(false);
   const [isTestModalOpen, setIsTestModalOpen] = useState(false);
   const [selectedAgentsForReassign, setSelectedAgentsForReassign] = useState<string[]>([]);
@@ -79,7 +81,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
   // Identify Commission Agents
   const commissionAgents = useMemo(() => {
-    return users.filter((u) => u.role === 'AGENT');
+    return users.filter((u) => u.role === 'COMMISSION_AGENT');
   }, [users]);
 
   // Current BE Profile & ID
@@ -95,16 +97,38 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   const effectiveCurrentBEId = effectiveCurrentBEUser?.id || 'usr_billing_1';
   const effectiveCurrentBEName = effectiveCurrentBEUser?.name || 'Priya Verma (BE-1)';
 
-  // Commission Agents assigned to this Billing Executive
+  // Order Raisers mapped to this Billing Executive
   const assignedCAs = useMemo(() => {
-    return users.filter((u) => u.role === 'AGENT' && u.billing_executive_id === effectiveCurrentBEId);
+    return users.filter((u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === effectiveCurrentBEId);
   }, [users, effectiveCurrentBEId]);
 
-  // Filter Orders: strictly to current Billing Executive's assigned Commission Agents
+  const assignedSEs = useMemo(() => {
+    return users.filter((u) => u.role === 'SALES_EXECUTIVE' && u.billing_executive_id === effectiveCurrentBEId);
+  }, [users, effectiveCurrentBEId]);
+
+  const assignedDistributors = useMemo(() => {
+    const distUsers = users.filter((u) => u.role === 'DISTRIBUTOR' && u.billing_executive_id === effectiveCurrentBEId);
+    const distClients = distributors.filter((d) => d.billing_executive_id === effectiveCurrentBEId);
+    return {
+      users: distUsers,
+      clients: distClients,
+      totalCount: distUsers.length + distClients.length,
+    };
+  }, [users, distributors, effectiveCurrentBEId]);
+
+  // Filter Orders: strictly to current Billing Executive's assigned CFS, Sales Executives, and Distributors
   const filteredOrders = useMemo(() => {
     return orders.filter((o) => {
-      // 1. BE Filter: Strictly orders taken by this BE's assigned Commission Agents
-      if (!isOrderAssignedToBE(o, effectiveCurrentBEId, users)) return false;
+      // 1. BE Filter: Strictly orders from this BE's mapped raisers
+      if (!isOrderAssignedToBE(o, effectiveCurrentBEId, users, distributors)) return false;
+
+      // 1b. Raiser Role Filter
+      if (selectedRaiserRoleFilter !== 'ALL') {
+        const creatorUser = users.find((u) => u.id === (o.created_by_user_id || o.commission_agent_id));
+        const isDistClient = distributors.some((d) => d.id === o.retailer_id);
+        const resolvedRole = o.order_source_role || (creatorUser ? creatorUser.role : (isDistClient || o.channel === 'DISTRIBUTOR' ? 'DISTRIBUTOR' : 'COMMISSION_AGENT'));
+        if (resolvedRole !== selectedRaiserRoleFilter) return false;
+      }
 
       // 2. DP Filter
       if (selectedDPFilter !== 'ALL') {
@@ -128,15 +152,16 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
         const retName = (o.retailer_name_raw || '').toLowerCase();
         const ordNo = (o.order_number || '').toLowerCase();
         const agentName = (o.commission_agent_name || '').toLowerCase();
+        const raiserName = (o.order_raiser_name || '').toLowerCase();
         const beatName = (o.beat_name || '').toLowerCase();
-        if (!retName.includes(q) && !ordNo.includes(q) && !agentName.includes(q) && !beatName.includes(q)) {
+        if (!retName.includes(q) && !ordNo.includes(q) && !agentName.includes(q) && !raiserName.includes(q) && !beatName.includes(q)) {
           return false;
         }
       }
 
       return true;
     });
-  }, [orders, effectiveCurrentBEId, users, selectedDPFilter, statusFilter, searchTerm]);
+  }, [orders, effectiveCurrentBEId, users, distributors, selectedRaiserRoleFilter, selectedDPFilter, statusFilter, searchTerm]);
 
   // Handle Opening Partial Approval / Amendment Modal
   const handleOpenAmendmentModal = (order: Order) => {
@@ -184,7 +209,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
       const exposure = calculateCreditExposure(retailer, order.total_amount);
 
       const reason = exposure.isExceeded
-        ? `Approved with Credit Limit Override (Variance: ₹${exposure.variance.toLocaleString('en-IN')})`
+        ? `Approved with Credit Limit Override (Variance: ₹${(exposure.variance || 0).toLocaleString('en-IN')})`
         : 'Approved in Full';
 
       verifyAndApproveOrderByBilling(
@@ -210,7 +235,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
     const exposure = calculateCreditExposure(retailer, activeApprovingOrder.total_amount);
 
     const reason = exposure.isExceeded
-      ? `Approved with Credit Limit Override (Variance: ₹${exposure.variance.toLocaleString('en-IN')})`
+      ? `Approved with Credit Limit Override (Variance: ₹${(exposure.variance || 0).toLocaleString('en-IN')})`
       : 'Approved in Full';
 
     verifyAndApproveOrderByBilling(
@@ -281,35 +306,12 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
           </div>
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-purple-400">
-              CA-to-BE Mapping & Routing Engine
+              Raiser-to-BE Mapping & Verification Engine (CFS • Sales Executive • Distributor)
             </div>
             <h2 className="text-base font-bold text-white mt-0.5">
               Billing Executive Order Verification & Credit Exposure Dashboard
             </h2>
-            <p className="text-xs text-slate-400 mt-1 max-w-2xl">
-              Orders placed by Commission Agents are automatically tagged to their fixed Billing Executive and Dispatch Point.
-              Review credit limits, amend quantities for partial approval, or cancel high-risk orders with real-time CA push alerts.
-            </p>
           </div>
-        </div>
-
-        {/* Action buttons: Test Suite & BE Absence Bulk Re-assignment */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setIsTestModalOpen(true)}
-            className="px-3 py-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/40 text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all shadow-sm"
-            title="Run positive & negative automated verification test scenarios"
-          >
-            <FileCheck size={14} className="text-purple-400" />
-            Verification Test Suite
-          </button>
-          <button
-            onClick={() => setIsReassignmentModalOpen(true)}
-            className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all shadow-sm"
-          >
-            <Users size={14} className="text-purple-400" />
-            Manage CA Mappings & Absence Route
-          </button>
         </div>
       </div>
 
@@ -320,7 +322,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
           <Search size={14} className="absolute left-3 top-2.5 text-slate-500" />
           <input
             type="text"
-            placeholder="Search by store, CA agent, beat, or order #..."
+            placeholder="Search by store, raiser, CA, beat, or order #..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-9 pr-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-purple-500"
@@ -329,15 +331,30 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
         {/* Filters */}
         <div className="flex flex-wrap items-center gap-2">
-          {/* Active Desk Queue Indicator (No redundant BE selector) */}
+          {/* Active Desk Queue Indicator with Multi-Raiser Counts */}
           <div className="flex items-center gap-1.5 bg-purple-950/50 border border-purple-800/60 rounded-xl px-3 py-1.5 text-xs text-purple-200">
             <UserCheck size={13} className="text-purple-400 shrink-0" />
             <span>
               <strong className="text-white font-semibold">Desk: {effectiveCurrentBEName}</strong>
               <span className="text-purple-300/80 ml-1.5 text-[11px]">
-                ({assignedCAs.length} {assignedCAs.length === 1 ? 'Assigned Agent' : 'Assigned Agents'})
+                ({assignedCAs.length} CFS • {assignedSEs.length} SE • {assignedDistributors.totalCount} Dist)
               </span>
             </span>
+          </div>
+
+          {/* Raiser Role Filter */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-400 text-[11px] font-semibold">Raiser Role:</span>
+            <select
+              value={selectedRaiserRoleFilter}
+              onChange={(e) => setSelectedRaiserRoleFilter(e.target.value as any)}
+              className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white font-medium focus:outline-none focus:border-purple-500"
+            >
+              <option value="ALL">All Raisers (CFS / SE / Dist)</option>
+              <option value="COMMISSION_AGENT">CFS (Commission Agents)</option>
+              <option value="SALES_EXECUTIVE">Sales Executives</option>
+              <option value="DISTRIBUTOR">Distributors</option>
+            </select>
           </div>
 
           {/* DP Selector */}
@@ -458,14 +475,14 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
                   <div className="text-right">
                     <div className="text-base font-mono font-bold text-white">
-                      ₹{ord.total_amount.toLocaleString('en-IN')}
+                      ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                     </div>
                     <div className="text-[10px] text-emerald-400 font-medium">
                       Incl. 18% GST
                     </div>
                     {ord.original_total_amount && ord.original_total_amount !== ord.total_amount && (
                       <div className="text-[10px] text-amber-400 line-through">
-                        Orig: ₹{ord.original_total_amount.toLocaleString('en-IN')}
+                        Orig: ₹{(ord.original_total_amount || 0).toLocaleString('en-IN')}
                       </div>
                     )}
                     <div className="text-[10px] text-slate-500">{ord.order_date}</div>
@@ -475,10 +492,23 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                 {/* Routing & Assignment Info Bar */}
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 bg-slate-950 p-2.5 rounded-xl border border-slate-800 text-[11px]">
                   <div>
-                    <span className="text-slate-500 block text-[10px]">Commission Agent</span>
-                    <span className="font-semibold text-slate-200 truncate block">
-                      {ord.commission_agent_name || 'CA Assigned'}
-                    </span>
+                    <span className="text-slate-500 block text-[10px]">Order Raiser / Source</span>
+                    <div className="font-semibold text-slate-200 truncate flex items-center gap-1.5 mt-0.5">
+                      {ord.order_source_role === 'DISTRIBUTOR' || ord.channel === 'DISTRIBUTOR' ? (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-amber-950/90 text-amber-300 border border-amber-800/80 font-bold shrink-0">
+                          Distributor
+                        </span>
+                      ) : ord.order_source_role === 'SALES_EXECUTIVE' ? (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-sky-950/90 text-sky-300 border border-sky-800/80 font-bold shrink-0">
+                          Sales Exec
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-purple-950/90 text-purple-300 border border-purple-800/80 font-bold shrink-0">
+                          CFS (CA)
+                        </span>
+                      )}
+                      <span className="truncate">{ord.order_raiser_name || ord.commission_agent_name || 'Raiser'}</span>
+                    </div>
                   </div>
                   <div>
                     <span className="text-slate-500 block text-[10px]">Assigned BE</span>
@@ -518,7 +548,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                     </div>
                     {exposure.isExceeded && (
                       <span className="font-mono font-bold text-rose-300 bg-rose-500/20 px-2 py-0.5 rounded text-[11px]">
-                        +₹{exposure.variance.toLocaleString('en-IN')} Over
+                        +₹{(exposure.variance || 0).toLocaleString('en-IN')} Over
                       </span>
                     )}
                   </div>
@@ -526,16 +556,16 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   <div className="grid grid-cols-3 gap-2 text-[11px] pt-1 border-t border-slate-800/60 font-mono">
                     <div>
                       <span className="text-slate-400 block text-[10px]">Credit Limit:</span>
-                      <strong>₹{exposure.creditLimit.toLocaleString('en-IN')}</strong>
+                      <strong>₹{(exposure.creditLimit || 0).toLocaleString('en-IN')}</strong>
                     </div>
                     <div>
                       <span className="text-slate-400 block text-[10px]">Current Debt:</span>
-                      <strong>₹{exposure.currentOutstanding.toLocaleString('en-IN')}</strong>
+                      <strong>₹{(exposure.currentOutstanding || 0).toLocaleString('en-IN')}</strong>
                     </div>
                     <div>
                       <span className="text-slate-400 block text-[10px]">Total Exposure:</span>
                       <strong className={exposure.isExceeded ? 'text-rose-300' : 'text-emerald-300'}>
-                        ₹{exposure.totalExposure.toLocaleString('en-IN')}
+                        ₹{(exposure.totalExposure || 0).toLocaleString('en-IN')}
                       </strong>
                     </div>
                   </div>
@@ -628,7 +658,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                     <button
                       onClick={() => {
                         setActiveCancellingOrder(ord);
-                        setCancellationReason(`Credit limit exceeded by ₹${exposure.variance.toLocaleString('en-IN')}`);
+                        setCancellationReason(`Credit limit exceeded by ₹${(exposure.variance || 0).toLocaleString('en-IN')}`);
                       }}
                       className="px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 rounded-xl font-bold flex items-center gap-1.5 transition-all"
                     >
@@ -758,7 +788,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
                           <div className="w-20 text-right font-mono">
                             <span className="text-[10px] text-slate-500 block">Total</span>
-                            <strong className="text-white">₹{lineTot.toLocaleString('en-IN')}</strong>
+                            <strong className="text-white">₹{(lineTot || 0).toLocaleString('en-IN')}</strong>
                           </div>
                         </div>
                       </div>
@@ -771,7 +801,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
               <div className="p-3 bg-slate-950 rounded-2xl border border-slate-800 space-y-1.5 font-mono text-xs">
                 <div className="flex justify-between text-slate-400">
                   <span>Original Order Value (Incl. GST):</span>
-                  <span>₹{activeAmendingOrder.total_amount.toLocaleString('en-IN')}</span>
+                  <span>₹{(activeAmendingOrder?.total_amount || 0).toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400 text-[11px]">
                   <span>Revised Product Subtotal:</span>
@@ -903,7 +933,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
             <form onSubmit={handleSubmitCancellation} className="space-y-4 text-xs">
               <p className="text-slate-300">
-                Are you sure you want to cancel the order for <strong>{activeCancellingOrder.retailer_name_raw}</strong> (Gross: ₹{activeCancellingOrder.total_amount.toLocaleString('en-IN')})?
+                Are you sure you want to cancel the order for <strong>{activeCancellingOrder.retailer_name_raw}</strong> (Gross: ₹{(activeCancellingOrder?.total_amount || 0).toLocaleString('en-IN')})?
               </p>
 
               <div>
@@ -969,7 +999,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
               <div className="flex justify-between items-center text-xs">
                 <span className="text-slate-400">Order Amount:</span>
                 <span className="font-mono font-bold text-white text-sm">
-                  ₹{activeApprovingOrder.total_amount.toLocaleString('en-IN')}
+                  ₹{(activeApprovingOrder?.total_amount || 0).toLocaleString('en-IN')}
                 </span>
               </div>
               <div className="flex justify-between items-center text-xs">

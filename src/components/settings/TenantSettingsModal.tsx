@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { useAppStore } from '../../data/store';
 import { AccountingSystem } from '../../types';
 import { validateGSTIN, validateStoreName } from '../../utils/validators';
-import { Settings, Sliders, CheckCircle2, Shield, Palette, Building2, AlertCircle, Sun, Moon } from 'lucide-react';
+import { isTenantSettingsAuthorized } from '../../utils/authClient';
+import { Settings, Sliders, CheckCircle2, Shield, Palette, Building2, AlertCircle, Sun, Moon, ShieldAlert } from 'lucide-react';
 
 interface TenantSettingsModalProps {
   onClose: () => void;
@@ -12,11 +13,38 @@ export const TenantSettingsModal: React.FC<TenantSettingsModalProps> = ({ onClos
   const {
     activeTenant,
     activeTenantSettings,
+    currentUser,
     updateTenantBranding,
     updateTenantSettings,
     theme,
     setTheme
   } = useAppStore();
+
+  const isAuthorized = isTenantSettingsAuthorized(currentUser);
+
+  if (!isAuthorized) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-slate-900 border border-rose-800 rounded-2xl max-w-md w-full p-6 text-center space-y-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+          <div className="w-12 h-12 rounded-full bg-rose-950 border border-rose-700 text-rose-400 flex items-center justify-center mx-auto">
+            <ShieldAlert size={24} />
+          </div>
+          <div>
+            <h3 className="font-bold text-white text-base">Backend Team Access Only</h3>
+            <p className="text-xs text-slate-400 mt-1">
+              Tenant Settings are restricted to backend administrator with User ID <strong>7830260134</strong>.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-lg text-xs transition-colors"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const [tenantName, setTenantName] = useState(activeTenant.name);
   const [accentColor, setAccentColor] = useState(activeTenant.accent_color);
@@ -264,25 +292,25 @@ export const TenantSettingsModal: React.FC<TenantSettingsModalProps> = ({ onClos
                 onClick={() => setTheme('light')}
                 className={`p-3 rounded-xl border text-left flex flex-col justify-between transition-all ${
                   theme === 'light'
-                    ? 'bg-amber-500/15 border-amber-500 text-slate-900 shadow-sm ring-1 ring-amber-500/40'
+                    ? 'bg-[#EFF6FF] border-[#1E40AF] text-[#0F172A] shadow-xs ring-1 ring-[#1E40AF]/30'
                     : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
                 }`}
               >
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
-                    <div className="w-6 h-6 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-amber-500">
+                    <div className="w-6 h-6 rounded-lg bg-white border border-[#CBD5E1] flex items-center justify-center text-[#1E40AF]">
                       <Sun size={13} />
                     </div>
-                    <span className="font-bold text-xs text-white">Light Theme</span>
+                    <span className="font-bold text-xs text-[#0F172A]">Executive Light</span>
                   </div>
                   {theme === 'light' && (
-                    <span className="text-[10px] font-semibold text-amber-600 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20">
+                    <span className="text-[10px] font-semibold text-[#1E40AF] bg-[#EFF6FF] px-1.5 py-0.5 rounded border border-[#BFDBFE]">
                       Active
                     </span>
                   )}
                 </div>
-                <p className="text-[10px] text-slate-400 leading-relaxed">
-                  Crisp off-white canvas with high-contrast text, clear borders, and optimal daytime readability.
+                <p className="text-[10px] text-[#64748B] leading-relaxed">
+                  Haute-Minimalist Executive B2B palette with matte Slate 50 canvas (#F8FAFC), crisp white cards, Slate Ink typography, and Royal Blue accents (#1E40AF).
                 </p>
               </button>
             </div>

@@ -15,13 +15,24 @@ import {
   Zap,
   Info,
   Calendar,
-  Warehouse
+  Warehouse,
+  Briefcase,
+  Building2
 } from 'lucide-react';
+
+interface UnifiedRaiserItem {
+  id: string;
+  name: string;
+  mobile?: string;
+  role: 'COMMISSION_AGENT' | 'SALES_EXECUTIVE' | 'DISTRIBUTOR';
+  roleTag: string;
+  billing_executive_id?: string | null;
+}
 
 export const BEAbsenceRemappingTool: React.FC = () => {
   const {
     users,
-    dispatchPoints,
+    distributors = [],
     updateCAAssignments,
     currentUser,
     activeRole,
@@ -35,39 +46,96 @@ export const BEAbsenceRemappingTool: React.FC = () => {
     [users]
   );
 
-  const commissionAgents = useMemo(
-    () => users.filter((u) => u.role === 'AGENT'),
-    [users]
-  );
+  // Compile all order raisers (CFS, Sales Executives, Distributors)
+  const allOrderRaisers = useMemo<UnifiedRaiserItem[]>(() => {
+    const list: UnifiedRaiserItem[] = [];
+
+    // Commission Agents (CFS)
+    users
+      .filter((u) => u.role === 'COMMISSION_AGENT')
+      .forEach((u) => {
+        list.push({
+          id: u.id,
+          name: u.name,
+          mobile: u.mobile_number,
+          role: 'COMMISSION_AGENT',
+          roleTag: 'CFS (CA)',
+          billing_executive_id: u.billing_executive_id,
+        });
+      });
+
+    // Sales Executives
+    users
+      .filter((u) => u.role === 'SALES_EXECUTIVE')
+      .forEach((u) => {
+        list.push({
+          id: u.id,
+          name: u.name,
+          mobile: u.mobile_number,
+          role: 'SALES_EXECUTIVE',
+          roleTag: 'Sales Exec',
+          billing_executive_id: u.billing_executive_id,
+        });
+      });
+
+    // Distributor users & accounts
+    const seen = new Set<string>();
+    users
+      .filter((u) => u.role === 'DISTRIBUTOR')
+      .forEach((u) => {
+        seen.add(u.id);
+        list.push({
+          id: u.id,
+          name: u.name,
+          mobile: u.mobile_number,
+          role: 'DISTRIBUTOR',
+          roleTag: 'Distributor User',
+          billing_executive_id: u.billing_executive_id,
+        });
+      });
+
+    (distributors || []).forEach((d) => {
+      if (!seen.has(d.id)) {
+        list.push({
+          id: d.id,
+          name: d.name,
+          mobile: d.phone,
+          role: 'DISTRIBUTOR',
+          roleTag: 'Distributor Account',
+          billing_executive_id: d.billing_executive_id,
+        });
+      }
+    });
+
+    return list;
+  }, [users, distributors]);
 
   // Form State
   const [absentBEId, setAbsentBEId] = useState<string>('');
   const [targetBEId, setTargetBEId] = useState<string>('');
-  const [targetDPId, setTargetDPId] = useState<string>('');
-  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
-  const [hasManuallyToggledAgents, setHasManuallyToggledAgents] = useState(false);
+  const [selectedRaiserIds, setSelectedRaiserIds] = useState<string[]>([]);
+  const [hasManuallyToggled, setHasManuallyToggled] = useState(false);
   const [absenceReason, setAbsenceReason] = useState<string>('Leave / Temporary Absence');
   const [isExecuting, setIsExecuting] = useState(false);
   const [successMessage, setSuccessMessage] = useState<{
     count: number;
     absentName: string;
     targetName: string;
-    dpName?: string;
   } | null>(null);
 
   // Resolved active absent BE
   const activeAbsentBEId = absentBEId || (billingExecutives.length > 0 ? billingExecutives[0].id : '');
 
-  // CAs mapped to the active absent BE
-  const affectedAgents = useMemo(() => {
+  // Order raisers mapped to the active absent BE
+  const affectedRaisers = useMemo(() => {
     if (!activeAbsentBEId) return [];
-    return commissionAgents.filter((a) => a.billing_executive_id === activeAbsentBEId);
-  }, [commissionAgents, activeAbsentBEId]);
+    return allOrderRaisers.filter((a) => a.billing_executive_id === activeAbsentBEId);
+  }, [allOrderRaisers, activeAbsentBEId]);
 
-  // Active selected agent IDs (defaults to all affected agents if not manually customized)
-  const currentSelectedAgentIds = hasManuallyToggledAgents
-    ? selectedAgentIds
-    : affectedAgents.map((a) => a.id);
+  // Active selected raiser IDs (defaults to all affected raisers if not manually customized)
+  const currentSelectedRaiserIds = hasManuallyToggled
+    ? selectedRaiserIds
+    : affectedRaisers.map((a) => a.id);
 
   // Candidate replacement BEs (all BEs except absent BE)
   const replacementCandidates = useMemo(() => {
@@ -85,8 +153,8 @@ export const BEAbsenceRemappingTool: React.FC = () => {
   const handleAbsentBEChange = (newAbsentId: string) => {
     setAbsentBEId(newAbsentId);
     setSuccessMessage(null);
-    setHasManuallyToggledAgents(false);
-    setSelectedAgentIds([]);
+    setHasManuallyToggled(false);
+    setSelectedRaiserIds([]);
     const remaining = billingExecutives.filter((b) => b.id !== newAbsentId);
     if (remaining.length > 0) {
       setTargetBEId(remaining[0].id);
@@ -105,8 +173,8 @@ export const BEAbsenceRemappingTool: React.FC = () => {
       alert('Please select a Stand-in / Replacement Billing Executive.');
       return;
     }
-    if (currentSelectedAgentIds.length === 0) {
-      alert('Please select at least one Commission Agent to re-route.');
+    if (currentSelectedRaiserIds.length === 0) {
+      alert('Please select at least one Order Raiser (CFS / SE / Distributor) to re-route.');
       return;
     }
 
@@ -114,20 +182,18 @@ export const BEAbsenceRemappingTool: React.FC = () => {
 
     const absentObj = billingExecutives.find((b) => b.id === activeAbsentBEId);
     const targetObj = billingExecutives.find((b) => b.id === activeTargetBEId);
-    const targetDPObj = dispatchPoints.find((d) => d.id === targetDPId);
 
     // Apply update to store & DB
     updateCAAssignments(
-      currentSelectedAgentIds,
+      currentSelectedRaiserIds,
       activeTargetBEId,
-      targetDPId ? targetDPId : undefined
+      null
     );
 
     setSuccessMessage({
-      count: currentSelectedAgentIds.length,
+      count: currentSelectedRaiserIds.length,
       absentName: absentObj?.name || 'Absent BE',
       targetName: targetObj?.name || 'Replacement BE',
-      dpName: targetDPObj?.name
     });
 
     setIsExecuting(false);
@@ -146,142 +212,137 @@ export const BEAbsenceRemappingTool: React.FC = () => {
             <Zap size={20} />
           </div>
           <div>
-            <h2 className="text-sm font-bold text-white flex items-center gap-2">
-              BE Absence Quick Re-mapping Tool
-              <span className="px-2 py-0.5 rounded-full bg-amber-950 border border-amber-700/60 text-amber-300 text-[10px] font-medium">
-                Instant Roster Failover
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-bold text-white">
+                BE Absence Quick Re-mapping & Failover Tool
+              </h2>
+              <span className="px-2 py-0.5 rounded-full bg-amber-950 border border-amber-800/80 text-amber-300 text-[10px] font-semibold">
+                High Availability
               </span>
-            </h2>
+            </div>
             <p className="text-xs text-slate-400 mt-0.5">
-              Rapidly re-route field orders when a Billing Executive is on leave or absent, ensuring zero order verification bottlenecks.
+              Instantly re-route verification queues from an absent Billing Executive (BE) to a substitute BE for all assigned CFS (Commission Agents), Sales Executives, and Distributors.
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-2 text-xs">
-          <span className="px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-300 font-medium flex items-center gap-1.5">
-            <Users size={13} className="text-blue-400" />
-            {billingExecutives.length} Active Billing Executives
-          </span>
+          <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl flex items-center gap-2">
+            <Users size={14} className="text-purple-400" />
+            <span className="text-slate-400">Total BEs:</span>
+            <strong className="text-white font-mono">{billingExecutives.length}</strong>
+          </div>
         </div>
       </div>
 
-      {/* Success Notification Alert */}
+      {/* Success Notification Banner */}
       {successMessage && (
-        <div className="bg-emerald-950/50 border border-emerald-700/80 rounded-2xl p-4 text-xs text-emerald-200 flex items-start justify-between gap-3 shadow-lg shadow-emerald-950/30 animate-fadeIn">
-          <div className="flex items-start gap-2.5">
-            <CheckCircle2 size={18} className="text-emerald-400 shrink-0 mt-0.5" />
+        <div className="p-4 bg-emerald-950/70 border border-emerald-500/50 rounded-2xl text-emerald-200 text-xs flex items-center justify-between shadow-lg animate-fadeIn">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-emerald-500/20 rounded-xl border border-emerald-500/30 text-emerald-400">
+              <CheckCircle2 size={20} />
+            </div>
             <div>
-              <div className="font-bold text-emerald-100 text-sm">
-                Absence Re-routing Successfully Executed!
+              <div className="font-bold text-white text-sm">
+                Queue Re-routed Successfully!
               </div>
-              <p className="mt-1 text-emerald-200/90 leading-relaxed">
-                <strong>{successMessage.count} Commission Agents</strong> previously assigned to{' '}
-                <strong className="text-white underline">{successMessage.absentName}</strong> have been
-                instantly re-routed to{' '}
-                <strong className="text-white underline">{successMessage.targetName}</strong>
-                {successMessage.dpName ? (
-                  <> with Dispatch Point updated to <strong>{successMessage.dpName}</strong>.</>
-                ) : (
-                  <> (Dispatch Points retained as configured).</>
-                )}
-              </p>
-              <p className="text-[11px] text-emerald-400 mt-1 font-mono">
-                All upcoming field orders from these agents will now appear directly in {successMessage.targetName}'s verification queue.
-              </p>
+              <div className="text-emerald-300 mt-0.5">
+                Re-routed <strong className="text-white">{successMessage.count}</strong> order raiser(s) from{' '}
+                <strong className="text-white">{successMessage.absentName}</strong> to stand-in BE{' '}
+                <strong className="text-white">{successMessage.targetName}</strong>.
+              </div>
             </div>
           </div>
           <button
+            type="button"
             onClick={() => setSuccessMessage(null)}
-            className="text-emerald-400 hover:text-emerald-200 text-[11px] font-bold underline"
+            className="text-emerald-400 hover:text-white px-3 py-1.5 rounded-lg bg-emerald-900/40 border border-emerald-700/60 transition-colors cursor-pointer text-xs font-semibold"
           >
             Dismiss
           </button>
         </div>
       )}
 
-      {/* Main 2-Column Workbench */}
+      {/* Main Grid: Re-route Form & Workload Overview */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* Left Column: Interactive Re-route Form */}
-        <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-xl">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
-              <UserMinus size={15} className="text-amber-400" />
-              Configure Absence Roster Failover
+        {/* Left Column: Re-route Execution Form */}
+        <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+          <div className="border-b border-slate-800 pb-3 flex items-center justify-between">
+            <h3 className="font-bold text-white text-xs uppercase tracking-wider flex items-center gap-2">
+              <RefreshCw size={15} className="text-amber-400" />
+              Configure Failover Routing
             </h3>
-            <span className="text-[10px] text-slate-400">1-Click Execution</span>
+            <span className="text-[11px] text-slate-400">Admin Action</span>
           </div>
 
           <form onSubmit={handleExecuteReroute} className="space-y-4 text-xs">
             {/* Step 1: Select Absent BE */}
-            <div className="space-y-1.5">
+            <div className="space-y-2">
               <label className="block font-bold text-slate-200 text-xs flex items-center gap-1.5">
                 <span className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/40 flex items-center justify-center text-[10px] font-mono">
                   1
                 </span>
-                <span>Select Absent Billing Executive:</span>
+                <span>Select Absent Billing Executive (BE on Leave):</span>
               </label>
 
               <select
                 value={activeAbsentBEId}
                 onChange={(e) => handleAbsentBEChange(e.target.value)}
-                className="w-full bg-slate-950 border border-amber-500/40 focus:border-amber-400 rounded-xl px-3 py-2.5 text-white font-medium text-xs outline-none"
+                className="w-full bg-slate-950 border border-amber-500/40 focus:border-amber-400 rounded-xl px-3 py-2 text-white font-medium outline-none"
                 required
               >
                 {billingExecutives.map((be) => {
-                  const count = commissionAgents.filter((a) => a.billing_executive_id === be.id).length;
+                  const count = allOrderRaisers.filter((a) => a.billing_executive_id === be.id).length;
                   return (
                     <option key={be.id} value={be.id}>
-                      {be.name} ({be.mobile_number || 'BE'}) — {count} Assigned Agents
+                      {be.name} ({count} Raisers Mapped)
                     </option>
                   );
                 })}
               </select>
             </div>
 
-            {/* Affected Agents Preview & Selection */}
-            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1.5">
-                  <Users size={13} className="text-purple-400" />
-                  Commission Agents Mapped to this BE ({affectedAgents.length})
+            {/* Affected Raisers Selection Box */}
+            <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3 space-y-2">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-slate-300">
+                  Select Order Raisers to Re-route ({currentSelectedRaiserIds.length} of {affectedRaisers.length} Selected):
                 </span>
-                {affectedAgents.length > 0 && (
+                {affectedRaisers.length > 0 && (
                   <button
                     type="button"
                     onClick={() => {
-                      setHasManuallyToggledAgents(true);
-                      if (currentSelectedAgentIds.length === affectedAgents.length) {
-                        setSelectedAgentIds([]);
+                      setHasManuallyToggled(true);
+                      if (currentSelectedRaiserIds.length === affectedRaisers.length) {
+                        setSelectedRaiserIds([]);
                       } else {
-                        setSelectedAgentIds(affectedAgents.map((a) => a.id));
+                        setSelectedRaiserIds(affectedRaisers.map((a) => a.id));
                       }
                     }}
                     className="text-[10px] text-purple-400 hover:text-purple-300 font-semibold cursor-pointer"
                   >
-                    {currentSelectedAgentIds.length === affectedAgents.length ? 'Deselect All' : 'Select All'}
+                    {currentSelectedRaiserIds.length === affectedRaisers.length ? 'Deselect All' : 'Select All'}
                   </button>
                 )}
               </div>
 
-              {affectedAgents.length === 0 ? (
+              {affectedRaisers.length === 0 ? (
                 <div className="py-3 text-center text-slate-500 text-xs italic">
-                  No Commission Agents are currently assigned to this Billing Executive.
+                  No order raisers (CFS, SE, or Distributor) are currently assigned to this Billing Executive.
                 </div>
               ) : (
-                <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
-                  {affectedAgents.map((agent) => {
-                    const isChecked = currentSelectedAgentIds.includes(agent.id);
-                    const dpObj = dispatchPoints.find((d) => d.id === agent.dispatch_point_id);
+                <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+                  {affectedRaisers.map((raiser) => {
+                    const isChecked = currentSelectedRaiserIds.includes(raiser.id);
 
                     return (
                       <div
-                        key={agent.id}
+                        key={raiser.id}
                         onClick={() => {
-                          setHasManuallyToggledAgents(true);
-                          setSelectedAgentIds((prev) => {
-                            const baseList = hasManuallyToggledAgents ? prev : affectedAgents.map((a) => a.id);
-                            return isChecked ? baseList.filter((id) => id !== agent.id) : [...baseList, agent.id];
+                          setHasManuallyToggled(true);
+                          setSelectedRaiserIds((prev) => {
+                            const baseList = hasManuallyToggled ? prev : affectedRaisers.map((a) => a.id);
+                            return isChecked ? baseList.filter((id) => id !== raiser.id) : [...baseList, raiser.id];
                           });
                         }}
                         className={`px-2.5 py-1.5 rounded-lg border text-xs flex items-center justify-between cursor-pointer transition-all ${
@@ -297,13 +358,19 @@ export const BEAbsenceRemappingTool: React.FC = () => {
                             onChange={() => {}}
                             className="rounded border-slate-700 text-purple-600 focus:ring-0 cursor-pointer"
                           />
-                          <span className="font-semibold text-xs">{agent.name}</span>
+                          <span className="font-semibold text-xs">{raiser.name}</span>
                           <span className="text-[10px] text-slate-400 font-mono">
-                            +91 {agent.mobile_number || 'Mobile'}
+                            {raiser.mobile ? `+91 ${raiser.mobile}` : ''}
                           </span>
                         </div>
-                        <span className="text-[10px] text-slate-400">
-                          {dpObj?.name || 'Default DP'}
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${
+                          raiser.role === 'COMMISSION_AGENT'
+                            ? 'bg-purple-950 text-purple-300 border border-purple-800/80'
+                            : raiser.role === 'SALES_EXECUTIVE'
+                            ? 'bg-sky-950 text-sky-300 border border-sky-800/80'
+                            : 'bg-amber-950 text-amber-300 border border-amber-800/80'
+                        }`}>
+                          {raiser.roleTag}
                         </span>
                       </div>
                     );
@@ -312,55 +379,35 @@ export const BEAbsenceRemappingTool: React.FC = () => {
               )}
             </div>
 
-            {/* Step 2: Select Replacement BE & Optional DP */}
+            {/* Step 2: Select Replacement BE */}
             <div className="space-y-3 pt-1">
               <label className="block font-bold text-slate-200 text-xs flex items-center gap-1.5">
                 <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 flex items-center justify-center text-[10px] font-mono">
                   2
                 </span>
-                <span>Assign Stand-in Replacement & Destination:</span>
+                <span>Assign Stand-in Replacement Billing Executive:</span>
               </label>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-[10px] font-semibold text-slate-400 mb-1">
-                    Stand-in Billing Executive *
-                  </label>
-                  <select
-                    value={activeTargetBEId}
-                    onChange={(e) => setTargetBEId(e.target.value)}
-                    className="w-full bg-slate-950 border border-emerald-500/40 focus:border-emerald-400 rounded-xl px-3 py-2 text-white font-medium outline-none"
-                    required
-                  >
-                    {replacementCandidates.length === 0 ? (
-                      <option value="">No other Billing Executives available</option>
-                    ) : (
-                      replacementCandidates.map((be) => (
-                        <option key={be.id} value={be.id}>
-                          {be.name} ({be.mobile_number || 'BE'})
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[10px] font-semibold text-slate-400 mb-1">
-                    Warehouse / Dispatch Point (Optional)
-                  </label>
-                  <select
-                    value={targetDPId}
-                    onChange={(e) => setTargetDPId(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-white font-medium outline-none"
-                  >
-                    <option value="">-- Keep Current Dispatch Points --</option>
-                    {dispatchPoints.map((dp) => (
-                      <option key={dp.id} value={dp.id}>
-                        {dp.name} ({dp.code})
+              <div>
+                <label className="block text-[10px] font-semibold text-slate-400 mb-1">
+                  Stand-in Billing Executive *
+                </label>
+                <select
+                  value={activeTargetBEId}
+                  onChange={(e) => setTargetBEId(e.target.value)}
+                  className="w-full bg-slate-950 border border-emerald-500/40 focus:border-emerald-400 rounded-xl px-3 py-2 text-white font-medium outline-none"
+                  required
+                >
+                  {replacementCandidates.length === 0 ? (
+                    <option value="">No other Billing Executives available</option>
+                  ) : (
+                    replacementCandidates.map((be) => (
+                      <option key={be.id} value={be.id}>
+                        {be.name} ({be.mobile_number || 'BE'})
                       </option>
-                    ))}
-                  </select>
-                </div>
+                    ))
+                  )}
+                </select>
               </div>
 
               <div>
@@ -369,7 +416,7 @@ export const BEAbsenceRemappingTool: React.FC = () => {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g. Priya Verma on 3-day leave, rerouting queue to Anjali Sharma"
+                  placeholder="e.g. Priya Verma on 3-day leave, rerouting queue to Rohan Deshmukh"
                   value={absenceReason}
                   onChange={(e) => setAbsenceReason(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white placeholder-slate-500 outline-none focus:border-blue-500"
@@ -383,15 +430,15 @@ export const BEAbsenceRemappingTool: React.FC = () => {
                 type="submit"
                 disabled={
                   isExecuting ||
-                  affectedAgents.length === 0 ||
-                  currentSelectedAgentIds.length === 0 ||
+                  affectedRaisers.length === 0 ||
+                  currentSelectedRaiserIds.length === 0 ||
                   !activeTargetBEId
                 }
                 className="w-full bg-gradient-to-r from-amber-600 via-orange-600 to-amber-700 hover:from-amber-500 hover:to-orange-500 disabled:opacity-40 disabled:hover:from-amber-600 disabled:hover:to-amber-700 text-white font-bold rounded-xl py-3 px-4 flex items-center justify-center gap-2 shadow-lg shadow-amber-950/50 transition-all cursor-pointer text-xs"
               >
                 <Zap size={16} />
                 <span>
-                  Execute Re-routing for {currentSelectedAgentIds.length} Commission Agent(s)
+                  Execute Re-routing for {currentSelectedRaiserIds.length} Order Raiser(s)
                 </span>
                 <ArrowRight size={14} />
               </button>
@@ -407,88 +454,69 @@ export const BEAbsenceRemappingTool: React.FC = () => {
               Current BE Workload Distribution
             </h3>
             <p className="text-[11px] text-slate-400">
-              Live snapshot of Commission Agent allocations per Billing Executive.
+              Live snapshot of CFS, Sales Executive, and Distributor allocations per Billing Executive.
             </p>
 
             <div className="space-y-2.5 pt-1">
               {billingExecutives.map((be) => {
-                const assignedCAs = commissionAgents.filter((a) => a.billing_executive_id === be.id);
-                const isCurrentAbsent = be.id === activeAbsentBEId;
+                const assigned = allOrderRaisers.filter((a) => a.billing_executive_id === be.id);
+                const isSelectedAbsent = be.id === activeAbsentBEId;
+                const isSelectedTarget = be.id === activeTargetBEId;
+
+                const caCount = assigned.filter((a) => a.role === 'COMMISSION_AGENT').length;
+                const seCount = assigned.filter((a) => a.role === 'SALES_EXECUTIVE').length;
+                const distCount = assigned.filter((a) => a.role === 'DISTRIBUTOR').length;
 
                 return (
                   <div
                     key={be.id}
-                    className={`p-3 rounded-xl border transition-all ${
-                      isCurrentAbsent
-                        ? 'bg-amber-950/20 border-amber-500/50 ring-1 ring-amber-500/30'
+                    onClick={() => handleSelectAbsentFromCard(be.id)}
+                    className={`p-3 rounded-xl border transition-all cursor-pointer ${
+                      isSelectedAbsent
+                        ? 'bg-amber-950/30 border-amber-500/60 shadow-md shadow-amber-950/40'
+                        : isSelectedTarget
+                        ? 'bg-emerald-950/30 border-emerald-500/60 shadow-md shadow-emerald-950/40'
                         : 'bg-slate-950 border-slate-800 hover:border-slate-700'
                     }`}
                   >
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
-                        <div
-                          className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${
-                            isCurrentAbsent
-                              ? 'bg-amber-500/20 text-amber-300'
-                              : 'bg-slate-800 text-purple-300'
-                          }`}
-                        >
+                        <div className="w-7 h-7 rounded-full bg-purple-950 text-purple-300 border border-purple-800/80 flex items-center justify-center text-xs font-bold">
                           {be.name.charAt(0)}
                         </div>
                         <div>
-                          <div className="font-bold text-white text-xs">{be.name}</div>
+                          <div className="font-bold text-white text-xs flex items-center gap-1.5">
+                            <span>{be.name}</span>
+                            {isSelectedAbsent && (
+                              <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[9px] font-bold border border-amber-500/40">
+                                Absent
+                              </span>
+                            )}
+                            {isSelectedTarget && (
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[9px] font-bold border border-emerald-500/40">
+                                Stand-in
+                              </span>
+                            )}
+                          </div>
                           <div className="text-[10px] text-slate-400 font-mono">
-                            +91 {be.mobile_number || '9810012345'}
+                            +91 {be.mobile_number || '9810023456'}
                           </div>
                         </div>
                       </div>
 
                       <div className="text-right">
-                        <span className="px-2 py-0.5 rounded-full bg-slate-800 text-purple-300 text-[10px] font-bold font-mono">
-                          {assignedCAs.length} CAs Mapped
-                        </span>
+                        <div className="text-sm font-bold text-white font-mono">
+                          {assigned.length}
+                        </div>
+                        <div className="text-[10px] text-slate-500">
+                          {caCount} CFS • {seCount} SE • {distCount} Dist
+                        </div>
                       </div>
                     </div>
-
-                    {assignedCAs.length > 0 && (
-                      <div className="mt-2.5 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[10px]">
-                        <span className="text-slate-400 truncate max-w-[180px]">
-                          {assignedCAs.map((a) => a.name.split(' ')[0]).join(', ')}
-                        </span>
-                        {!isCurrentAbsent && (
-                          <button
-                            type="button"
-                            onClick={() => handleSelectAbsentFromCard(be.id)}
-                            className="text-amber-400 hover:text-amber-300 font-bold hover:underline"
-                          >
-                            Set as Absent
-                          </button>
-                        )}
-                      </div>
-                    )}
                   </div>
                 );
               })}
             </div>
-          </div>
-
-          {/* Quick Guide Card */}
-          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 text-[11px] text-slate-400 space-y-2">
-            <div className="font-bold text-slate-200 flex items-center gap-1.5">
-              <Info size={14} className="text-blue-400" />
-              How Absence Failover Works:
-            </div>
-            <ul className="list-disc pl-4 space-y-1 leading-relaxed text-slate-400">
-              <li>
-                When you execute a re-route, the selected CAs' <code>billing_executive_id</code> is updated in the database.
-              </li>
-              <li>
-                Any new field orders punched by these agents immediately show up in the replacement BE's verification queue.
-              </li>
-              <li>
-                When the original BE returns, simply use this tool to re-assign the agents back in 1 click.
-              </li>
-            </ul>
           </div>
         </div>
       </div>

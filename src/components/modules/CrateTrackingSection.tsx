@@ -39,7 +39,7 @@ export const CrateTrackingSection: React.FC<CrateTrackingSectionProps> = ({ sele
   } = useAppStore();
 
   const currentDepot = dispatchPoints.find((d) => d.id === selectedDpId) || dispatchPoints[0];
-  const commissionAgents = users.filter((u) => u.role === 'AGENT');
+  const commissionAgents = users.filter((u) => u.role === 'COMMISSION_AGENT');
 
   // Transfer console state
   const [crateTransferType, setCrateTransferType] = useState<'HUB_TO_AGENT' | 'AGENT_TO_HUB'>('HUB_TO_AGENT');
@@ -55,10 +55,10 @@ export const CrateTrackingSection: React.FC<CrateTrackingSectionProps> = ({ sele
   // Depot dock crate balance: Base depot stock of 250 standard crates minus issued to agents plus returns
   const INITIAL_DEPOT_CRATE_POOL = 250;
   const hubOutflow = returnableAssetLedger
-    .filter((e) => e.dispatch_point_id === selectedDpId && e.holder_type === 'AGENT' && e.movement_type === 'ISSUED')
+    .filter((e) => e.dispatch_point_id === selectedDpId && (e.holder_type === 'COMMISSION_AGENT' || e.holder_type === 'AGENT') && e.movement_type === 'ISSUED')
     .reduce((sum, e) => sum + e.quantity, 0);
   const hubInflow = returnableAssetLedger
-    .filter((e) => e.dispatch_point_id === selectedDpId && e.holder_type === 'AGENT' && e.movement_type === 'RETURNED')
+    .filter((e) => e.dispatch_point_id === selectedDpId && (e.holder_type === 'COMMISSION_AGENT' || e.holder_type === 'AGENT') && e.movement_type === 'RETURNED')
     .reduce((sum, e) => sum + e.quantity, 0);
   const depotCrateBalance = Math.max(0, INITIAL_DEPOT_CRATE_POOL - hubOutflow + hubInflow);
 

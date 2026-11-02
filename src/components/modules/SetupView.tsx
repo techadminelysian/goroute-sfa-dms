@@ -15,6 +15,7 @@ import {
   validateCreditLimit,
   validateSKUPricing
 } from '../../utils/validators';
+import { isTenantSettingsAuthorized, isOnboardingAuthorized } from '../../utils/authClient';
 import {
   Settings,
   Building,
@@ -73,8 +74,10 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
   } = useAppStore();
 
   const isAdmin = currentUser?.role === 'ADMIN' || activeRole === 'ADMIN';
-  const isAgent = currentUser?.role === 'AGENT' || activeRole === 'AGENT';
+  const isAgent = currentUser?.role === 'COMMISSION_AGENT' || activeRole === 'COMMISSION_AGENT';
   const isBilling = currentUser?.role === 'BILLING' || activeRole === 'BILLING';
+  const isTenantSettingsUser = isTenantSettingsAuthorized(currentUser);
+  const isYashSharma = isOnboardingAuthorized(currentUser);
 
   // Beat visibility for store onboarding:
   // - Admins: All beats
@@ -96,7 +99,14 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
 
   const [activeTab, setActiveTab] = useState<
     'COMPANIES' | 'SKUS' | 'DISPATCH' | 'BEATS' | 'RETAILERS' | 'USERS' | 'SETTINGS' | 'MY_RETAILERS'
-  >(activeRole === 'AGENT' ? 'MY_RETAILERS' : 'COMPANIES');
+  >(activeRole === 'COMMISSION_AGENT' ? 'MY_RETAILERS' : 'COMPANIES');
+
+  // Enforce Tenant Settings visibility: auto-redirect if unauthorized user is on SETTINGS tab
+  useEffect(() => {
+    if (!isTenantSettingsUser && activeTab === 'SETTINGS') {
+      setActiveTab('COMPANIES');
+    }
+  }, [isTenantSettingsUser, activeTab]);
 
   // SKU Management State
   const [skuCompanyFilter, setSkuCompanyFilter] = useState<string>('ALL');
@@ -603,19 +613,21 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onOpenOnboarding}
-            className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center gap-1.5 shadow"
-          >
-            <PlayCircle size={15} /> Run Onboarding Wizard
-          </button>
-        </div>
+        {isYashSharma && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onOpenOnboarding}
+              className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center gap-1.5 shadow"
+            >
+              <PlayCircle size={15} /> Run Onboarding Wizard
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Tabs */}
       <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 p-1.5 rounded-xl text-xs overflow-x-auto">
-        {activeRole === 'AGENT' ? (
+        {activeRole === 'COMMISSION_AGENT' ? (
           <button
             onClick={() => setActiveTab('MY_RETAILERS')}
             className={`px-3 py-1.5 rounded-lg font-semibold flex items-center gap-1.5 transition-all ${
@@ -696,16 +708,18 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
               <Users size={14} /> Users & Roles
             </button>
 
-            <button
-              onClick={() => setActiveTab('SETTINGS')}
-              className={`px-3 py-1.5 rounded-lg font-semibold flex items-center gap-1.5 transition-all ${
-                activeTab === 'SETTINGS'
-                  ? 'bg-blue-600 text-white shadow'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              <Sliders size={14} /> Tenant Settings
-            </button>
+            {isTenantSettingsUser && (
+              <button
+                onClick={() => setActiveTab('SETTINGS')}
+                className={`px-3 py-1.5 rounded-lg font-semibold flex items-center gap-1.5 transition-all ${
+                  activeTab === 'SETTINGS'
+                    ? 'bg-blue-600 text-white shadow'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Sliders size={14} /> Tenant Settings
+              </button>
+            )}
           </>
         )}
       </div>
@@ -1987,8 +2001,8 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
         </div>
       )}
 
-      {/* Tenant Settings Tab */}
-      {activeTab === 'SETTINGS' && (
+      {/* Tenant Settings Tab - Restricted strictly to backend team user ID / mobile 7830260134 */}
+      {activeTab === 'SETTINGS' && isTenantSettingsUser && (
         <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl space-y-4 text-xs">
           <div className="flex items-center justify-between border-b border-slate-800 pb-3">
             <div>

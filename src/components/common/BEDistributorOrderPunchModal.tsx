@@ -454,7 +454,9 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
       retailer_name_raw: selectedClient.name,
       beat_name: selectedClient.beat_name || 'Direct / Institutional (No Beat)',
       dispatch_point_id: selectedDispatchPointId || selectedClient.dispatch_point_id || dispatchPoints[0]?.id || '',
-      billing_executive_id: currentUser?.id || 'usr_billing_1',
+      billing_executive_id: (selectedClient as any).billing_executive_id || currentUser?.id || 'usr_billing_1',
+      order_source_role: 'DISTRIBUTOR',
+      order_raiser_name: selectedClient.name,
       created_by_user_id: currentUser?.id || 'usr_billing_1',
       commission_agent_id: null, // NO CA INVOLVED
       commission_agent_name: undefined,

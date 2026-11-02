@@ -85,7 +85,7 @@ export const MobileAgentView: React.FC = () => {
   } = useAppStore();
 
   // Commission Agents for Admin Simulation
-  const commissionAgents = useMemo(() => (users || []).filter((u) => u.role === 'AGENT'), [users]);
+  const commissionAgents = useMemo(() => (users || []).filter((u) => u.role === 'COMMISSION_AGENT'), [users]);
   const [simulatedAgentId, setSimulatedAgentId] = useState<string>(() => commissionAgents[0]?.id || '');
   const [selectedBeatFilterId, setSelectedBeatFilterId] = useState<string>('ALL');
 
@@ -98,11 +98,11 @@ export const MobileAgentView: React.FC = () => {
       if (commissionAgents[0]) return commissionAgents[0];
       return currentUser;
     }
-    // 2. Authenticated currentUser from session if role is AGENT
-    if (currentUser?.role === 'AGENT') {
+    // 2. Authenticated currentUser from session if role is COMMISSION_AGENT
+    if (currentUser?.role === 'COMMISSION_AGENT') {
       return currentUser;
     }
-    // 3. Fallback to first AGENT
+    // 3. Fallback to first COMMISSION_AGENT
     const anyAgent = commissionAgents[0];
     if (anyAgent) return anyAgent;
     // 4. Default fallback
@@ -289,7 +289,7 @@ export const MobileAgentView: React.FC = () => {
       phase_status: 'ACTIVE' as const,
       credit_limit: activeTenantSettings.credit_limit_default || 50000,
       current_outstanding: 0,
-      onboarded_by_role: activeAgent?.role || 'AGENT',
+      onboarded_by_role: activeAgent?.role || 'COMMISSION_AGENT',
       onboarded_by_user_id: activeAgent?.id,
     };
 
@@ -1527,7 +1527,7 @@ export const MobileAgentView: React.FC = () => {
               <div className="space-y-1.5 pt-1 border-t border-slate-800/80">
                 <div className="text-[11px] text-slate-400 flex items-center justify-between">
                   <span>
-                    {t('outstanding', language)}: <strong className="text-rose-400 font-mono">₹{selectedRetailer.current_outstanding.toLocaleString('en-IN')}</strong>
+                    {t('outstanding', language)}: <strong className="text-rose-400 font-mono">₹{(selectedRetailer.current_outstanding || 0).toLocaleString('en-IN')}</strong>
                   </span>
                   <span>
                     {t('cratesInCustody', language)}: <strong className="text-amber-400 font-mono font-bold">{selectedRetailer.crate_custody_balance || 0} {language === 'hi' ? 'क्रेट' : 'crates'}</strong>
@@ -1896,7 +1896,7 @@ export const MobileAgentView: React.FC = () => {
 
               <div className="pt-2 border-t border-slate-800 flex items-center justify-between text-xs font-bold">
                 <span className="text-slate-300">Total Value:</span>
-                <span className="font-mono text-emerald-400">₹{mobileCreatedOrderSummary.order.total_amount.toLocaleString('en-IN')}</span>
+                <span className="font-mono text-emerald-400">₹{(mobileCreatedOrderSummary.order.total_amount || 0).toLocaleString('en-IN')}</span>
               </div>
             </div>
 
@@ -2010,7 +2010,7 @@ export const MobileAgentView: React.FC = () => {
 
                     <div className="text-right">
                       <div className="font-mono font-bold text-emerald-400 text-xs">
-                        ₹{ord.total_amount.toLocaleString('en-IN')}
+                        ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                       </div>
                       <span
                         className={`px-2 py-0.5 rounded text-[9px] font-bold ${
@@ -2156,7 +2156,7 @@ export const MobileAgentView: React.FC = () => {
                 <div className="p-2 bg-slate-950 border border-slate-800 rounded-xl mt-2 flex items-center justify-between text-[11px]">
                   <span className="text-slate-400">{language === 'hi' ? 'दुकान की वर्तमान बकाया राशि:' : 'Current Store Outstanding:'}</span>
                   <span className="font-mono font-bold text-rose-400 text-sm">
-                    ₹{paymentSelectedRetailer.current_outstanding.toLocaleString('en-IN')}
+                    ₹{(paymentSelectedRetailer.current_outstanding || 0).toLocaleString('en-IN')}
                   </span>
                 </div>
               )}
@@ -2178,7 +2178,7 @@ export const MobileAgentView: React.FC = () => {
                   .filter((o) => o.retailer_id === paymentRetailerId)
                   .map((o) => (
                     <option key={o.id} value={o.id}>
-                      {language === 'hi' ? 'ऑर्डर' : 'Order'} #{o.order_number} (₹{o.total_amount.toLocaleString('en-IN')})
+                      {language === 'hi' ? 'ऑर्डर' : 'Order'} #{o.order_number} (₹{(o.total_amount || 0).toLocaleString('en-IN')})
                     </option>
                   ))}
               </select>
@@ -2486,7 +2486,7 @@ export const MobileAgentView: React.FC = () => {
                     <div className="text-right">
                       <div className="text-[10px] text-slate-400">{t('outstanding', language)}</div>
                       <div className="font-mono font-bold text-rose-400 text-xs">
-                        ₹{r.current_outstanding.toLocaleString('en-IN')}
+                        ₹{(r.current_outstanding || 0).toLocaleString('en-IN')}
                       </div>
                     </div>
                   </div>
@@ -2566,7 +2566,7 @@ export const MobileAgentView: React.FC = () => {
 
                     <div className="text-right">
                       <div className="font-mono font-bold text-emerald-400 text-xs">
-                        ₹{p.amount.toLocaleString('en-IN')}
+                        ₹{(p.amount || 0).toLocaleString('en-IN')}
                       </div>
                       <span
                         className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
@@ -2621,7 +2621,7 @@ export const MobileAgentView: React.FC = () => {
                 Store: <span className="text-slate-300 font-bold">{deliveryOrder.retailer_name_raw}</span>
               </div>
               <div>
-                Order Value: <span className="font-mono text-emerald-400 font-bold">₹{deliveryOrder.total_amount.toLocaleString('en-IN')}</span>
+                Order Value: <span className="font-mono text-emerald-400 font-bold">₹{(deliveryOrder.total_amount || 0).toLocaleString('en-IN')}</span>
               </div>
             </div>
 
@@ -2892,7 +2892,7 @@ export const MobileAgentView: React.FC = () => {
                             {l.quantity} pcs × ₹{l.unit_price}
                           </span>
                           <strong className="text-emerald-400 font-mono">
-                            ₹{l.total.toLocaleString('en-IN')}
+                            ₹{(l.total || 0).toLocaleString('en-IN')}
                           </strong>
                         </div>
                       </div>
@@ -3451,13 +3451,13 @@ export const MobileAgentView: React.FC = () => {
               <div className="flex justify-between border-t border-slate-800/80 pt-1.5 mt-1">
                 <span className="text-slate-400">Current Outstanding:</span>
                 <span className="font-mono font-bold text-rose-400">
-                  ₹{selectedStoreForDetail.current_outstanding.toLocaleString('en-IN')}
+                  ₹{(selectedStoreForDetail.current_outstanding || 0).toLocaleString('en-IN')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Credit Limit:</span>
                 <span className="font-mono text-slate-300">
-                  ₹{selectedStoreForDetail.credit_limit.toLocaleString('en-IN')}
+                  ₹{(selectedStoreForDetail.credit_limit || 0).toLocaleString('en-IN')}
                 </span>
               </div>
               <div className="flex justify-between border-t border-slate-800/80 pt-1.5 mt-1">
@@ -3568,7 +3568,7 @@ export const MobileAgentView: React.FC = () => {
                           </div>
                           <div className="text-right">
                             <span className="font-mono font-bold text-emerald-400 text-xs">
-                              ₹{ord.total_amount.toLocaleString('en-IN')}
+                              ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                             </span>
                             <div>
                               <span

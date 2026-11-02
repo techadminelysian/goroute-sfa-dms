@@ -39,6 +39,8 @@ export interface Company {
   contact_person: string;
   email: string;
   phone: string;
+  dispatch_point_id: string; // Mandatory foreign key referencing DispatchPoint
+  dispatch_point_name?: string;
 }
 
 export interface DispatchPoint {
@@ -284,6 +286,7 @@ export interface DistributorInstitution {
   credit_limit: number;
   credit_days?: number | null;
   dispatch_point_id?: string | null;
+  billing_executive_id?: string | null; // Fixed mapping: Distributor -> Billing Executive (Many-to-One)
   current_outstanding: number;
   onboarded_by_role?: string | null;
   onboarded_by_user_id?: string | null;
@@ -464,8 +467,10 @@ export interface Order {
   retailer_name_raw: string;
   beat_id?: string;
   beat_name: string;
-  dispatch_point_id: string; // Mapped DP ID (Fixed assignment from CA)
-  billing_executive_id?: string | null; // Mapped BE ID (Fixed assignment from CA)
+  dispatch_point_id: string; // Mapped DP ID (Fixed assignment from Principal Company)
+  billing_executive_id?: string | null; // Mapped BE ID (Fixed assignment from CFS, Sales Executive, or Distributor)
+  order_source_role?: 'COMMISSION_AGENT' | 'SALES_EXECUTIVE' | 'DISTRIBUTOR' | 'BE_DIRECT' | string;
+  order_raiser_name?: string;
   created_by_user_id: string;
   commission_agent_id?: string | null;
   commission_agent_name?: string;
@@ -620,7 +625,7 @@ export interface Payment {
   notes?: string;
 }
 
-export type UserRole = 'ADMIN' | 'BILLING' | 'ORDER_PUNCHER' | 'DISPATCHER' | 'ACCOUNTANT' | 'AGENT';
+export type UserRole = 'ADMIN' | 'SUB_ADMIN' | 'BILLING' | 'ORDER_PUNCHER' | 'DISPATCHER' | 'ACCOUNTANT' | 'DISTRIBUTOR' | 'SALES_EXECUTIVE' | 'COMMISSION_AGENT' | 'DELIVERY_VAN_EXECUTIVE';
 
 export interface User {
   id: string;
@@ -636,7 +641,7 @@ export interface User {
   beat_id?: string | null; // Primary assigned FMCG Beat
   beat_name?: string | null;
   assigned_beat_ids?: string[]; // Multiple beats assigned (1 CA -> N Beats)
-  billing_executive_id?: string | null; // Fixed mapping: CA -> Billing Executive (Many-to-One)
+  billing_executive_id?: string | null; // Fixed mapping: CFS/Commission Agent, Sales Executive, or Distributor -> Billing Executive (Many-to-One)
   platform: 'WEB' | 'MOBILE';
   is_active?: boolean;
   crate_custody_balance?: number; // Running balance of standard crates held in transit/van
@@ -687,14 +692,14 @@ export interface AdminResetUserPasswordResponse {
  * Tracks physical custody independently of sales revenue & GST
  */
 export type AssetMovementType = 'ISSUED' | 'RETURNED' | 'AUDIT_ADJUSTMENT';
-export type AssetHolderType = 'AGENT' | 'RETAILER' | 'DISPATCH_POINT';
+export type AssetHolderType = 'COMMISSION_AGENT' | 'AGENT' | 'RETAILER' | 'DISPATCH_POINT';
 
 export interface ReturnableAssetLedgerEntry {
   id: string; // ledger_entry_id (PK)
   tenant_id: string;
   asset_sku_id: string; // FK -> SKU
   asset_name: string; // Default: 'Standard Crate'
-  holder_type: AssetHolderType; // 'AGENT' (Commission Agent) | 'RETAILER' | 'DISPATCH_POINT'
+  holder_type: AssetHolderType; // 'COMMISSION_AGENT' | 'RETAILER' | 'DISPATCH_POINT'
   holder_id: string; // FK -> User.id or Retailer.id or DispatchPoint.id
   holder_name: string;
   movement_type: AssetMovementType; // 'ISSUED' (debit custody) | 'RETURNED' (credit custody)

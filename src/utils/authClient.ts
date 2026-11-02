@@ -25,6 +25,33 @@ export function isValidMobileNumber(mobile: string): boolean {
   return /^[6-9]\d{9}$/.test(sanitized);
 }
 
+/**
+ * Checks if the user is authorized to access Tenant Settings.
+ * Strictly limited to backend team user ID / mobile: 7830260134.
+ */
+export function isTenantSettingsAuthorized(user: { id?: string; mobile_number?: string } | null | undefined): boolean {
+  if (!user) return false;
+  const cleanMobile = user.mobile_number ? sanitizeMobileNumber(user.mobile_number) : '';
+  const cleanId = user.id ? sanitizeMobileNumber(user.id) : '';
+  return user.id === '7830260134' || cleanMobile === '7830260134' || cleanId === '7830260134';
+}
+
+/**
+ * Checks if the user is authorized to access Onboarding Wizard / Tenant Setup.
+ * Strictly limited to the user: Yash Sharma.
+ */
+export function isOnboardingAuthorized(user: { id?: string; name?: string; email?: string; mobile_number?: string } | null | undefined): boolean {
+  if (!user) return false;
+  const name = (user.name || '').trim().toLowerCase();
+  const id = (user.id || '').trim().toLowerCase();
+  const email = (user.email || '').trim().toLowerCase();
+  return (
+    name.includes('yash') ||
+    id.includes('yash') ||
+    email.includes('yash')
+  );
+}
+
 // Password Complexity Requirement: Min 8 chars, at least 1 letter, 1 number
 export function validatePasswordStrength(password: string): { isValid: boolean; message?: string } {
   if (!password || password.length < 8) {

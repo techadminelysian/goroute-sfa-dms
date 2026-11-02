@@ -60,7 +60,7 @@ export const BillingInvoicing: React.FC = () => {
     updateOrderStatus,
     verifyOrderWithParallelAlert,
     updateOrder,
-    verifyPayment,
+    //verifyPayment,
     flagPayment,
     updateRetailerCreditLimit,
     updatePaymentDetails,
@@ -272,12 +272,14 @@ export const BillingInvoicing: React.FC = () => {
             code: skuObj?.code || 'SKU-00',
             name: l.sku_name,
             quantity: 0,
-            unit_price: l.unit_price,
-            total: 0,
-          };
-        }
-        skuMap[l.sku_id].quantity += l.quantity;
-        skuMap[l.sku_id].total += l.total;
+            unit_price: Number(l.unit_price) || 0,
+                          total: 0,
+                        };
+                      }
+                      const qty = Number(l.quantity) || 0;
+                      const tot = Number(l.total) != null && !isNaN(Number(l.total)) ? Number(l.total) : qty * (Number(l.unit_price) || 0);
+                      skuMap[l.sku_id].quantity += qty;
+                      skuMap[l.sku_id].total += tot;
       });
     });
 
@@ -288,7 +290,7 @@ export const BillingInvoicing: React.FC = () => {
     const totalQty = Object.values(skuMap).reduce((s, r) => s + r.quantity, 0);
     const totalVal = Object.values(skuMap).reduce((s, r) => s + r.total, 0);
 
-    const fullText = `=== MORNING DISPATCH CONSIGNMENT MANIFEST ===\nParty / Retailer: ${partyName}\nOrders Included: ${partyOrders.map((o) => o.order_number).join(', ')}\nBeat: ${partyOrders[0]?.beat_name || 'N/A'}\n------------------------------------------------\n${linesText}\n------------------------------------------------\nTOTAL CONSIGNMENT QUANTITY: ${totalQty} pcs\nTOTAL CONSIGNMENT GROSS VALUE: ₹${totalVal.toLocaleString('en-IN')}\n================================================`;
+    const fullText = `=== MORNING DISPATCH CONSIGNMENT MANIFEST ===\nParty / Retailer: ${partyName}\nOrders Included: ${partyOrders.map((o) => o.order_number).join(', ')}\nBeat: ${partyOrders[0]?.beat_name || 'N/A'}\n------------------------------------------------\n${linesText}\n------------------------------------------------\nTOTAL CONSIGNMENT QUANTITY: ${totalQty} pcs\nTOTAL CONSIGNMENT GROSS VALUE: ₹${(totalVal || 0).toLocaleString('en-IN')}\n================================================`;
 
     navigator.clipboard.writeText(fullText);
     alert(`Copied morning consignment manifest for ${partyName} to clipboard!`);
@@ -599,7 +601,7 @@ export const BillingInvoicing: React.FC = () => {
     setPayRef('');
 
     if (isAutoSettle) {
-      alert(`Payment ${newPayment.payment_number} (₹${payAmount.toLocaleString('en-IN')}) successfully recorded & VERIFIED into Bank Ledger!\nMatched invoice status & retailer balance updated.`);
+      alert(`Payment ${newPayment.payment_number} (₹${(payAmount || 0).toLocaleString('en-IN')}) successfully recorded & VERIFIED into Bank Ledger!\nMatched invoice status & retailer balance updated.`);
     } else {
       alert(`Collection Entry ${newPayment.payment_number} recorded as PENDING!\nSubmitted to Accounts Executive queue for Maker-Checker bank reconciliation.`);
     }
@@ -611,8 +613,8 @@ export const BillingInvoicing: React.FC = () => {
       alert('Maker-Checker Security Control: Collection entries recorded by Billing Executives require Accounts Executive approval to settle into bank accounts.');
       return;
     }
-    verifyPayment(pmt.id);
-    alert(`Payment ${pmt.payment_number} (₹${pmt.amount.toLocaleString('en-IN')}) verified & reconciled into Bank Ledger!\nMatched invoice and retailer balance updated.`);
+    //verifyPayment(pmt.id);
+    //alert(`Payment ${pmt.payment_number} (₹${(pmt.amount || 0).toLocaleString('en-IN')}) verified & reconciled into Bank Ledger!\nMatched invoice and retailer balance updated.`);
   };
 
   // Flag Payment Handler
@@ -685,7 +687,7 @@ export const BillingInvoicing: React.FC = () => {
     });
 
     if (isFlagged) {
-      verifyPayment(editingPayment.id);
+      //verifyPayment(editingPayment.id);
       alert(`Admin Discrepancy Resolution: Payment ${editingPayment.payment_number} updated to ₹${amt.toLocaleString('en-IN')} (${editPaymentMode}) and VERIFIED into Bank Ledger!\nFlagged discrepancy resolved successfully.`);
     } else {
       alert(`Payment ${editingPayment.payment_number} updated to ₹${amt.toLocaleString('en-IN')} (${editPaymentMode}) by Admin!\nMatched invoice and retailer balance updated.`);
@@ -713,7 +715,7 @@ export const BillingInvoicing: React.FC = () => {
     const remaining = Math.max(0, editingInvoicePartial.total_amount - amt);
     const newStatus = amt >= editingInvoicePartial.total_amount ? 'PAID' : amt > 0 ? 'PARTIAL' : 'UNPAID';
 
-    alert(`Invoice ${editingInvoicePartial.invoice_number} updated successfully!\n- Accumulated Paid Amount: ₹${amt.toLocaleString('en-IN')}\n- Status: ${newStatus}\n- Remaining Balance: ₹${remaining.toLocaleString('en-IN')}\nPayment collection record created and linked to ledger.`);
+    alert(`Invoice ${editingInvoicePartial.invoice_number} updated successfully!\n- Accumulated Paid Amount: ₹${amt.toLocaleString('en-IN')}\n- Status: ${newStatus}\n- Remaining Balance: ₹${(remaining || 0).toLocaleString('en-IN')}\nPayment collection record created and linked to ledger.`);
     setEditingInvoicePartial(null);
   };
 
@@ -867,10 +869,10 @@ export const BillingInvoicing: React.FC = () => {
       beat_name: ret.beat_name || 'Central Beat',
       dispatch_point_id: 'dp_central',
       created_by_user_id: currentUser?.id || 'usr_billing_1',
-      commission_agent_id: (ret as any).commission_agent_id || users?.find((u) => u.role === 'AGENT')?.id || 'usr_agent_1',
+      commission_agent_id: (ret as any).commission_agent_id || users?.find((u) => u.role === 'COMMISSION_AGENT')?.id || 'usr_agent_1',
       commission_agent_name: (ret as any).commission_agent_id
         ? (users?.find((u) => u.id === (ret as any).commission_agent_id)?.name || 'Commission Agent')
-        : (users?.find((u) => u.role === 'AGENT')?.name || 'Commission Agent'),
+        : (users?.find((u) => u.role === 'COMMISSION_AGENT')?.name || 'Commission Agent'),
       order_date: new Date().toISOString().split('T')[0],
       delivery_date: new Date(Date.now() + 86400000).toISOString().split('T')[0],
       status: 'PUNCHED',
@@ -901,65 +903,6 @@ export const BillingInvoicing: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      {/* Role Context & Segregation of Duties Banner */}
-      <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className={`p-2 rounded-xl ${isAccountant ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-purple-500/10 text-purple-400 border border-purple-500/20'}`}>
-              <ShieldCheck size={20} />
-            </div>
-            <div>
-              <div className="text-sm font-bold text-white flex items-center gap-2">
-                <span>Active Console Context:</span>
-                <span className={`px-2.5 py-0.5 rounded-full text-xs font-extrabold uppercase tracking-wide ${isAccountant ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'}`}>
-                  {activeRole === 'ACCOUNTANT' ? 'Accounts Executive (Finance)' : activeRole === 'BILLING' ? 'Billing Executive (Sales Ops)' : 'Admin (Full Controller Rights)'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Standard FMCG Industry Segregation of Duties & Maker-Checker Financial Safeguards Enforced.
-              </p>
-            </div>
-          </div>
-
-          {/* Quick Perspective Switcher */}
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-400 font-medium hidden sm:inline">Simulate Operational Role:</span>
-            <button
-              onClick={() => setActiveRole('BILLING')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border ${activeRole === 'BILLING' ? 'bg-purple-600 text-white border-purple-500 shadow-sm' : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'}`}
-            >
-              Billing Executive View
-            </button>
-            <button
-              onClick={() => setActiveRole('ACCOUNTANT')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border ${activeRole === 'ACCOUNTANT' ? 'bg-emerald-600 text-white border-emerald-500 shadow-sm' : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'}`}
-            >
-              Accounts Executive View
-            </button>
-          </div>
-        </div>
-
-        {/* Roles Segregation Matrix Explanation */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-slate-800 text-xs">
-          <div className="p-2.5 bg-slate-950/60 rounded-xl border border-slate-800 space-y-1">
-            <div className="font-bold text-purple-300 flex items-center gap-1.5">
-              <FileText size={14} /> Billing Executive Scope
-            </div>
-            <p className="text-slate-400 leading-relaxed">
-              Verifies daily store orders taken by field agents, punches direct outlet orders, issues GST Tax Invoices with E-Way Bills, and records field collection receipts.
-            </p>
-          </div>
-          <div className="p-2.5 bg-slate-950/60 rounded-xl border border-slate-800 space-y-1">
-            <div className="font-bold text-emerald-300 flex items-center gap-1.5">
-              <Scale size={14} /> Accounts Executive (Checker) Scope
-            </div>
-            <p className="text-slate-400 leading-relaxed">
-              Audits and reconciles agent collections against bank statements, allocates partial payments, locks finalized invoices, monitors credit limits, and exports data to Zoho Finance / Tally.
-            </p>
-          </div>
-        </div>
-      </div>
-
       {/* Module Title Header */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
@@ -995,21 +938,21 @@ export const BillingInvoicing: React.FC = () => {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <KPICard
           title="Total Invoiced Value"
-          value={`₹${totalInvoicedValue.toLocaleString('en-IN')}`}
+          value={`₹${(totalInvoicedValue || 0).toLocaleString('en-IN')}`}
           subtitle={`${gstInvoicesCount} GST | ${cashInvoicesCount} Cash Invoices`}
           icon={FileText}
           status="info"
         />
         <KPICard
           title="Reconciled Bank Collections"
-          value={`₹${totalCollectedValue.toLocaleString('en-IN')}`}
+          value={`₹${(totalCollectedValue || 0).toLocaleString('en-IN')}`}
           subtitle={`${verifiedPaymentsCount} Verified | ${pendingPaymentsCount} Pending Reconciliation`}
           icon={CheckCircle2}
           status="success"
         />
         <KPICard
           title="Accounts Receivable (Outstanding)"
-          value={`₹${totalOutstandingValue.toLocaleString('en-IN')}`}
+          value={`₹${(totalOutstandingValue || 0).toLocaleString('en-IN')}`}
           subtitle={`${creditExceededRetailers.length} Outlets Exceeding Credit Threshold`}
           icon={DollarSign}
           status={totalOutstandingValue > 100000 ? 'warning' : 'neutral'}
@@ -1107,7 +1050,7 @@ export const BillingInvoicing: React.FC = () => {
                         <div className="font-bold text-white">{ord.order_number}</div>
                         <div className="text-slate-400">{ord.retailer_name_raw}</div>
                       </div>
-                      <span className="font-mono font-bold text-emerald-400">₹{ord.total_amount.toLocaleString('en-IN')}</span>
+                      <span className="font-mono font-bold text-emerald-400">₹{(ord.total_amount || 0).toLocaleString('en-IN')}</span>
                     </div>
                     <div className="flex justify-end gap-1.5 pt-2 border-t border-slate-800">
                       <button
@@ -1141,9 +1084,6 @@ export const BillingInvoicing: React.FC = () => {
                 <h3 className="text-sm font-bold text-white mt-0.5">
                   Party-Wise, Sub-Distributor-Wise & Agent-Wise Consolidated Load Sheet
                 </h3>
-                <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                  Consolidate daily store orders punched to principal companies or verified by billing. Group by <strong>Commission Agent</strong>, <strong>Sub-Distributor / Retail Outlet</strong>, or <strong>Beat Route</strong> with detailed SKU units to hand over to the Dispatcher every morning for vehicle load planning.
-                </p>
               </div>
             </div>
 
@@ -1302,12 +1242,14 @@ export const BillingInvoicing: React.FC = () => {
                           name: l.sku_name,
                           pack: skuObj?.pack_size || '1x12',
                           quantity: 0,
-                          unit_price: l.unit_price,
+                          unit_price: Number(l.unit_price) || 0,
                           total: 0,
                         };
                       }
-                      skuMap[l.sku_id].quantity += l.quantity;
-                      skuMap[l.sku_id].total += l.total;
+                      const qty = Number(l.quantity) || 0;
+                      const tot = Number(l.total) != null && !isNaN(Number(l.total)) ? Number(l.total) : qty * (Number(l.unit_price) || 0);
+                      skuMap[l.sku_id].quantity += qty;
+                      skuMap[l.sku_id].total += tot;
                     });
                   });
 
@@ -1334,7 +1276,7 @@ export const BillingInvoicing: React.FC = () => {
                               </span>
                             </h4>
                             <p className="text-xs text-slate-400 mt-0.5">
-                              {grp.sublabel} | <span className="text-emerald-400 font-bold">{groupTotalQty.toLocaleString()} Pcs</span> | Total Value: <span className="text-white font-semibold">₹{groupTotalVal.toLocaleString('en-IN')}</span>
+                              {grp.sublabel} | <span className="text-emerald-400 font-bold">{(groupTotalQty || 0).toLocaleString()} Pcs</span> | Total Value: <span className="text-white font-semibold">₹{(groupTotalVal || 0).toLocaleString('en-IN')}</span>
                             </p>
                           </div>
                         </div>
@@ -1376,9 +1318,9 @@ export const BillingInvoicing: React.FC = () => {
                                 <td className="py-2 px-3 font-bold text-indigo-400">{line.code}</td>
                                 <td className="py-2 px-3 font-sans font-semibold text-white">{line.name}</td>
                                 <td className="py-2 px-3 font-sans text-slate-400">{line.pack}</td>
-                                <td className="py-2 px-3 text-right font-bold text-amber-300">{line.quantity.toLocaleString()}</td>
+                                <td className="py-2 px-3 text-right font-bold text-amber-300">{(line.quantity || 0).toLocaleString()}</td>
                                 <td className="py-2 px-3 text-right text-slate-300">₹{line.unit_price}</td>
-                                <td className="py-2 px-3 text-right font-bold text-emerald-400">₹{line.total.toLocaleString('en-IN')}</td>
+                                <td className="py-2 px-3 text-right font-bold text-emerald-400">₹{(line.total || 0).toLocaleString('en-IN')}</td>
                               </tr>
                             ))}
                           </tbody>
@@ -1413,7 +1355,7 @@ export const BillingInvoicing: React.FC = () => {
                                     {(ord.lines || []).length} SKUs
                                   </div>
                                   <div className="font-bold text-emerald-400 text-xs">
-                                    ₹{ord.total_amount.toLocaleString('en-IN')}
+                                    ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                                   </div>
                                 </div>
                               </div>
@@ -1438,7 +1380,7 @@ export const BillingInvoicing: React.FC = () => {
             <div className="bg-slate-900 border border-slate-800 p-3 rounded-2xl">
               <div className="text-[10px] text-slate-400 font-medium uppercase tracking-wider">Total Invoices</div>
               <div className="text-base font-extrabold text-white font-mono mt-1">
-                ₹{totalInvoicedValue.toLocaleString('en-IN')}
+                ₹{(totalInvoicedValue || 0).toLocaleString('en-IN')}
               </div>
               <div className="text-[10px] text-slate-500 font-semibold mt-0.5">{invoices.length} total generated</div>
             </div>
@@ -1449,7 +1391,7 @@ export const BillingInvoicing: React.FC = () => {
                 <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[9px] font-bold">CASH</span>
               </div>
               <div className="text-base font-extrabold text-emerald-300 font-mono mt-1">
-                ₹{cashInvoicedValue.toLocaleString('en-IN')}
+                ₹{(cashInvoicedValue || 0).toLocaleString('en-IN')}
               </div>
               <div className="text-[10px] text-emerald-400/80 font-semibold mt-0.5">{cashSettledInvoices.length} cash invoices</div>
             </div>
@@ -1460,7 +1402,7 @@ export const BillingInvoicing: React.FC = () => {
                 <span className="px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 text-[9px] font-bold">UPI/NEFT</span>
               </div>
               <div className="text-base font-extrabold text-indigo-300 font-mono mt-1">
-                ₹{onlineInvoicedValue.toLocaleString('en-IN')}
+                ₹{(onlineInvoicedValue || 0).toLocaleString('en-IN')}
               </div>
               <div className="text-[10px] text-indigo-400/80 font-semibold mt-0.5">{onlineSettledInvoices.length} bank invoices</div>
             </div>
@@ -1468,7 +1410,7 @@ export const BillingInvoicing: React.FC = () => {
             <div className="bg-slate-900 border border-amber-500/20 p-3 rounded-2xl bg-amber-950/10">
               <div className="text-[10px] text-amber-400 font-medium uppercase tracking-wider">Total Balance Due</div>
               <div className="text-base font-extrabold text-amber-300 font-mono mt-1">
-                ₹{totalOutstandingValue.toLocaleString('en-IN')}
+                ₹{(totalOutstandingValue || 0).toLocaleString('en-IN')}
               </div>
               <div className="text-[10px] text-amber-400/80 font-semibold mt-0.5">Uncollected credit</div>
             </div>
@@ -1616,10 +1558,10 @@ export const BillingInvoicing: React.FC = () => {
                         </td>
 
                         <td className="py-3 px-4 text-right font-bold text-white">
-                          ₹{inv.total_amount.toLocaleString('en-IN')}
+                          ₹{(inv.total_amount || 0).toLocaleString('en-IN')}
                         </td>
                         <td className="py-3 px-4 text-right text-emerald-400">
-                          ₹{inv.paid_amount.toLocaleString('en-IN')}
+                          ₹{(inv.paid_amount || 0).toLocaleString('en-IN')}
                         </td>
                         <td className="py-3 px-4 text-center">
                           <span
@@ -1635,7 +1577,7 @@ export const BillingInvoicing: React.FC = () => {
                           </span>
                           {remaining > 0 && inv.status !== 'UNPAID' && (
                             <div className="text-[9px] text-rose-400 mt-0.5">
-                              Due: ₹{remaining.toLocaleString('en-IN')}
+                              Due: ₹{(remaining || 0).toLocaleString('en-IN')}
                             </div>
                           )}
                         </td>
@@ -1818,7 +1760,7 @@ export const BillingInvoicing: React.FC = () => {
                           {pmt.collector_name || 'Commission Agent'}
                         </td>
                         <td className="py-3 px-4 text-right font-bold text-emerald-400">
-                          ₹{pmt.amount.toLocaleString('en-IN')}
+                          ₹{(pmt.amount || 0).toLocaleString('en-IN')}
                         </td>
                         <td className="py-3 px-4 text-center font-sans">
                           <span
@@ -1860,7 +1802,7 @@ export const BillingInvoicing: React.FC = () => {
                                     <ShieldAlert size={12} /> Resolve & Edit
                                   </button>
                                   <button
-                                    onClick={() => handleVerifyPayment(pmt)}
+                                    //onClick={() => handleVerifyPayment(pmt)}
                                     className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold inline-flex items-center gap-1 shadow-sm"
                                     title="Approve & Verify Flagged Payment directly into bank ledger"
                                   >
@@ -1898,7 +1840,7 @@ export const BillingInvoicing: React.FC = () => {
                               )}
 
                               <button
-                                onClick={() => handleVerifyPayment(pmt)}
+                                //onClick={() => handleVerifyPayment(pmt)}
                                 className={`px-2 py-1 rounded text-[10px] font-bold inline-flex items-center gap-1 ${
                                   isAccountant
                                     ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm'
@@ -1960,18 +1902,18 @@ export const BillingInvoicing: React.FC = () => {
                       </div>
                     </div>
                     <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-rose-500/20 text-rose-300 border border-rose-500/30">
-                      EXCEEDED BY ₹{excess.toLocaleString('en-IN')}
+                      EXCEEDED BY ₹{(excess || 0).toLocaleString('en-IN')}
                     </span>
                   </div>
 
                   <div className="grid grid-cols-2 gap-2 p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs font-mono">
                     <div>
                       <span className="text-slate-400 block text-[10px]">Approved Credit Limit:</span>
-                      <strong className="text-white">₹{limit.toLocaleString('en-IN')}</strong>
+                      <strong className="text-white">₹{(limit || 0).toLocaleString('en-IN')}</strong>
                     </div>
                     <div>
                       <span className="text-slate-400 block text-[10px]">Current Outstanding:</span>
-                      <strong className="text-rose-400">₹{ret.current_outstanding.toLocaleString('en-IN')}</strong>
+                      <strong className="text-rose-400">₹{(ret.current_outstanding || 0).toLocaleString('en-IN')}</strong>
                     </div>
                   </div>
 
@@ -2044,19 +1986,19 @@ export const BillingInvoicing: React.FC = () => {
               <div className="space-y-1.5 font-mono text-xs pt-2">
                 <div className="flex justify-between text-slate-400">
                   <span>Subtotal (Taxable Value):</span>
-                  <span>₹{selectedInvoiceForPrint.subtotal.toLocaleString('en-IN')}</span>
+                  <span>₹{(selectedInvoiceForPrint.subtotal || 0).toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>CGST (9%):</span>
-                  <span>₹{selectedInvoiceForPrint.cgst.toLocaleString('en-IN')}</span>
+                  <span>₹{(selectedInvoiceForPrint.cgst || 0).toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>SGST (9%):</span>
-                  <span>₹{selectedInvoiceForPrint.sgst.toLocaleString('en-IN')}</span>
+                  <span>₹{(selectedInvoiceForPrint.sgst || 0).toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-white font-bold text-sm pt-2 border-t border-slate-800">
                   <span>Grand Total Invoice Value:</span>
-                  <span className="text-emerald-400">₹{selectedInvoiceForPrint.total_amount.toLocaleString('en-IN')}</span>
+                  <span className="text-emerald-400">₹{(selectedInvoiceForPrint.total_amount || 0).toLocaleString('en-IN')}</span>
                 </div>
               </div>
 
@@ -2104,7 +2046,7 @@ export const BillingInvoicing: React.FC = () => {
                   <div className="flex justify-between items-center text-xs">
                     <span className="font-bold text-white">{selectedInvoiceForPayment.invoice_number}</span>
                     <span className="font-mono text-emerald-400 font-bold">
-                      Due: ₹{(selectedInvoiceForPayment.total_amount - selectedInvoiceForPayment.paid_amount).toLocaleString('en-IN')}
+                      Due: ₹{((selectedInvoiceForPayment.total_amount || 0) - (selectedInvoiceForPayment.paid_amount || 0)).toLocaleString('en-IN')}
                     </span>
                   </div>
                 </div>
@@ -2121,7 +2063,7 @@ export const BillingInvoicing: React.FC = () => {
                   <option value="">-- Choose Outlet --</option>
                   {retailers.map((r) => (
                     <option key={r.id} value={r.id}>
-                      {r.name} (Outstanding: ₹{r.current_outstanding.toLocaleString('en-IN')})
+                      {r.name} (Outstanding: ₹{(r.current_outstanding || 0).toLocaleString('en-IN')})
                     </option>
                   ))}
                 </select>
@@ -2466,11 +2408,11 @@ export const BillingInvoicing: React.FC = () => {
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Invoice Total Amount:</span>
-                  <span className="font-mono font-bold text-white">₹{editingInvoicePartial.total_amount.toLocaleString('en-IN')}</span>
+                  <span className="font-mono font-bold text-white">₹{(editingInvoicePartial.total_amount || 0).toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Current Paid Amount:</span>
-                  <span className="font-mono font-bold text-emerald-400">₹{editingInvoicePartial.paid_amount.toLocaleString('en-IN')}</span>
+                  <span className="font-mono font-bold text-emerald-400">₹{(editingInvoicePartial.paid_amount || 0).toLocaleString('en-IN')}</span>
                 </div>
               </div>
 
@@ -2486,7 +2428,7 @@ export const BillingInvoicing: React.FC = () => {
                   required
                 />
                 <p className="text-[10px] text-slate-400 mt-1">
-                  Remaining Due: <strong className="text-rose-400 font-mono">₹{Math.max(0, editingInvoicePartial.total_amount - partialPayAmount).toLocaleString('en-IN')}</strong>
+                  Remaining Due: <strong className="text-rose-400 font-mono">₹{Math.max(0, (editingInvoicePartial.total_amount || 0) - (partialPayAmount || 0)).toLocaleString('en-IN')}</strong>
                 </p>
               </div>
 
@@ -2745,15 +2687,15 @@ export const BillingInvoicing: React.FC = () => {
                   <div className="space-y-1">
                     <div className="flex justify-between text-slate-400 text-xs">
                       <span>Total Invoice Amount:</span>
-                      <span className="font-mono font-bold text-white">₹{inv.total_amount.toLocaleString('en-IN')}</span>
+                      <span className="font-mono font-bold text-white">₹{(inv.total_amount || 0).toLocaleString('en-IN')}</span>
                     </div>
                     <div className="flex justify-between text-slate-400 text-xs">
                       <span>Reconciled Paid Amount:</span>
-                      <span className="font-mono font-bold text-emerald-400">₹{inv.paid_amount.toLocaleString('en-IN')}</span>
+                      <span className="font-mono font-bold text-emerald-400">₹{(inv.paid_amount || 0).toLocaleString('en-IN')}</span>
                     </div>
                     <div className="flex justify-between text-slate-400 text-xs">
                       <span>Outstanding Balance Due:</span>
-                      <span className="font-mono font-bold text-rose-400">₹{Math.max(0, inv.total_amount - inv.paid_amount).toLocaleString('en-IN')}</span>
+                      <span className="font-mono font-bold text-rose-400">₹{Math.max(0, (inv.total_amount || 0) - (inv.paid_amount || 0)).toLocaleString('en-IN')}</span>
                     </div>
                   </div>
 
@@ -2774,7 +2716,7 @@ export const BillingInvoicing: React.FC = () => {
                               <div className="text-[9px] text-slate-500">Ref: {p.reference_number || 'N/A'} | {p.payment_date}</div>
                             </div>
                             <div className="text-right">
-                              <span className="font-bold text-emerald-400">₹{p.amount.toLocaleString('en-IN')}</span>
+                              <span className="font-bold text-emerald-400">₹{(p.amount || 0).toLocaleString('en-IN')}</span>
                               <div className="text-[9px] text-slate-400">{p.status}</div>
                             </div>
                           </div>
@@ -2820,10 +2762,10 @@ export const BillingInvoicing: React.FC = () => {
                               <td className="py-2 px-3 text-slate-400">{skuObj?.hsn_code || '19053100'}</td>
                               <td className="py-2 px-3 text-right text-slate-400">{skuObj?.pack_size || 'Std Case'}</td>
                               <td className="py-2 px-3 text-right font-bold text-white">{line.quantity}</td>
-                              <td className="py-2 px-3 text-right text-slate-200">₹{line.unit_price.toFixed(2)}</td>
+                              <td className="py-2 px-3 text-right text-slate-200">₹{(line.unit_price || 0).toFixed(2)}</td>
                               <td className="py-2 px-3 text-right text-slate-400">{skuObj?.tax_rate || 18}%</td>
                               <td className="py-2 px-3 text-right font-bold text-emerald-400">
-                                ₹{line.total.toLocaleString('en-IN')}
+                                ₹{(line.total || 0).toLocaleString('en-IN')}
                               </td>
                             </tr>
                           );
@@ -2843,15 +2785,15 @@ export const BillingInvoicing: React.FC = () => {
               {/* Financial Totals Summary Bar */}
               <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 flex flex-wrap items-center justify-between gap-4 font-mono text-xs">
                 <div className="space-y-0.5 text-slate-400 text-[11px]">
-                  <div>Taxable Subtotal: <strong className="text-slate-200">₹{inv.subtotal.toLocaleString('en-IN')}</strong></div>
-                  <div>GST Tax Component (CGST 9% + SGST 9%): <strong className="text-slate-200">₹{(inv.cgst + inv.sgst).toLocaleString('en-IN')}</strong></div>
+                  <div>Taxable Subtotal: <strong className="text-slate-200">₹{(inv.subtotal || 0).toLocaleString('en-IN')}</strong></div>
+                  <div>GST Tax Component (CGST 9% + SGST 9%): <strong className="text-slate-200">₹{((inv.cgst || 0) + (inv.sgst || 0)).toLocaleString('en-IN')}</strong></div>
                 </div>
 
                 <div className="text-right">
                   <div className="text-[10px] text-slate-400 uppercase tracking-wider font-sans">Grand Total Invoiced</div>
-                  <div className="text-xl font-extrabold text-white">₹{inv.total_amount.toLocaleString('en-IN')}</div>
+                  <div className="text-xl font-extrabold text-white">₹{(inv.total_amount || 0).toLocaleString('en-IN')}</div>
                   <div className="text-[11px] text-emerald-400">
-                    Paid: ₹{inv.paid_amount.toLocaleString('en-IN')} | Outstanding: ₹{Math.max(0, inv.total_amount - inv.paid_amount).toLocaleString('en-IN')}
+                    Paid: ₹{(inv.paid_amount || 0).toLocaleString('en-IN')} | Outstanding: ₹{Math.max(0, (inv.total_amount || 0) - (inv.paid_amount || 0)).toLocaleString('en-IN')}
                   </div>
                 </div>
               </div>

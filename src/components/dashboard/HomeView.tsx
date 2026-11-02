@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../../data/store';
 import { Order, OrderInvoicingType } from '../../types';
 import { isOrderAssignedToBE, getOrderFinancialSummary } from '../../utils/caRoutingLogic';
+import { isOnboardingAuthorized } from '../../utils/authClient';
 import { KPICard } from '../common/KPICard';
 import { BEDistributorOnboardingModal } from '../common/BEDistributorOnboardingModal';
 import { BEDistributorOrderPunchModal } from '../common/BEDistributorOrderPunchModal';
@@ -71,6 +72,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
   const [isBEPunchOpen, setIsBEPunchOpen] = useState(false);
   const [selectedBEClientId, setSelectedBEClientId] = useState<string | undefined>(undefined);
 
+  // Strict access gate: Tenant Setup is restricted to Yash Sharma
+  const isYashSharma = isOnboardingAuthorized(currentUser);
+
   // Sync invoicing classification default whenever an order is opened for review
   useEffect(() => {
     if (selectedOrderForReview) {
@@ -132,21 +136,23 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              onClick={onOpenOnboarding}
-              className="px-3 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 text-xs font-semibold flex items-center gap-1.5"
-            >
-              <Plus size={14} /> Tenant Setup
-            </button>
-          </div>
+          {isYashSharma && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onOpenOnboarding}
+                className="px-3 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 text-xs font-semibold flex items-center gap-1.5"
+              >
+                <Plus size={14} /> Tenant Setup
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Overview KPIs from all 5 modules */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
           <KPICard
             title="Orders & Sales"
-            value={`₹${totalSalesValue.toLocaleString('en-IN')}`}
+            value={`₹${(totalSalesValue || 0).toLocaleString('en-IN')}`}
             delta={{ value: `${orders.length} orders`, isPositive: true, label: 'gross booked' }}
             icon={ShoppingCart}
             subtext="Across all channels"
@@ -162,7 +168,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           />
           <KPICard
             title="Billing Collections"
-            value={`₹${totalCollectedValue.toLocaleString('en-IN')}`}
+            value={`₹${(totalCollectedValue || 0).toLocaleString('en-IN')}`}
             delta={{ value: 'Auto-match', isPositive: true, label: 'receipts matched' }}
             icon={Receipt}
             subtext={`${invoices.length} total invoices`}
@@ -171,14 +177,14 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           <KPICard
             title="Credit Over-Limit"
             value={overLimitRetailers.length}
-            delta={{ value: `₹${totalOutstandingValue.toLocaleString('en-IN')}`, isPositive: false, label: 'outstanding' }}
+            delta={{ value: `₹${(totalOutstandingValue || 0).toLocaleString('en-IN')}`, isPositive: false, label: 'outstanding' }}
             icon={AlertTriangle}
             subtext="Stores exceeding threshold"
             accentColor="#f59e0b"
           />
           <KPICard
             title="Claims & Leakage"
-            value={`₹${totalClaimsVal.toLocaleString('en-IN')}`}
+            value={`₹${(totalClaimsVal || 0).toLocaleString('en-IN')}`}
             delta={{ value: `${leakageFlaggedCount} flagged`, isPositive: false, label: 'below cost' }}
             icon={FileCheck2}
             subtext="Principal recovery"
@@ -189,7 +195,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
         {/* Quick Nav Shortcut Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-3">
           {[
-            { label: 'Orders', icon: ShoppingCart, module: 'orders', color: 'text-blue-400', count: orders.length, roles: ['ADMIN', 'BILLING', 'ORDER_PUNCHER', 'AGENT'] },
+            { label: 'Orders', icon: ShoppingCart, module: 'orders', color: 'text-blue-400', count: orders.length, roles: ['ADMIN', 'BILLING', 'ORDER_PUNCHER', 'COMMISSION_AGENT'] },
             { label: 'Inventory', icon: Boxes, module: 'inventory', color: 'text-emerald-400', count: skus.length, roles: ['ADMIN', 'DISPATCHER'] },
             { label: 'Billing', icon: Receipt, module: 'billing', color: 'text-purple-400', count: invoices.length, roles: ['ADMIN', 'BILLING', 'ACCOUNTANT'] },
             { label: 'Credit', icon: AlertTriangle, module: 'credit', color: 'text-amber-400', count: overLimitRetailers.length, roles: ['ADMIN', 'ACCOUNTANT'] },
@@ -247,7 +253,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                       </span>
                     </div>
                     <div className="text-[11px] text-slate-400 mt-0.5">
-                      {ord.retailer_name_raw} | ₹{ord.total_amount.toLocaleString('en-IN')}
+                      {ord.retailer_name_raw} | ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                     </div>
                   </div>
 
@@ -333,7 +339,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
     // Commission Agents assigned to this Billing Executive
     const assignedCAs = users.filter(
-      (u) => u.role === 'AGENT' && u.billing_executive_id === effectiveCurrentBEId
+      (u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === effectiveCurrentBEId
     );
 
     // Filter orders strictly to those taken by this BE's assigned Commission Agents or tagged to this BE
@@ -447,7 +453,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           <KPICard
             title="Invoices Raised Today"
             value={beInvoices.length}
-            delta={{ value: `₹${beInvoicedValue.toLocaleString('en-IN')}`, isPositive: true, label: 'total value' }}
+            delta={{ value: `₹${(beInvoicedValue || 0).toLocaleString('en-IN')}`, isPositive: true, label: 'total value' }}
             icon={CheckCircle2}
             subtext="GST + Cash Non-GST"
             accentColor="#10b981"
@@ -661,7 +667,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
                   <div className="flex items-center justify-between pt-2 border-t border-slate-800/80 text-[11px]">
                     <span className="font-mono font-bold text-emerald-400 text-sm">
-                      ₹{ord.total_amount.toLocaleString('en-IN')}
+                      ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                     </span>
                     <button
                       onClick={() => onNavigate('billing')}
@@ -844,11 +850,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                             <div className="text-xs text-slate-300">
                               Outstanding:{' '}
                               <span className="font-mono font-bold text-amber-400">
-                                ₹{currentOutstanding.toLocaleString('en-IN')}
+                                ₹{(currentOutstanding || 0).toLocaleString('en-IN')}
                               </span>{' '}
                               /{' '}Limit:{' '}
                               <span className="font-mono font-semibold text-slate-400">
-                                ₹{creditLimit.toLocaleString('en-IN')}
+                                ₹{(creditLimit || 0).toLocaleString('en-IN')}
                               </span>
                             </div>
                           </div>
@@ -863,7 +869,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                               isOverCredit ? 'text-rose-400' : 'text-emerald-400'
                             }`}
                           >
-                            ₹{projectedTotal.toLocaleString('en-IN')}{' '}
+                            ₹{(projectedTotal || 0).toLocaleString('en-IN')}{' '}
                             {isOverCredit ? '(Exceeds Limit)' : '(Within Limit)'}
                           </span>
                         </div>
@@ -962,7 +968,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                                     </td>
                                     <td className="p-2.5 text-right font-mono font-bold text-emerald-400">
                                       ₹
-                                      {line.total.toLocaleString('en-IN', {
+                                      {(line.total || 0).toLocaleString('en-IN', {
                                         minimumFractionDigits: 2,
                                       })}
                                     </td>
@@ -1223,7 +1229,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           />
           <KPICard
             title="Total Sales Booked"
-            value={`₹${totalSalesValue.toLocaleString('en-IN')}`}
+            value={`₹${(totalSalesValue || 0).toLocaleString('en-IN')}`}
             delta={{ value: `${orders.length} total`, isPositive: true, label: 'all channels' }}
             icon={ShoppingCart}
             subtext="Gross sales value"
@@ -1264,7 +1270,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                       </span>
                     </div>
                     <div className="text-[11px] text-slate-400 mt-0.5">
-                      {ord.retailer_name_raw} | Value: <strong className="text-white">₹{ord.total_amount.toLocaleString('en-IN')}</strong>
+                      {ord.retailer_name_raw} | Value: <strong className="text-white">₹{(ord.total_amount || 0).toLocaleString('en-IN')}</strong>
                     </div>
                   </div>
 
@@ -1399,7 +1405,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <KPICard
             title="Total Outstanding Receivables"
-            value={`₹${totalOutstandingValue.toLocaleString('en-IN')}`}
+            value={`₹${(totalOutstandingValue || 0).toLocaleString('en-IN')}`}
             delta={{ value: `${uncollectedInvoices.length} invoices`, isPositive: false, label: 'uncollected' }}
             icon={DollarSign}
             subtext="Retailer balance due"
@@ -1407,7 +1413,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           />
           <KPICard
             title="Total Cash Collected"
-            value={`₹${totalCollectedValue.toLocaleString('en-IN')}`}
+            value={`₹${(totalCollectedValue || 0).toLocaleString('en-IN')}`}
             delta={{ value: 'Auto Payment Match', isPositive: true, label: 'verified' }}
             icon={CheckCircle2}
             subtext="Bank & UPI receipts"
@@ -1439,7 +1445,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                 <div>
                   <div className="font-mono font-bold text-white">{inv.invoice_number}</div>
                   <div className="text-[11px] text-slate-400">
-                    Retailer: <strong className="text-white">{inv.retailer_name}</strong> | Due: ₹{(inv.total_amount - inv.paid_amount).toLocaleString('en-IN')}
+                    Retailer: <strong className="text-white">{inv.retailer_name}</strong> | Due: ₹{((inv.total_amount || 0) - (inv.paid_amount || 0)).toLocaleString('en-IN')}
                   </div>
                 </div>
 
@@ -1521,7 +1527,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
                 <div className="text-right flex flex-col items-end gap-1">
                   <div className="font-mono font-bold text-emerald-400 text-xs">
-                    ₹{ord.total_amount.toLocaleString('en-IN')}
+                    ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                   </div>
 
                   {isDelivered ? (

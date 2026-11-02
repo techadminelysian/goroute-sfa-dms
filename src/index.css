@@ -3,51 +3,255 @@
 /* 
  * GoRoute Enterprise Multi-Tenant DMS Theme System
  * Default: Dark Theme
- * Optional: Light Theme
+ * Bespoke Haute-Minimalist Executive B2B Light Theme
  */
 
-:root,
-[data-theme="dark"] {
-  color-scheme: dark;
+@layer base {
+  :root,
+  [data-theme="dark"] {
+    color-scheme: dark;
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  [data-theme="light"] {
+    color-scheme: light;
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+    /* Haute-Minimalist Executive B2B Color Scale Overrides */
+    --color-slate-950: #f8fafc; /* Canvas / Background: Slate 50 Matte off-white with zero glare */
+    --color-slate-900: #ffffff; /* Surface / Card: Pure white crisp surface */
+    --color-slate-850: #f1f5f9; /* Table header / zebra tint: Slate 100 */
+    --color-slate-800: #e2e8f0; /* Structural Border Light: Slate 200 1px crisp separation */
+    --color-slate-700: #cbd5e1; /* Strong / Interactive Border: Slate 300 Input & control borders */
+    --color-slate-600: #94a3b8; /* Disabled / Metadata: Slate 400 */
+    --color-slate-500: #64748b; /* Muted Secondary Ink: Slate 500 */
+    --color-slate-400: #64748b; /* Secondary Ink: Slate 500 (>8:1 contrast) */
+    --color-slate-300: #475569; /* Subtle body text: Slate 600 */
+    --color-slate-200: #1e293b; /* Strong subtitle: Slate 800 */
+    --color-slate-100: #0f172a; /* Primary Slate Ink: Slate 900 (>14:1 contrast) */
+    --color-slate-50:  #0f172a; /* Maximum contrast text */
+
+    /* Primary Brand Action Scale */
+    --color-blue-950: #172554; /* Midnight Blue 950 - Executive Header */
+    --color-blue-900: #1e3a8a;
+    --color-blue-800: #1e40af; /* Royal Blue 800 - Primary Action / CTA */
+    --color-blue-700: #1d4ed8; /* Royal Blue 700 - Hover state */
+    --color-blue-600: #1e40af; /* Map blue-600 to Royal Blue 800 */
+    --color-blue-500: #2563eb;
+    --color-blue-400: #1e40af; /* High contrast Royal Blue for icons/text */
+    --color-blue-200: #bfdbfe; /* Selection border */
+    --color-blue-50:  #eff6ff; /* Blue 50 - Subtle Primary Tint Container */
+
+    /* Semantic Status Scales */
+    --color-emerald-950: #ecfdf5; /* Emerald 50 Container */
+    --color-emerald-900: #d1fae5;
+    --color-emerald-800: #065f46;
+    --color-emerald-700: #047857; /* Emerald 700 Success Text */
+    --color-emerald-600: #047857;
+    --color-emerald-500: #059669;
+    --color-emerald-400: #047857; /* High contrast text in light mode */
+    --color-emerald-200: #a7f3d0; /* Success border */
+
+    --color-amber-950: #fffbeb; /* Amber 50 Container */
+    --color-amber-900: #fef3c7;
+    --color-amber-800: #92400e;
+    --color-amber-700: #b45309; /* Amber 700 Pending Text */
+    --color-amber-600: #b45309;
+    --color-amber-500: #d97706;
+    --color-amber-400: #b45309; /* High contrast text in light mode */
+    --color-amber-200: #fde68a; /* Pending border */
+
+    --color-rose-950: #fff1f2; /* Rose 50 Container */
+    --color-rose-900: #ffe4e6;
+    --color-rose-800: #9f1239;
+    --color-rose-700: #be123c; /* Rose 700 Alert Text */
+    --color-rose-600: #be123c;
+    --color-rose-500: #e11d48;
+    --color-rose-400: #be123c; /* High contrast text in light mode */
+    --color-rose-200: #fecdd3; /* Alert border */
+  }
 }
 
-[data-theme="light"] {
-  color-scheme: light;
+/* ==========================================================================
+   Haute-Minimalist Executive B2B Light Theme Component Rules
+   ========================================================================== */
 
-  /* Inverted Slate Scale for Clean High-Contrast Light Theme */
-  --color-slate-950: #f8fafc; /* Canvas background / page body */
-  --color-slate-900: #ffffff; /* Card / panel / modal surface */
-  --color-slate-850: #f1f5f9; /* Zebra rows / table header subtle tint */
-  --color-slate-800: #e2e8f0; /* Crisp light dividers, borders, subtle pills */
-  --color-slate-700: #cbd5e1; /* Input borders, active element boundaries */
-  --color-slate-600: #94a3b8; /* Muted controls */
-  --color-slate-500: #64748b; /* Secondary helper text, captions */
-  --color-slate-400: #475569; /* Readable secondary labels, muted icons */
-  --color-slate-300: #334155; /* Normal body text, data values */
-  --color-slate-200: #1e293b; /* Prominent titles, section headings */
-  --color-slate-100: #0f172a; /* Maximum contrast text & primary headings */
-  --color-slate-50: #020617;  /* Pitch text accents */
+/* 1. Canvas / Background: #F8FAFC */
+[data-theme="light"],
+[data-theme="light"] body,
+[data-theme="light"] .min-h-screen {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
 }
 
-/* Light Mode Card & Panel Polish */
-[data-theme="light"] .bg-slate-900 {
-  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.06), 0 1px 2px -1px rgba(15, 23, 42, 0.04);
+/* 2. Surfaces & Cards: Pure White #FFFFFF with 1px #E2E8F0 border and flat elevation */
+[data-theme="light"] .bg-slate-900,
+[data-theme="light"] .bg-slate-900\/80,
+[data-theme="light"] .bg-slate-900\/90,
+[data-theme="light"] .bg-slate-900\/60,
+[data-theme="light"] .bg-slate-900\/40,
+[data-theme="light"] .bg-slate-900\/50 {
+  background-color: #ffffff !important;
+  border-color: #e2e8f0 !important;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.04);
 }
 
-[data-theme="light"] .fixed.inset-0 .bg-slate-900 {
-  box-shadow: 0 20px 25px -5px rgba(15, 23, 42, 0.12), 0 8px 10px -6px rgba(15, 23, 42, 0.08);
+[data-theme="light"] .bg-slate-950:not(header):not(aside) {
+  background-color: #f8fafc !important;
 }
 
-/* Form Controls in Light Mode */
+[data-theme="light"] .border-slate-800,
+[data-theme="light"] .border-slate-800\/80,
+[data-theme="light"] .border-slate-800\/60 {
+  border-color: #e2e8f0 !important;
+}
+
+[data-theme="light"] .border-slate-700,
+[data-theme="light"] .border-slate-700\/80,
+[data-theme="light"] .border-slate-700\/50 {
+  border-color: #cbd5e1 !important;
+}
+
+[data-theme="light"] .hover\:border-slate-700:hover {
+  border-color: #cbd5e1 !important;
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.06);
+}
+
+/* 3. Navigation & Headers: Clean White Top Bar & Crisp Sidebar */
+[data-theme="light"] header.sticky {
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #e2e8f0 !important;
+  color: #0f172a !important;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.03);
+}
+
+[data-theme="light"] header.sticky .text-slate-400 {
+  color: #64748b !important;
+}
+
+[data-theme="light"] aside {
+  background-color: #ffffff !important;
+  border-right: 1px solid #e2e8f0 !important;
+}
+
+[data-theme="light"] aside nav button {
+  color: #64748b !important;
+  border-radius: 8px !important;
+}
+
+[data-theme="light"] aside nav button:hover {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+[data-theme="light"] aside nav button[class*="bg-blue-600"] {
+  background-color: #1e40af !important;
+  color: #1e40af !important;
+  border: 1px solid #bfdbfe !important;
+  font-weight: 600 !important;
+}
+
+[data-theme="light"] aside nav button[class*="bg-blue-600"] svg {
+  color: #1e40af !important;
+}
+
+/* 4. Slate Ink Typography */
+[data-theme="light"] h1,
+[data-theme="light"] h2,
+[data-theme="light"] h3,
+[data-theme="light"] h4,
+[data-theme="light"] h5 {
+  color: #0f172a !important;
+  letter-spacing: -0.015em;
+}
+
+[data-theme="light"] p {
+  line-height: 1.55;
+}
+
+/* Text-white inversion on light surfaces (keeps white text on colored CTA buttons) */
+[data-theme="light"] .text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]):not([class*="bg-[#1E40AF]"]):not([class*="bg-[#047857]"]):not([class*="bg-[#BE123C]"]) {
+  color: #0f172a !important;
+}
+
+[data-theme="light"] .text-slate-400 {
+  color: #64748b !important;
+}
+
+[data-theme="light"] .text-slate-500 {
+  color: #64748b !important;
+}
+
+[data-theme="light"] .text-slate-300 {
+  color: #475569 !important;
+}
+
+[data-theme="light"] .text-slate-200 {
+  color: #1e293b !important;
+}
+
+[data-theme="light"] .text-slate-100 {
+  color: #0f172a !important;
+}
+
+/* 5. Primary Brand / Action Buttons & Controls */
+[data-theme="light"] button[class*="bg-blue-600"],
+[data-theme="light"] a[class*="bg-blue-600"] {
+  background-color: #1e40af !important;
+  color: #ffffff !important;
+  border-radius: 8px !important;
+  font-weight: 500 !important;
+  box-shadow: 0 1px 2px 0 rgba(30, 64, 175, 0.2);
+}
+
+[data-theme="light"] button[class*="bg-blue-600"]:hover,
+[data-theme="light"] a[class*="bg-blue-600"]:hover {
+  background-color: #1d4ed8 !important;
+}
+
+[data-theme="light"] button[class*="bg-blue-600"] *,
+[data-theme="light"] a[class*="bg-blue-600"] * {
+  color: #ffffff !important;
+}
+
+/* Secondary & Neutral Buttons */
+[data-theme="light"] button.bg-slate-900,
+[data-theme="light"] button.bg-slate-950 {
+  background-color: #ffffff !important;
+  border: 1px solid #e2e8f0 !important;
+  color: #0f172a !important;
+  border-radius: 8px !important;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.02);
+}
+
+[data-theme="light"] button.bg-slate-900:hover,
+[data-theme="light"] button.bg-slate-950:hover {
+  background-color: #f8fafc !important;
+  border-color: #cbd5e1 !important;
+  color: #0f172a !important;
+}
+
+/* 6. Form Controls: Inputs, Selects, Textareas */
 [data-theme="light"] input,
 [data-theme="light"] select,
 [data-theme="light"] textarea {
-  color: #0f172a;
+  background-color: #ffffff !important;
+  border: 1px solid #cbd5e1 !important;
+  color: #0f172a !important;
+  border-radius: 8px !important;
 }
 
 [data-theme="light"] input::placeholder,
 [data-theme="light"] textarea::placeholder {
-  color: #94a3b8;
+  color: #94a3b8 !important;
+}
+
+[data-theme="light"] input:focus,
+[data-theme="light"] select:focus,
+[data-theme="light"] textarea:focus {
+  border-color: #1e40af !important;
+  box-shadow: 0 0 0 1px #1e40af !important;
+  outline: none !important;
 }
 
 [data-theme="light"] option {
@@ -55,73 +259,128 @@
   color: #0f172a;
 }
 
-/* Text-white inversion on neutral / light surfaces */
-[data-theme="light"] h1.text-white,
-[data-theme="light"] h2.text-white,
-[data-theme="light"] h3.text-white,
-[data-theme="light"] h4.text-white,
-[data-theme="light"] h5.text-white,
-[data-theme="light"] th.text-white,
-[data-theme="light"] td.text-white,
-[data-theme="light"] span.text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]),
-[data-theme="light"] div.text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]),
-[data-theme="light"] p.text-white:not([class*="bg-blue"]):not([class*="bg-emerald"]):not([class*="bg-rose"]):not([class*="bg-amber"]):not([class*="bg-indigo"]):not([class*="bg-purple"]):not([class*="bg-red"]):not([class*="bg-teal"]):not([class*="bg-green"]) {
-  color: #0f172a;
+/* 7. Semantic Status Indicators & Containers */
+/* Success: #047857 (Emerald 700) on #ECFDF5 Container with #A7F3D0 Border */
+[data-theme="light"] [class*="bg-emerald-950"],
+[data-theme="light"] [class*="bg-emerald-500/10"],
+[data-theme="light"] [class*="bg-emerald-900/40"],
+[data-theme="light"] [class*="bg-emerald-900/60"],
+[data-theme="light"] [class*="bg-green-950"] {
+  background-color: #ecfdf5 !important;
+  color: #047857 !important;
+  border-color: #a7f3d0 !important;
+  border-radius: 6px !important;
 }
 
-/* Primary Action Buttons: Maintain crisp white text */
-[data-theme="light"] button[class*="bg-blue-600"],
-[data-theme="light"] button[class*="bg-emerald-600"],
-[data-theme="light"] button[class*="bg-rose-600"],
-[data-theme="light"] button[class*="bg-amber-600"],
-[data-theme="light"] button[class*="bg-indigo-600"],
-[data-theme="light"] button[class*="bg-purple-600"],
-[data-theme="light"] button[class*="bg-red-600"],
-[data-theme="light"] a[class*="bg-blue-600"],
-[data-theme="light"] a[class*="bg-emerald-600"] {
-  color: #ffffff !important;
+[data-theme="light"] .text-emerald-400,
+[data-theme="light"] .text-emerald-300,
+[data-theme="light"] .text-emerald-500,
+[data-theme="light"] .text-green-400 {
+  color: #047857 !important;
 }
 
-[data-theme="light"] button[class*="bg-blue-600"] *,
-[data-theme="light"] button[class*="bg-emerald-600"] *,
-[data-theme="light"] button[class*="bg-rose-600"] *,
-[data-theme="light"] button[class*="bg-amber-600"] *,
-[data-theme="light"] button[class*="bg-indigo-600"] *,
-[data-theme="light"] button[class*="bg-purple-600"] *,
-[data-theme="light"] button[class*="bg-red-600"] * {
-  color: #ffffff !important;
+/* Pending / Warning: #B45309 (Amber 700) on #FFFBEB Container with #FDE68A Border */
+[data-theme="light"] [class*="bg-amber-950"],
+[data-theme="light"] [class*="bg-amber-500/10"],
+[data-theme="light"] [class*="bg-amber-900/40"],
+[data-theme="light"] [class*="bg-amber-900/60"],
+[data-theme="light"] [class*="bg-yellow-950"] {
+  background-color: #fffbeb !important;
+  color: #b45309 !important;
+  border-color: #fde68a !important;
+  border-radius: 6px !important;
 }
 
-/* High Contrast Colored Badges & Text in Light Mode (Passes WCAG AA) */
-[data-theme="light"] .text-blue-400 {
-  color: #2563eb !important;
+[data-theme="light"] .text-amber-400,
+[data-theme="light"] .text-amber-300,
+[data-theme="light"] .text-amber-500,
+[data-theme="light"] .text-yellow-400 {
+  color: #b45309 !important;
 }
 
-[data-theme="light"] .text-emerald-400 {
-  color: #059669 !important;
+/* Alert / Error: #BE123C (Rose 700) on #FFF1F2 Container with #FECDD3 Border */
+[data-theme="light"] [class*="bg-rose-950"],
+[data-theme="light"] [class*="bg-rose-500/10"],
+[data-theme="light"] [class*="bg-rose-900/40"],
+[data-theme="light"] [class*="bg-rose-900/60"],
+[data-theme="light"] [class*="bg-red-950"] {
+  background-color: #fff1f2 !important;
+  color: #be123c !important;
+  border-color: #fecdd3 !important;
+  border-radius: 6px !important;
 }
 
-[data-theme="light"] .text-amber-400 {
-  color: #d97706 !important;
+[data-theme="light"] .text-rose-400,
+[data-theme="light"] .text-rose-300,
+[data-theme="light"] .text-rose-500,
+[data-theme="light"] .text-red-400 {
+  color: #be123c !important;
 }
 
-[data-theme="light"] .text-rose-400 {
-  color: #e11d48 !important;
+/* Subtle Primary Tint / Blue Containers: #1E40AF on #EFF6FF with #BFDBFE Border */
+[data-theme="light"] [class*="bg-blue-950"],
+[data-theme="light"] [class*="bg-blue-500/10"],
+[data-theme="light"] [class*="bg-blue-600/10"],
+[data-theme="light"] [class*="bg-blue-600/20"],
+[data-theme="light"] [class*="bg-blue-900/40"],
+[data-theme="light"] [class*="bg-blue-900/60"] {
+  background-color: #eff6ff !important;
+  color: #1e40af !important;
+  border-color: #bfdbfe !important;
+  border-radius: 6px !important;
 }
 
-[data-theme="light"] .text-purple-400 {
-  color: #7c3aed !important;
+[data-theme="light"] .text-blue-400,
+[data-theme="light"] .text-blue-300,
+[data-theme="light"] .text-blue-500 {
+  color: #1e40af !important;
 }
 
-[data-theme="light"] .text-indigo-400 {
-  color: #4f46e5 !important;
+/* 8. Table Styling: Haute-Minimalist Executive Clean Tables */
+[data-theme="light"] table {
+  background-color: #ffffff;
 }
 
-[data-theme="light"] .text-cyan-400 {
-  color: #0891b2 !important;
+[data-theme="light"] table thead,
+[data-theme="light"] table th {
+  background-color: #f8fafc !important;
+  color: #64748b !important;
+  border-bottom: 1px solid #e2e8f0 !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.05em !important;
 }
 
-/* Light Theme Scrollbars */
+[data-theme="light"] table tbody tr {
+  border-bottom: 1px solid #e2e8f0 !important;
+  background-color: #ffffff;
+  transition: background-color 0.15s ease;
+}
+
+[data-theme="light"] table tbody tr:hover {
+  background-color: #f8fafc !important;
+}
+
+[data-theme="light"] table td {
+  color: #0f172a !important;
+  border-bottom: 1px solid #e2e8f0 !important;
+}
+
+/* 9. Modals & Overlays */
+[data-theme="light"] .fixed.inset-0 .bg-slate-900,
+[data-theme="light"] .fixed.inset-0 .bg-slate-950 {
+  background-color: #ffffff !important;
+  border: 1px solid #e2e8f0 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 20px 25px -5px rgba(15, 23, 42, 0.1), 0 8px 10px -6px rgba(15, 23, 42, 0.06) !important;
+}
+
+[data-theme="light"] .fixed.inset-0[class*="bg-black"] {
+  background-color: rgba(15, 23, 42, 0.45) !important;
+  backdrop-filter: blur(4px) !important;
+}
+
+/* 10. Minimalist Scrollbars */
 [data-theme="light"] ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

@@ -1,4 +1,4 @@
-import { Beat, Order, Retailer, User, WorkflowNotification } from '../types';
+import { Beat, Order, Retailer, User, WorkflowNotification, DistributorInstitution } from '../types';
 
 /**
  * Result structure returned by credit limit validation calculation
@@ -44,38 +44,49 @@ export function calculateCreditExposure(
 }
 
 /**
- * Auto-fetches and applies fixed CA mappings (Assigned BE & DP) to an order.
- * Ensures the CA never has to manually pick these routing endpoints.
+ * Auto-fetches and applies fixed BE mappings (Assigned BE) to an order.
+ * Supports Commission Agents (CFS), Sales Executives, and Distributors in a Many-to-One mapping to BE.
  */
 export function applyCAMappingsToOrder(
   order: Partial<Order>,
   agentUser: User | null | undefined,
   allUsers: User[],
-  defaultDpId: string = 'dp_central'
+  defaultDpId: string = 'dp_central',
+  clientDistributor?: DistributorInstitution | null
 ): {
   dispatch_point_id: string;
   billing_executive_id: string;
   commission_agent_id: string;
   commission_agent_name: string;
+  order_source_role?: string;
+  order_raiser_name?: string;
 } {
-  const caId = agentUser?.id || order.commission_agent_id || order.created_by_user_id || 'usr_agent_1';
-  const caName = agentUser?.name || order.commission_agent_name || 'Commission Agent';
+  const isCA = !agentUser || agentUser.role === 'COMMISSION_AGENT';
+  const isSE = agentUser?.role === 'SALES_EXECUTIVE';
+  const isDist = agentUser?.role === 'DISTRIBUTOR';
 
-  // DP lookup: CA profile fixed DP or fallback
-  const dpId = agentUser?.dispatch_point_id || order.dispatch_point_id || defaultDpId;
+  const raiserId = agentUser?.id || order.created_by_user_id || order.commission_agent_id || 'usr_agent_1';
+  const raiserName = agentUser?.name || order.order_raiser_name || order.commission_agent_name || (isSE ? 'Sales Executive' : isDist ? 'Distributor' : 'Commission Agent');
 
-  // BE lookup: CA profile fixed BE, or find active BE in users, or default
-  let beId = agentUser?.billing_executive_id || order.billing_executive_id;
+  // DP lookup: order DP or default (Depot is associated with Company)
+  const dpId = order.dispatch_point_id || defaultDpId;
+
+  // BE lookup: User profile fixed BE, or distributor mapped BE, or order mapped BE, or default BE
+  let beId = agentUser?.billing_executive_id || clientDistributor?.billing_executive_id || order.billing_executive_id;
   if (!beId) {
     const defaultBE = allUsers.find((u) => u.role === 'BILLING' && u.is_active !== false);
     beId = defaultBE?.id || 'usr_billing_1';
   }
 
+  const roleTag = isSE ? 'SALES_EXECUTIVE' : isDist ? 'DISTRIBUTOR' : 'COMMISSION_AGENT';
+
   return {
     dispatch_point_id: dpId,
     billing_executive_id: beId,
-    commission_agent_id: caId,
-    commission_agent_name: caName,
+    commission_agent_id: isCA ? raiserId : (order.commission_agent_id || ''),
+    commission_agent_name: isCA ? raiserName : (order.commission_agent_name || ''),
+    order_source_role: roleTag,
+    order_raiser_name: raiserName,
   };
 }
 
@@ -96,7 +107,7 @@ export function createOrderCancelledAlert(
     title: `Order ${order.order_number} Cancelled`,
     message: `Order #${order.order_number} for ${retailerName} has been cancelled by billing due to credit limit exposure. Reason: ${reason}`,
     type: 'ORDER_CANCELLED_CREDIT_LIMIT',
-    target_roles: ['AGENT', 'ADMIN'],
+    target_roles: ['COMMISSION_AGENT', 'ADMIN'],
     target_user_id: order.commission_agent_id || order.created_by_user_id,
     related_entity_id: order.id,
     related_entity_type: 'ORDER',
@@ -132,7 +143,7 @@ export function createOrderAmendedAlert(
     title: `Order ${order.order_number} Amended & Approved`,
     message: `Order #${order.order_number} for ${retailerName} has been amended. ${itemsText} to match credit limits. Click to view updated dispatch totals.`,
     type: 'ORDER_AMENDED_PARTIAL_APPROVAL',
-    target_roles: ['AGENT', 'ADMIN'],
+    target_roles: ['COMMISSION_AGENT', 'ADMIN'],
     target_user_id: order.commission_agent_id || order.created_by_user_id,
     related_entity_id: order.id,
     related_entity_type: 'ORDER',
@@ -150,13 +161,14 @@ export function createOrderAmendedAlert(
 
 /**
  * Checks whether an order belongs to the designated Billing Executive's queue.
- * Strictly verifies that the order was taken by a Commission Agent assigned to this BE,
- * or explicitly tagged with this BE's ID.
+ * Strictly verifies that the order was raised by a Commission Agent (CFS), Sales Executive,
+ * or Distributor assigned to this BE, or explicitly tagged with this BE's ID.
  */
 export function isOrderAssignedToBE(
   order: Order,
   beId: string,
-  allUsers: User[]
+  allUsers: User[],
+  allDistributors: DistributorInstitution[] = []
 ): boolean {
   if (!beId) return false;
 
@@ -165,23 +177,32 @@ export function isOrderAssignedToBE(
     return true;
   }
 
-  // 2. Check the Commission Agent that took or created the order
-  const agentId = order.commission_agent_id || order.created_by_user_id;
-  if (agentId) {
-    const agentUser = allUsers.find((u) => u.id === agentId);
-    if (agentUser && agentUser.billing_executive_id === beId) {
+  // 2. Check the creator / raiser user (CFS / Sales Executive / Distributor)
+  const creatorId = order.created_by_user_id || order.commission_agent_id;
+  if (creatorId) {
+    const creatorUser = allUsers.find((u) => u.id === creatorId);
+    if (creatorUser && creatorUser.billing_executive_id === beId) {
       return true;
     }
   }
 
-  // 3. Check matching by commission agent name if IDs were unpopulated
-  if (order.commission_agent_name) {
-    const agentByName = allUsers.find(
+  // 3. Check if order is for or from a Distributor entity with mapped BE
+  if (order.retailer_id) {
+    const matchedDistributor = allDistributors.find((d) => d.id === order.retailer_id);
+    if (matchedDistributor && matchedDistributor.billing_executive_id === beId) {
+      return true;
+    }
+  }
+
+  // 4. Check matching by raiser / agent name if IDs were unpopulated
+  const checkName = (order.order_raiser_name || order.commission_agent_name || '').trim().toLowerCase();
+  if (checkName) {
+    const userByName = allUsers.find(
       (u) =>
-        u.role === 'AGENT' &&
-        u.name.toLowerCase() === order.commission_agent_name?.toLowerCase()
+        (u.role === 'COMMISSION_AGENT' || u.role === 'SALES_EXECUTIVE' || u.role === 'DISTRIBUTOR') &&
+        u.name.toLowerCase() === checkName
     );
-    if (agentByName && agentByName.billing_executive_id === beId) {
+    if (userByName && userByName.billing_executive_id === beId) {
       return true;
     }
   }
@@ -190,10 +211,57 @@ export function isOrderAssignedToBE(
 }
 
 /**
- * Returns all Commission Agents assigned to a specific Billing Executive
+ * Returns all Commission Agents (CFS) assigned to a specific Billing Executive
  */
 export function getCommissionAgentsForBE(beId: string, allUsers: User[]): User[] {
-  return allUsers.filter((u) => u.role === 'AGENT' && u.billing_executive_id === beId);
+  return allUsers.filter((u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === beId);
+}
+
+/**
+ * Returns all Sales Executives assigned to a specific Billing Executive
+ */
+export function getSalesExecutivesForBE(beId: string, allUsers: User[]): User[] {
+  return allUsers.filter((u) => u.role === 'SALES_EXECUTIVE' && u.billing_executive_id === beId);
+}
+
+/**
+ * Returns all Distributors assigned to a specific Billing Executive
+ */
+export function getDistributorsForBE(
+  beId: string,
+  allUsers: User[],
+  allDistributors: DistributorInstitution[] = []
+): { users: User[]; clients: DistributorInstitution[] } {
+  const users = allUsers.filter((u) => u.role === 'DISTRIBUTOR' && u.billing_executive_id === beId);
+  const clients = allDistributors.filter((d) => d.billing_executive_id === beId);
+  return { users, clients };
+}
+
+/**
+ * Returns all mapped Order Raisers (CFS, Sales Executives, and Distributors) for a Billing Executive
+ */
+export function getMappedRaisersForBE(
+  beId: string,
+  allUsers: User[],
+  allDistributors: DistributorInstitution[] = []
+): {
+  commissionAgents: User[];
+  salesExecutives: User[];
+  distributorUsers: User[];
+  distributorClients: DistributorInstitution[];
+  totalRaisers: number;
+} {
+  const commissionAgents = getCommissionAgentsForBE(beId, allUsers);
+  const salesExecutives = getSalesExecutivesForBE(beId, allUsers);
+  const { users: distributorUsers, clients: distributorClients } = getDistributorsForBE(beId, allUsers, allDistributors);
+
+  return {
+    commissionAgents,
+    salesExecutives,
+    distributorUsers,
+    distributorClients,
+    totalRaisers: commissionAgents.length + salesExecutives.length + distributorUsers.length + distributorClients.length,
+  };
 }
 
 export interface OrderFinancialSummary {
@@ -341,7 +409,7 @@ export function getBeatsForBE(
 ): Beat[] {
   if (!beId) return [];
 
-  const caUsers = allUsers.filter((u) => u.role === 'AGENT' && u.billing_executive_id === beId);
+  const caUsers = allUsers.filter((u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === beId);
   if (caUsers.length === 0) {
     return [];
   }

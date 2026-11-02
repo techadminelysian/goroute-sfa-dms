@@ -202,7 +202,7 @@ export function addDbUser(userData: {
     company_scope: [],
     dispatch_point_id: userData.dispatch_point_id !== undefined ? userData.dispatch_point_id : (userData.role === 'DISPATCHER' ? 'dp_central' : null),
     beat_id: userData.beat_id || null,
-    platform: userData.role === 'DISPATCHER' || userData.role === 'AGENT' ? 'MOBILE' : 'WEB',
+    platform: userData.role === 'DISPATCHER' || userData.role === 'COMMISSION_AGENT' ? 'MOBILE' : 'WEB',
     is_active: true
   };
 

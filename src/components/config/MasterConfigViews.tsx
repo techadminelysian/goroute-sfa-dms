@@ -22,6 +22,7 @@ import {
   Check,
   UserPlus,
   AlertCircle,
+  AlertTriangle,
   Sparkles,
   Eye,
   EyeOff,
@@ -36,7 +37,8 @@ import {
   Download,
   Upload,
   FileSpreadsheet,
-  CheckSquare
+  CheckSquare,
+  UserCheck
 } from 'lucide-react';
 
 export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USERS' }> = ({ type }) => {
@@ -48,6 +50,8 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     dispatchPoints,
     beats,
     users,
+    skus,
+    orders,
     addCompany,
     updateCompany,
     deleteCompany,
@@ -61,6 +65,8 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
   } = useAppStore();
 
   const isAdmin = (currentUser?.role === 'ADMIN' || activeRole === 'ADMIN');
+  const isSubAdmin = (currentUser?.role === 'SUB_ADMIN' || activeRole === 'SUB_ADMIN');
+  const canManageCompany = isAdmin || isSubAdmin;
 
   // Company Creation States
   const [compName, setCompName] = useState('');
@@ -70,6 +76,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
   const [compContact, setCompContact] = useState('');
   const [compPhone, setCompPhone] = useState('');
   const [compEmail, setCompEmail] = useState('');
+  const [compDispatchPointId, setCompDispatchPointId] = useState('');
   const [compError, setCompError] = useState<string | null>(null);
   const [compSuccess, setCompSuccess] = useState<string | null>(null);
 
@@ -82,7 +89,11 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
   const [editCompContact, setEditCompContact] = useState('');
   const [editCompPhone, setEditCompPhone] = useState('');
   const [editCompEmail, setEditCompEmail] = useState('');
+  const [editCompDispatchPointId, setEditCompDispatchPointId] = useState('');
   const [editCompError, setEditCompError] = useState<string | null>(null);
+
+  // Company Deletion Confirmation Modal State
+  const [deletingCompany, setDeletingCompany] = useState<Company | null>(null);
 
   // Company Bulk Upload States
   const [isCompBulkOpen, setIsCompBulkOpen] = useState(false);
@@ -109,9 +120,10 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
   const [usrName, setUsrName] = useState('');
   const [usrEmail, setUsrEmail] = useState('');
   const [usrMobile, setUsrMobile] = useState('');
-  const [usrRole, setUsrRole] = useState<UserRole>('AGENT');
+  const [usrRole, setUsrRole] = useState<UserRole>('COMMISSION_AGENT');
   const [usrDispatchPointId, setUsrDispatchPointId] = useState('');
   const [usrBeatId, setUsrBeatId] = useState('');
+  const [usrBillingExecutiveId, setUsrBillingExecutiveId] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
 
   // Success Modal State for showing generated credentials to Admin
@@ -241,6 +253,11 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     setCompError(null);
     setCompSuccess(null);
 
+    if (!canManageCompany) {
+      setCompError('Permission Denied: Only Admin and Sub-Admin accounts are authorized to create or assign Dispatch Points for Principal Companies.');
+      return;
+    }
+
     const nameVal = validateStoreName(compName);
     if (!nameVal.isValid) {
       setCompError(`Company Name Error: ${nameVal.error}`);
@@ -254,6 +271,13 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       return;
     }
 
+    // Mandatory Dispatch Point assignment (Requirement 1 & 2)
+    const assignedDpId = compDispatchPointId || (dispatchPoints.length > 0 ? dispatchPoints[0].id : '');
+    if (!assignedDpId) {
+      setCompError('Dispatch Point Error: Every Principal Company must have an associated Dispatch Point. Please select one.');
+      return;
+    }
+
     const code = compCode.trim() ? compCode.trim().toUpperCase() : compName.substring(0, 4).toUpperCase();
     if (companies.some((c) => c.name.toLowerCase() === compName.trim().toLowerCase() || c.code === code)) {
       setCompError(`Validation Error: A company with name "${compName}" or code "${code}" already exists.`);
@@ -262,6 +286,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
 
     const addedName = nameVal.formatted!;
     const addedGstin = gstinVal.formatted!;
+    const linkedDp = dispatchPoints.find((dp) => dp.id === assignedDpId);
 
     addCompany({
       id: `comp_${Date.now()}`,
@@ -273,6 +298,8 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       contact_person: compContact.trim() || 'Manager',
       email: compEmail.trim() || 'sales@company.com',
       phone: compPhone.trim() || '+91 98000 00000',
+      dispatch_point_id: assignedDpId,
+      dispatch_point_name: linkedDp?.name,
     });
 
     setCompName('');
@@ -281,11 +308,13 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     setCompContact('');
     setCompPhone('');
     setCompEmail('');
-    setCompSuccess(`Principal Company "${addedName}" successfully created with GSTIN: ${addedGstin}`);
+    setCompDispatchPointId(dispatchPoints[0]?.id || '');
+    setCompSuccess(`Principal Company "${addedName}" successfully created and mapped to Dispatch Point "${linkedDp?.name || assignedDpId}" (GSTIN: ${addedGstin})`);
     setTimeout(() => setCompSuccess(null), 5000);
   };
 
   const handleStartEditCompany = (company: Company) => {
+    if (!canManageCompany) return;
     setEditingCompany(company);
     setEditCompName(company.name);
     setEditCompCode(company.code);
@@ -294,12 +323,17 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     setEditCompContact(company.contact_person || '');
     setEditCompPhone(company.phone || '');
     setEditCompEmail(company.email || '');
+    setEditCompDispatchPointId(company.dispatch_point_id || (dispatchPoints[0]?.id || ''));
     setEditCompError(null);
   };
 
   const handleSaveEditCompany = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingCompany) return;
+    if (!canManageCompany) {
+      setEditCompError('Permission Denied: Only Admin and Sub-Admin accounts are authorized to modify Principal Companies.');
+      return;
+    }
     setEditCompError(null);
 
     const nameVal = validateStoreName(editCompName);
@@ -315,6 +349,13 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       return;
     }
 
+    // Mandatory Dispatch Point assignment on edit
+    const assignedDpId = editCompDispatchPointId.trim() || (dispatchPoints.length > 0 ? dispatchPoints[0].id : '');
+    if (!assignedDpId) {
+      setEditCompError('Dispatch Point Error: An associated Dispatch Point is mandatory for every Principal Company.');
+      return;
+    }
+
     const code = editCompCode.trim() ? editCompCode.trim().toUpperCase() : editCompName.substring(0, 4).toUpperCase();
     const isDuplicate = companies.some(
       (c) => c.id !== editingCompany.id && (c.name.toLowerCase() === editCompName.trim().toLowerCase() || c.code === code)
@@ -326,6 +367,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
 
     const updatedName = nameVal.formatted!;
     const updatedGstin = gstinVal.formatted!;
+    const linkedDp = dispatchPoints.find((dp) => dp.id === assignedDpId);
 
     updateCompany(editingCompany.id, {
       name: updatedName,
@@ -335,10 +377,31 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       contact_person: editCompContact.trim() || 'Manager',
       email: editCompEmail.trim() || 'sales@company.com',
       phone: editCompPhone.trim() || '+91 98000 00000',
+      dispatch_point_id: assignedDpId,
+      dispatch_point_name: linkedDp?.name,
     });
 
     setEditingCompany(null);
-    setCompSuccess(`Principal Company "${updatedName}" updated successfully with GSTIN: ${updatedGstin}`);
+    setCompSuccess(`Principal Company "${updatedName}" updated successfully (Dispatch Point: ${linkedDp?.name || assignedDpId}, GSTIN: ${updatedGstin})`);
+    setTimeout(() => setCompSuccess(null), 5000);
+  };
+
+  // Delete Principal Company confirmation handler
+  const handleConfirmDeleteCompany = () => {
+    if (!deletingCompany) return;
+
+    if (!canManageCompany) {
+      setCompError('Permission Denied: Only Admin and Sub-Admin accounts are authorized to delete Principal Companies.');
+      setDeletingCompany(null);
+      return;
+    }
+
+    const compName = deletingCompany.name;
+    const compCode = deletingCompany.code;
+
+    deleteCompany(deletingCompany.id);
+    setDeletingCompany(null);
+    setCompSuccess(`Principal Company "${compName}" (${compCode}) has been deleted successfully.`);
     setTimeout(() => setCompSuccess(null), 5000);
   };
 
@@ -532,7 +595,8 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
         gstin: r.gstin,
         contact_person: r.contact_person || 'Manager',
         email: r.email || 'sales@company.com',
-        phone: r.phone || '+91 98000 00000'
+        phone: r.phone || '+91 98000 00000',
+        dispatch_point_id: existing?.dispatch_point_id || (dispatchPoints.length > 0 ? dispatchPoints[0].id : 'dp_central'),
       };
     });
 
@@ -604,22 +668,19 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       return;
     }
 
-    // 4. Mandatory Dispatch Point Validation ONLY if Commission Agent
+    // 4. Dispatch Point Assignment (Only applicable for DISPATCHER; Commission Agent has NO Dispatch Point association)
     let selectedDpId: string | null = null;
     let selectedDpName: string | undefined = undefined;
-    let selectedBeat = usrRole === 'AGENT' && usrBeatId ? beats.find((b) => b.id === usrBeatId) : null;
+    let selectedBeat = usrRole === 'COMMISSION_AGENT' && usrBeatId ? beats.find((b) => b.id === usrBeatId) : null;
 
-    if (usrRole === 'AGENT') {
-      if (!effectiveUsrDispatchPointId) {
-        setFormError('Dispatch Point is mandatory for Commission Agent role.');
-        return;
-      }
-      selectedDpId = effectiveUsrDispatchPointId;
-      selectedDpName = dispatchPoints.find((dp) => dp.id === effectiveUsrDispatchPointId)?.name;
-    } else if (usrRole === 'DISPATCHER') {
-      selectedDpId = 'dp_central';
-      selectedDpName = dispatchPoints.find((dp) => dp.id === 'dp_central')?.name || 'Central Depot';
+    if (usrRole === 'DISPATCHER') {
+      selectedDpId = effectiveUsrDispatchPointId || 'dp_central';
+      selectedDpName = dispatchPoints.find((dp) => dp.id === selectedDpId)?.name || 'Central Depot';
     }
+
+    // 4b. Billing Executive Assignment (For CFS, Sales Executives, and Distributors)
+    const isOrderRaiserRole = usrRole === 'COMMISSION_AGENT' || usrRole === 'SALES_EXECUTIVE' || usrRole === 'DISTRIBUTOR';
+    const selectedBEId = isOrderRaiserRole ? (usrBillingExecutiveId || (users.find((u) => u.role === 'BILLING')?.id || 'usr_billing_1')) : null;
 
     // 5. Auto-generate secure password as per current security standards
     const autoGeneratedPassword = generateSecurePassword(14);
@@ -633,9 +694,10 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       role: usrRole,
       company_scope: [],
       dispatch_point_id: selectedDpId,
+      billing_executive_id: selectedBEId,
       beat_id: selectedBeat ? selectedBeat.id : null,
       beat_name: selectedBeat ? selectedBeat.name : null,
-      platform: usrRole === 'DISPATCHER' || usrRole === 'AGENT' ? 'MOBILE' : 'WEB',
+      platform: usrRole === 'DISPATCHER' || usrRole === 'COMMISSION_AGENT' || usrRole === 'SALES_EXECUTIVE' ? 'MOBILE' : 'WEB',
       is_active: true,
     };
 
@@ -662,9 +724,10 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     setUsrName('');
     setUsrEmail('');
     setUsrMobile('');
-    setUsrRole('AGENT');
+    setUsrRole('COMMISSION_AGENT');
     setUsrDispatchPointId(dispatchPoints.length > 0 ? dispatchPoints[0].id : '');
     setUsrBeatId('');
+    setUsrBillingExecutiveId('');
     fetchDbStats();
   };
 
@@ -837,76 +900,119 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
             </div>
           )}
 
-          {/* Add Company Form with Mandatory GST Field */}
-          <form onSubmit={handleAddCompany} className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2 text-xs">
-            <input
-              type="text"
-              placeholder="Company Name *"
-              value={compName}
-              onChange={(e) => setCompName(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white focus:outline-hidden focus:border-blue-500"
-              required
-            />
-            <input
-              type="text"
-              placeholder="Code (e.g. BRIT)"
-              value={compCode}
-              onChange={(e) => setCompCode(e.target.value.toUpperCase())}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white uppercase font-mono focus:outline-hidden focus:border-blue-500"
-            />
-            <input
-              type="text"
-              placeholder="Mandatory GSTIN * (15 chars)"
-              value={compGstin}
-              onChange={(e) => setCompGstin(e.target.value.toUpperCase().replace(/[\s-]/g, ''))}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono uppercase font-semibold text-emerald-400 focus:outline-hidden focus:border-emerald-500"
-              maxLength={15}
-              required
-            />
-            <select
-              value={compRel}
-              onChange={(e) => setCompRel(e.target.value as any)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white focus:outline-hidden focus:border-blue-500"
-            >
-              <option value="CF">C&F Relationship</option>
-              <option value="SS">Super Stockist</option>
-              <option value="TCD">Transporter-Distributor</option>
-            </select>
-            <button
-              type="submit"
-              className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 shadow transition-all cursor-pointer"
-            >
-              <Plus size={14} /> Add Company
-            </button>
-          </form>
+          {/* Add Company Form with Mandatory GST Field & Mandatory Dispatch Point */}
+          {canManageCompany ? (
+            <form onSubmit={handleAddCompany} className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2 text-xs">
+              <input
+                type="text"
+                placeholder="Company Name *"
+                value={compName}
+                onChange={(e) => setCompName(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white focus:outline-hidden focus:border-blue-500"
+                required
+              />
+              <input
+                type="text"
+                placeholder="Code (e.g. BRIT)"
+                value={compCode}
+                onChange={(e) => setCompCode(e.target.value.toUpperCase())}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white uppercase font-mono focus:outline-hidden focus:border-blue-500"
+              />
+              <input
+                type="text"
+                placeholder="Mandatory GSTIN * (15 chars)"
+                value={compGstin}
+                onChange={(e) => setCompGstin(e.target.value.toUpperCase().replace(/[\s-]/g, ''))}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono uppercase font-semibold text-emerald-400 focus:outline-hidden focus:border-emerald-500"
+                maxLength={15}
+                required
+              />
+              <select
+                value={compRel}
+                onChange={(e) => setCompRel(e.target.value as any)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-white focus:outline-hidden focus:border-blue-500"
+              >
+                <option value="CF">C&F Relationship</option>
+                <option value="SS">Super Stockist</option>
+                <option value="TCD">Transporter-Distributor</option>
+              </select>
+              <select
+                value={compDispatchPointId || (dispatchPoints.length > 0 ? dispatchPoints[0].id : '')}
+                onChange={(e) => setCompDispatchPointId(e.target.value)}
+                className="bg-slate-950 border border-blue-500/60 rounded-lg px-2.5 py-2 text-blue-300 font-medium focus:outline-hidden focus:border-blue-400"
+                required
+              >
+                <option value="">Select Dispatch Point *</option>
+                {dispatchPoints.map((dp) => (
+                  <option key={dp.id} value={dp.id}>
+                    {dp.name} ({dp.code})
+                  </option>
+                ))}
+              </select>
+              <button
+                type="submit"
+                className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 shadow transition-all cursor-pointer"
+              >
+                <Plus size={14} /> Add Company
+              </button>
+            </form>
+          ) : (
+            <div className="p-3 bg-slate-900/60 border border-slate-800 rounded-xl text-slate-400 text-xs flex items-center gap-2">
+              <Shield size={14} className="text-amber-400 shrink-0" />
+              <span>Principal Company creation and Dispatch Point assignment is restricted to Admin and Sub-Admin accounts.</span>
+            </div>
+          )}
 
-          {/* Principal Companies Table with Edit Action Icon in Front */}
+          {/* Principal Companies Table with Edit Action Icon in Front & Dispatch Point Column */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden text-xs shadow-md">
             <div className="overflow-x-auto">
               <table className="w-full text-left">
                 <thead>
                   <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase font-semibold">
-                    <th className="p-3 text-center w-20">Edit</th>
+                    <th className="p-3 text-center w-36">Actions</th>
                     <th className="p-3">Company Code</th>
                     <th className="p-3">Name</th>
                     <th className="p-3">Type</th>
+                    <th className="p-3">Assigned Dispatch Point</th>
                     <th className="p-3">GSTIN (Mandatory)</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800 text-slate-200">
                   {companies.map((c) => (
                     <tr key={c.id} className="hover:bg-slate-800/40 transition-colors">
-                      {/* Edit action icon in front of each specific company */}
+                      {/* Action buttons (Edit & Delete) - restricted to Admin & Sub-Admin */}
                       <td className="p-3 text-center">
-                        <button
-                          type="button"
-                          onClick={() => handleStartEditCompany(c)}
-                          className="p-1.5 rounded-lg bg-blue-600/15 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 transition-all inline-flex items-center gap-1 shadow-xs cursor-pointer"
-                          title={`Edit Principal Company ${c.name}`}
-                        >
-                          <Edit2 size={13} />
-                          <span className="text-[11px] font-bold">Edit</span>
-                        </button>
+                        {canManageCompany ? (
+                          <div className="flex items-center justify-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleStartEditCompany(c)}
+                              className="p-1.5 rounded-lg bg-blue-600/15 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 transition-all inline-flex items-center gap-1 shadow-xs cursor-pointer"
+                              title={`Edit Principal Company ${c.name} & Dispatch Point`}
+                            >
+                              <Edit2 size={13} />
+                              <span className="text-[11px] font-bold">Edit</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => setDeletingCompany(c)}
+                              className="p-1.5 rounded-lg bg-rose-600/15 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 transition-all inline-flex items-center gap-1 shadow-xs cursor-pointer"
+                              title={`Delete Principal Company ${c.name}`}
+                            >
+                              <Trash2 size={13} />
+                              <span className="text-[11px] font-bold">Delete</span>
+                            </button>
+                          </div>
+                        ) : (
+                          <span
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 text-slate-500 border border-slate-800 text-[10px] select-none"
+                            title="Admin or Sub-Admin access required to edit or delete"
+                          >
+                            <Lock size={10} />
+                            <span>Locked</span>
+                          </span>
+                        )}
                       </td>
                       <td className="p-3 font-mono font-bold text-white">
                         <span className="px-2 py-0.5 rounded bg-slate-800 text-blue-400 border border-slate-700 font-mono text-[10px]">
@@ -918,6 +1024,26 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                         <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px]">
                           {c.relationship_type === 'CF' ? 'C&F' : c.relationship_type === 'SS' ? 'Super Stockist' : 'Transporter-Distributor'}
                         </span>
+                      </td>
+                      <td className="p-3">
+                        {(() => {
+                          const dp = dispatchPoints.find((d) => d.id === c.dispatch_point_id);
+                          return dp ? (
+                            <div className="flex items-center gap-1.5">
+                              <span className="p-1 rounded bg-blue-950/80 border border-blue-800/60 text-blue-400 shrink-0">
+                                <Warehouse size={12} />
+                              </span>
+                              <div>
+                                <div className="font-semibold text-white leading-tight">{dp.name}</div>
+                                <div className="text-[10px] text-slate-400 font-mono">{dp.code}</div>
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded bg-amber-950/60 border border-amber-500/40 text-amber-300 text-[10px] font-mono">
+                              Unassigned
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="p-3 font-mono font-bold">
                         {c.gstin ? (
@@ -1021,6 +1147,29 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                 </div>
               </div>
 
+              <div className="space-y-1">
+                <label className="text-slate-300 font-semibold flex items-center gap-1.5">
+                  <Warehouse size={13} className="text-blue-400" />
+                  <span>Associated Dispatch Point * (Admin / Sub-Admin Only)</span>
+                </label>
+                <select
+                  value={editCompDispatchPointId}
+                  onChange={(e) => setEditCompDispatchPointId(e.target.value)}
+                  className="w-full bg-slate-950 border border-blue-700/80 focus:border-blue-500 rounded-lg px-3 py-2 text-white font-medium focus:outline-hidden"
+                  required
+                >
+                  <option value="">-- Select Dispatch Point --</option>
+                  {dispatchPoints.map((dp) => (
+                    <option key={dp.id} value={dp.id}>
+                      {dp.name} ({dp.code})
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-slate-400">
+                  Every Principal Company must have an assigned Dispatch Point. Only Admin or Sub-Admin can edit this mapping.
+                </p>
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div className="space-y-1">
                   <label className="text-slate-300 font-semibold">Contact Person</label>
@@ -1072,6 +1221,111 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* DELETE PRINCIPAL COMPANY CONFIRMATION MODAL POPUP */}
+      {deletingCompany && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-rose-500/40 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150 text-slate-200">
+            {/* Modal Header */}
+            <div className="flex items-start justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-xl bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                  <AlertTriangle size={22} />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">
+                    Delete Principal Company?
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Confirmation required to prevent accidental removal
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeletingCompany(null)}
+                className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Target Company Info Card */}
+            <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2 text-xs">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                <span className="text-slate-400">Company Name:</span>
+                <span className="font-bold text-white text-sm">{deletingCompany.name}</span>
+              </div>
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                <span className="text-slate-400">Company Code:</span>
+                <span className="px-2 py-0.5 rounded bg-slate-800 text-blue-400 font-mono font-bold text-xs border border-slate-700">
+                  {deletingCompany.code}
+                </span>
+              </div>
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                <span className="text-slate-400">Relationship Type:</span>
+                <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[11px]">
+                  {deletingCompany.relationship_type === 'CF' ? 'C&F' : deletingCompany.relationship_type === 'SS' ? 'Super Stockist' : 'Transporter-Distributor'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                <span className="text-slate-400">Assigned Dispatch Point:</span>
+                <span className="font-semibold text-white flex items-center gap-1 text-[11px]">
+                  <Warehouse size={12} className="text-blue-400" />
+                  {dispatchPoints.find((dp) => dp.id === deletingCompany.dispatch_point_id)?.name || 'Unassigned'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-400">GSTIN:</span>
+                <span className="font-mono text-emerald-400 font-semibold text-xs">
+                  {deletingCompany.gstin || 'None'}
+                </span>
+              </div>
+            </div>
+
+            {/* Impact Warning Notice */}
+            {(() => {
+              const linkedSkusCount = (skus || []).filter((s) => s.company_id === deletingCompany.id).length;
+              const linkedOrdersCount = (orders || []).filter(
+                (o) => o.company_id === deletingCompany.id || (o.company_ids && o.company_ids.includes(deletingCompany.id))
+              ).length;
+
+              return (
+                <div className="p-3 bg-rose-950/30 border border-rose-800/50 rounded-xl space-y-1.5 text-xs text-rose-300">
+                  <div className="font-bold flex items-center gap-1.5 text-rose-200">
+                    <AlertCircle size={14} className="text-rose-400 shrink-0" />
+                    <span>Permanent Deletion Warning</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-rose-300/90">
+                    Deleting this company will permanently remove it from your principal company registry.
+                    {linkedSkusCount > 0 && ` Note: ${linkedSkusCount} SKU(s) in catalog currently belong to this manufacturer.`}
+                    {linkedOrdersCount > 0 && ` ${linkedOrdersCount} order(s) currently reference this company.`}
+                  </p>
+                </div>
+              );
+            })()}
+
+            {/* Modal Actions */}
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setDeletingCompany(null)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteCompany}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center gap-1.5 transition-all shadow-md shadow-rose-950/40 cursor-pointer"
+              >
+                <Trash2 size={14} />
+                <span>Yes, Delete Company</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1422,7 +1676,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
               }`}
             >
               <Layers size={15} />
-              <span>CA BE & DP Mapping Matrix</span>
+              <span>Raiser to BE Mapping Matrix (CFS • SE • Distributor)</span>
               <span
                 className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-semibold ${
                   userSubTab === 'CA_MATRIX'
@@ -1430,7 +1684,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                     : 'bg-slate-800 text-slate-400'
                 }`}
               >
-                {users.filter((u) => u.role === 'AGENT').length} CAs
+                {users.filter((u) => u.role === 'COMMISSION_AGENT' || u.role === 'SALES_EXECUTIVE' || u.role === 'DISTRIBUTOR').length} Raisers
               </span>
             </button>
 
@@ -1517,12 +1771,16 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                           className="w-full bg-slate-950 border border-slate-700 focus:border-purple-500 focus:ring-1 focus:ring-purple-500 rounded-lg px-2.5 py-2 text-white outline-none"
                           required
                         >
-                          <option value="AGENT">Commission Agent (Mobile Field App)</option>
-                          <option value="ADMIN">Admin / Sub-Admin (Web Console)</option>
-                          <option value="BILLING">Billing Executive (Web Console)</option>
-                          <option value="ORDER_PUNCHER">Order Puncher (Web Console)</option>
-                          <option value="DISPATCHER">Dispatcher (Mobile Dock)</option>
-                          <option value="ACCOUNTANT">Accountant (Web Console)</option>
+                          <option value="COMMISSION_AGENT">Commission Agent</option>
+                          <option value="ADMIN">Admin</option>
+                          <option value="SUB_ADMIN">Sub-Admin</option>
+                          <option value="BILLING">Billing Executive </option>
+                          <option value="ORDER_PUNCHER">Order Puncher</option>
+                          <option value="DISPATCHER">Dispatcher</option>
+                          <option value="ACCOUNTANT">Accountant</option>
+                          <option value="DISTRIBUTOR">Distributor</option>
+                          <option value="SALES_EXECUTIVE">Sales Executive</option>
+                          <option value="DELIVERY_VAN_EXECUTIVE">Delivery Van Executive</option>
                         </select>
                       </div>
 
@@ -1560,17 +1818,17 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                       </div>
                     </div>
 
-                    {/* Dispatch Point Field - ONLY VISIBLE AND MANDATORY IF ROLE IS COMMISSION AGENT */}
-                    {usrRole === 'AGENT' && (
-                      <div className="bg-purple-950/30 border border-purple-800/40 rounded-xl p-3 grid grid-cols-1 sm:grid-cols-2 gap-3 items-center animate-fadeIn">
+                    {/* Dispatch Point Field - ONLY for DISPATCHER; Commission Agents have NO Dispatch Point association */}
+                    {usrRole === 'DISPATCHER' && (
+                      <div className="bg-blue-950/30 border border-blue-800/40 rounded-xl p-3 grid grid-cols-1 sm:grid-cols-2 gap-3 items-center animate-fadeIn">
                         <div>
-                          <label className="block text-xs font-semibold text-purple-200 mb-1 flex items-center gap-1.5">
-                            <Warehouse size={13} className="text-purple-400" />
-                            <span>Assigned Dispatch Point / Warehouse</span>
+                          <label className="block text-xs font-semibold text-blue-200 mb-1 flex items-center gap-1.5">
+                            <Warehouse size={13} className="text-blue-400" />
+                            <span>Assigned Warehouse / Depot</span>
                             <span className="text-rose-400">*</span>
                           </label>
-                          <p className="text-[10px] text-purple-300/80">
-                            Commission Agents require an assigned dispatch point for allocating and inwarding outward stock.
+                          <p className="text-[10px] text-blue-300/80">
+                            Dispatchers oversee inventory inwarding, gate passes, and outward stock at their designated depot.
                           </p>
                         </div>
 
@@ -1578,7 +1836,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                           <select
                             value={effectiveUsrDispatchPointId}
                             onChange={(e) => setUsrDispatchPointId(e.target.value)}
-                            className="w-full bg-slate-950 border border-purple-700 focus:border-purple-400 rounded-lg px-3 py-2 text-white outline-none font-medium"
+                            className="w-full bg-slate-950 border border-blue-700 focus:border-blue-400 rounded-lg px-3 py-2 text-white outline-none font-medium"
                             required
                           >
                             {dispatchPoints.length === 0 ? (
@@ -1596,7 +1854,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                     )}
 
                     {/* Beat Selection & Assignment Field - ONLY VISIBLE IF ROLE IS COMMISSION AGENT */}
-                    {usrRole === 'AGENT' && (
+                    {usrRole === 'COMMISSION_AGENT' && (
                       <div className="bg-amber-950/30 border border-amber-800/40 rounded-xl p-3 grid grid-cols-1 sm:grid-cols-2 gap-3 items-center animate-fadeIn">
                         <div>
                           <label className="block text-xs font-semibold text-amber-200 mb-1 flex items-center gap-1.5">
@@ -1642,6 +1900,37 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                               );
                             })()
                           )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Billing Executive Mapping - VISIBLE FOR COMMISSION_AGENT, SALES_EXECUTIVE, and DISTRIBUTOR */}
+                    {(usrRole === 'COMMISSION_AGENT' || usrRole === 'SALES_EXECUTIVE' || usrRole === 'DISTRIBUTOR') && (
+                      <div className="bg-purple-950/30 border border-purple-800/40 rounded-xl p-3 grid grid-cols-1 sm:grid-cols-2 gap-3 items-center animate-fadeIn">
+                        <div>
+                          <label className="block text-xs font-semibold text-purple-200 mb-1 flex items-center gap-1.5">
+                            <UserCheck size={13} className="text-purple-400" />
+                            <span>Mapped Billing Executive (BE)</span>
+                            <span className="text-purple-400 font-normal text-[10px]">(Mandatory for Order Verification)</span>
+                          </label>
+                          <p className="text-[10px] text-purple-300/80">
+                            Orders raised by this {usrRole === 'COMMISSION_AGENT' ? 'Commission Agent' : usrRole === 'SALES_EXECUTIVE' ? 'Sales Executive' : 'Distributor'} will route directly to this Billing Executive's desk for verification and approval.
+                          </p>
+                        </div>
+
+                        <div>
+                          <select
+                            value={usrBillingExecutiveId}
+                            onChange={(e) => setUsrBillingExecutiveId(e.target.value)}
+                            className="w-full bg-slate-950 border border-purple-700 focus:border-purple-400 rounded-lg px-3 py-2 text-white outline-none font-medium"
+                          >
+                            <option value="">-- Select Billing Executive (Auto-Default if blank) --</option>
+                            {users.filter((u) => u.role === 'BILLING').map((be) => (
+                              <option key={be.id} value={be.id}>
+                                {be.name} ({be.email || be.mobile_number})
+                              </option>
+                            ))}
+                          </select>
                         </div>
                       </div>
                     )}
@@ -1696,7 +1985,9 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                       className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white outline-none focus:border-purple-500"
                     >
                       <option value="ALL">All Roles ({users.length})</option>
-                      <option value="AGENT">Commission Agents ({users.filter((u) => u.role === 'AGENT').length})</option>
+                      <option value="COMMISSION_AGENT">Commission Agents ({users.filter((u) => u.role === 'COMMISSION_AGENT').length})</option>
+                      <option value="SALES_EXECUTIVE">Sales Executives ({users.filter((u) => u.role === 'SALES_EXECUTIVE').length})</option>
+                      <option value="DISTRIBUTOR">Distributors ({users.filter((u) => u.role === 'DISTRIBUTOR').length})</option>
                       <option value="BILLING">Billing Executives ({users.filter((u) => u.role === 'BILLING').length})</option>
                       <option value="ADMIN">Administrators ({users.filter((u) => u.role === 'ADMIN').length})</option>
                       <option value="DISPATCHER">Dispatchers ({users.filter((u) => u.role === 'DISPATCHER').length})</option>
@@ -1720,6 +2011,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                       <th className="p-3">Mobile (Login)</th>
                       <th className="p-3">Email</th>
                       <th className="p-3">Role</th>
+                      <th className="p-3">Mapped BE</th>
                       <th className="p-3">Dispatch Point</th>
                       <th className="p-3">Assigned Beat</th>
                       <th className="p-3 text-right">Password & Access</th>
@@ -1767,18 +2059,43 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                                 className={`px-2 py-0.5 rounded font-semibold text-[10px] ${
                                   u.role === 'ADMIN'
                                     ? 'bg-purple-950 text-purple-300 border border-purple-800/60'
-                                    : u.role === 'AGENT'
+                                    : u.role === 'COMMISSION_AGENT'
                                     ? 'bg-amber-950 text-amber-300 border border-amber-800/60'
+                                    : u.role === 'SALES_EXECUTIVE'
+                                    ? 'bg-cyan-950 text-cyan-300 border border-cyan-800/60'
+                                    : u.role === 'DISTRIBUTOR'
+                                    ? 'bg-indigo-950 text-indigo-300 border border-indigo-800/60'
                                     : u.role === 'DISPATCHER'
                                     ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/60'
                                     : 'bg-slate-800 text-blue-300'
                                 }`}
                               >
-                                {u.role === 'AGENT' ? 'COMMISSION AGENT' : u.role}
+                                {u.role === 'COMMISSION_AGENT' ? 'COMMISSION AGENT' : u.role}
                               </span>
                             </td>
                             <td className="p-3">
-                              {linkedDp ? (
+                              {u.role === 'COMMISSION_AGENT' || u.role === 'SALES_EXECUTIVE' || u.role === 'DISTRIBUTOR' ? (
+                                (() => {
+                                  const mappedBE = users.find((be) => be.id === u.billing_executive_id);
+                                  return mappedBE ? (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-purple-950/80 border border-purple-700/60 text-purple-300 text-[10px] font-medium font-mono">
+                                      <UserCheck size={10} className="text-purple-400" />
+                                      {mappedBE.name}
+                                    </span>
+                                  ) : (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-950/60 border border-rose-800/60 text-rose-300 text-[10px] font-medium">
+                                      Unassigned BE
+                                    </span>
+                                  );
+                                })()
+                              ) : (
+                                <span className="text-slate-500 font-mono text-[11px]">N/A</span>
+                              )}
+                            </td>
+                            <td className="p-3">
+                              {u.role === 'COMMISSION_AGENT' ? (
+                                <span className="text-slate-500 font-mono text-[11px]">N/A (Beats Only)</span>
+                              ) : linkedDp ? (
                                 <span className="text-[11px] text-slate-300 font-medium flex items-center gap-1">
                                   <Warehouse size={12} className="text-emerald-400" />
                                   {linkedDp.name}
@@ -1788,7 +2105,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                               )}
                             </td>
                             <td className="p-3">
-                              {u.role === 'AGENT' ? (
+                              {u.role === 'COMMISSION_AGENT' ? (
                                 <div className="flex items-center gap-1.5 flex-wrap">
                                   {agentAssignedBeats.length === 0 ? (
                                     <span className="text-slate-500 font-mono text-[11px] flex items-center gap-1">
@@ -1929,7 +2246,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
               <div className="flex items-center justify-between">
                 <span className="text-slate-400">Assigned Role:</span>
                 <span className="px-2 py-0.5 rounded font-semibold bg-purple-950 text-purple-300 border border-purple-800/60 text-[10px]">
-                  {resetTargetUser.role === 'AGENT' ? 'COMMISSION AGENT' : resetTargetUser.role}
+                  {resetTargetUser.role === 'COMMISSION_AGENT' ? 'COMMISSION AGENT' : resetTargetUser.role}
                 </span>
               </div>
               <div className="flex items-center justify-between">
@@ -2092,7 +2409,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
               <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
                 <span className="text-slate-400">Assigned Role:</span>
                 <span className="px-2 py-0.5 rounded font-semibold bg-purple-950 text-purple-300 border border-purple-800/60 text-[10px]">
-                  {resetSuccessData.user.role === 'AGENT' ? 'COMMISSION AGENT' : resetSuccessData.user.role}
+                  {resetSuccessData.user.role === 'COMMISSION_AGENT' ? 'COMMISSION AGENT' : resetSuccessData.user.role}
                 </span>
               </div>
               <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
@@ -2191,7 +2508,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
               <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
                 <span className="text-slate-400">Assigned Role:</span>
                 <span className="px-2 py-0.5 rounded font-semibold bg-purple-950 text-purple-300 border border-purple-800/60">
-                  {createdCredentials.user.role === 'AGENT' ? 'Commission Agent' : createdCredentials.user.role}
+                  {createdCredentials.user.role === 'COMMISSION_AGENT' ? 'Commission Agent' : createdCredentials.user.role}
                 </span>
               </div>
               <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
@@ -2206,7 +2523,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                   <span className="font-mono text-slate-300">{createdCredentials.user.email}</span>
                 </div>
               ) : null}
-              {createdCredentials.dispatchPointName ? (
+              {createdCredentials.user.role !== 'COMMISSION_AGENT' && createdCredentials.dispatchPointName ? (
                 <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
                   <span className="text-slate-400">Dispatch Point:</span>
                   <span className="font-semibold text-white flex items-center gap-1">
@@ -2221,6 +2538,15 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                   <span className="font-semibold text-amber-300 flex items-center gap-1">
                     <MapPin size={13} className="text-amber-400" />
                     {createdCredentials.beatName}
+                  </span>
+                </div>
+              ) : null}
+              {createdCredentials.user.billing_executive_id ? (
+                <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                  <span className="text-slate-400">Mapped BE:</span>
+                  <span className="font-semibold text-purple-300 flex items-center gap-1">
+                    <UserCheck size={13} className="text-purple-400" />
+                    {users.find((u) => u.id === createdCredentials.user.billing_executive_id)?.name || createdCredentials.user.billing_executive_id}
                   </span>
                 </div>
               ) : null}

@@ -710,7 +710,7 @@ export const MobileDispatcherApp: React.FC = () => {
 
                       <div className="text-right">
                         <div className="font-mono font-bold text-emerald-400 text-xs">
-                          ₹{group.totalDemandValue.toLocaleString('en-IN')}
+                          ₹{(group.totalDemandValue || 0).toLocaleString('en-IN')}
                         </div>
                         <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
                           {group.recipientType.replace('_', ' ')}
@@ -751,7 +751,7 @@ export const MobileDispatcherApp: React.FC = () => {
 
                             <div className="text-right">
                               <div className="font-mono font-bold text-emerald-400">
-                                ₹{item.totalValue.toLocaleString('en-IN')}
+                                ₹{(item.totalValue || 0).toLocaleString('en-IN')}
                               </div>
                               {isShort && (
                                 <span className="text-[9px] font-bold text-rose-400 flex items-center gap-0.5 justify-end">
@@ -791,7 +791,7 @@ export const MobileDispatcherApp: React.FC = () => {
                                 </div>
                               </div>
                               <span className="font-mono text-emerald-400 font-bold">
-                                ₹{ord.total_amount.toLocaleString('en-IN')}
+                                ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                               </span>
                             </div>
                           ))}
@@ -1045,7 +1045,7 @@ export const MobileDispatcherApp: React.FC = () => {
                           </div>
 
                           <div className="text-right font-mono font-bold text-emerald-400">
-                            ₹{line.total.toLocaleString('en-IN')}
+                            ₹{(line.total || 0).toLocaleString('en-IN')}
                           </div>
                         </div>
                       );

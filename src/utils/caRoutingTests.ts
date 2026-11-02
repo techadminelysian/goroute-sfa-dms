@@ -30,7 +30,7 @@ export function runAllCaRoutingTests(): {
       tenant_id: 't1',
       name: 'Rahul Sharma',
       email: 'rahul@distributor.com',
-      role: 'AGENT',
+      role: 'COMMISSION_AGENT',
       company_scope: [],
       dispatch_point_id: 'dp_central',
       billing_executive_id: 'usr_billing_1',
@@ -41,7 +41,7 @@ export function runAllCaRoutingTests(): {
       tenant_id: 't1',
       name: 'Amit Patel',
       email: 'amit@distributor.com',
-      role: 'AGENT',
+      role: 'COMMISSION_AGENT',
       company_scope: [],
       dispatch_point_id: 'dp_north',
       billing_executive_id: 'usr_billing_2',
@@ -233,7 +233,7 @@ export function runAllCaRoutingTests(): {
 
     const passed =
       notification.type === 'ORDER_AMENDED_PARTIAL_APPROVAL' &&
-      notification.target_roles.includes('AGENT') &&
+      notification.target_roles.includes('COMMISSION_AGENT') &&
       notification.message.includes('Atta 10kg');
 
     results.push({
@@ -241,7 +241,7 @@ export function runAllCaRoutingTests(): {
       type: 'POSITIVE',
       passed,
       actualOutcome: `Notification Type: ${notification.type}, Target: ${notification.target_roles.join(', ')}`,
-      expectedOutcome: 'Notification Type: ORDER_AMENDED_PARTIAL_APPROVAL, Target contains AGENT',
+      expectedOutcome: 'Notification Type: ORDER_AMENDED_PARTIAL_APPROVAL, Target contains COMMISSION_AGENT',
     });
   } catch (err: any) {
     results.push({
@@ -330,7 +330,7 @@ export function runAllCaRoutingTests(): {
 
     const passed =
       notif.type === 'ORDER_CANCELLED_CREDIT_LIMIT' &&
-      notif.target_roles.includes('AGENT') &&
+      notif.target_roles.includes('COMMISSION_AGENT') &&
       notif.message.includes('Sharma Traders');
 
     results.push({
@@ -338,7 +338,7 @@ export function runAllCaRoutingTests(): {
       type: 'POSITIVE',
       passed,
       actualOutcome: `Type: ${notif.type}, Message: ${notif.message}`,
-      expectedOutcome: 'Type: ORDER_CANCELLED_CREDIT_LIMIT, targeting AGENT',
+      expectedOutcome: 'Type: ORDER_CANCELLED_CREDIT_LIMIT, targeting COMMISSION_AGENT',
     });
   } catch (err: any) {
     results.push({

@@ -128,7 +128,7 @@ const loadStore = (): StoreData => {
       const parsed = JSON.parse(saved);
       const savedUsers: User[] = Array.isArray(parsed.users) ? parsed.users : [];
       // Ensure INITIAL_USERS exist in saved users list if not already present
-      const mergedUsers = [...savedUsers];
+      let mergedUsers = [...savedUsers];
       INITIAL_USERS.forEach((initU) => {
         if (!mergedUsers.some((u) => u.id === initU.id || (u.mobile_number && u.mobile_number === initU.mobile_number))) {
           mergedUsers.push(initU);
@@ -144,27 +144,93 @@ const loadStore = (): StoreData => {
       if (savedSession && savedSession.user && savedSession.token) {
         resolvedUserId = savedSession.user.id;
         resolvedToken = savedSession.token;
-        resolvedRole = savedSession.user.role;
+        resolvedRole = (savedSession.user.role as any) === 'AGENT' ? 'COMMISSION_AGENT' : savedSession.user.role;
         resolvedTenantId = savedSession.user.tenant_id;
       }
+
+      if ((resolvedRole as any) === 'AGENT') {
+        resolvedRole = 'COMMISSION_AGENT';
+      }
+
+      mergedUsers = mergedUsers.map((u) => {
+        const isAgent = (u.role as any) === 'AGENT' || u.role === 'COMMISSION_AGENT';
+        if (isAgent) {
+          return {
+            ...u,
+            role: 'COMMISSION_AGENT' as UserRole,
+            dispatch_point_id: null // Commission Agents have no dispatch point association
+          };
+        }
+        return u;
+      });
+
+      const loadedDps: DispatchPoint[] = Array.isArray(parsed.dispatchPoints) && parsed.dispatchPoints.length > 0
+        ? parsed.dispatchPoints
+        : INITIAL_DISPATCH_POINTS;
+
+      const loadedCompanies: Company[] = Array.isArray(parsed.companies) && parsed.companies.length > 0
+        ? parsed.companies
+        : INITIAL_COMPANIES;
+
+      const normalizedCompanies: Company[] = loadedCompanies.map((c) => {
+        if (!c.dispatch_point_id) {
+          const fallbackDp = loadedDps.find((dp) => dp.tenant_id === c.tenant_id)?.id || 'dp_central';
+          return { ...c, dispatch_point_id: fallbackDp };
+        }
+        return c;
+      });
 
       return {
         tenants: Array.isArray(parsed.tenants) && parsed.tenants.length > 0 ? parsed.tenants : INITIAL_TENANTS,
         tenantSettings: parsed.tenantSettings || INITIAL_TENANT_SETTINGS,
-        companies: Array.isArray(parsed.companies) ? parsed.companies : INITIAL_COMPANIES,
-        dispatchPoints: Array.isArray(parsed.dispatchPoints) ? parsed.dispatchPoints : INITIAL_DISPATCH_POINTS,
+        companies: normalizedCompanies,
+        dispatchPoints: loadedDps,
         skus: Array.isArray(parsed.skus) ? parsed.skus : INITIAL_SKUS,
         beats: Array.isArray(parsed.beats) && parsed.beats.length > 0 ? parsed.beats : INITIAL_BEATS,
-        retailers: Array.isArray(parsed.retailers) ? parsed.retailers : INITIAL_RETAILERS,
+        retailers: Array.isArray(parsed.retailers)
+          ? parsed.retailers.map((r: any) => ({
+              ...r,
+              current_outstanding: Number(r.current_outstanding) || 0,
+              credit_limit: Number(r.credit_limit) || 50000,
+            }))
+          : INITIAL_RETAILERS,
         distributors: Array.isArray(parsed.distributors) ? parsed.distributors : INITIAL_DISTRIBUTORS,
-        orders: Array.isArray(parsed.orders) ? parsed.orders : INITIAL_ORDERS,
+        orders: Array.isArray(parsed.orders)
+          ? parsed.orders.map((o: any) => ({
+              ...o,
+              total_amount: Number(o.total_amount) || (Array.isArray(o.lines) ? o.lines.reduce((s: number, l: any) => s + (Number(l?.total) || 0), 0) : 0),
+              lines: Array.isArray(o.lines)
+                ? o.lines.map((l: any) => ({
+                    ...l,
+                    quantity: Number(l?.quantity) || 0,
+                    unit_price: Number(l?.unit_price) || 0,
+                    total: Number(l?.total) != null && !isNaN(Number(l?.total)) ? Number(l.total) : (Number(l?.quantity) || 0) * (Number(l?.unit_price) || 0),
+                  }))
+                : [],
+            }))
+          : INITIAL_ORDERS,
         purchaseOrders: Array.isArray(parsed.purchaseOrders) ? parsed.purchaseOrders : INITIAL_PURCHASE_ORDERS,
         workflowNotifications: Array.isArray(parsed.workflowNotifications) ? parsed.workflowNotifications : INITIAL_WORKFLOW_NOTIFICATIONS,
         stockLedger: Array.isArray(parsed.stockLedger) ? parsed.stockLedger : INITIAL_STOCK_LEDGER,
         returnableAssetLedger: Array.isArray(parsed.returnableAssetLedger) ? parsed.returnableAssetLedger : INITIAL_RETURNABLE_ASSET_LEDGER,
-        invoices: Array.isArray(parsed.invoices) ? parsed.invoices : INITIAL_INVOICES,
+        invoices: Array.isArray(parsed.invoices)
+          ? parsed.invoices.map((inv: any) => ({
+              ...inv,
+              total_amount: Number(inv.total_amount) || 0,
+              paid_amount: Number(inv.paid_amount) || 0,
+              subtotal: Number(inv.subtotal) || 0,
+              cgst: Number(inv.cgst) || 0,
+              sgst: Number(inv.sgst) || 0,
+              igst: Number(inv.igst) || 0,
+            }))
+          : INITIAL_INVOICES,
         claims: Array.isArray(parsed.claims) ? parsed.claims : INITIAL_CLAIMS,
-        payments: Array.isArray(parsed.payments) ? parsed.payments : INITIAL_PAYMENTS,
+        payments: Array.isArray(parsed.payments)
+          ? parsed.payments.map((p: any) => ({
+              ...p,
+              amount: Number(p.amount) || 0,
+            }))
+          : INITIAL_PAYMENTS,
         users: mergedUsers,
         activeTenantId: resolvedTenantId || 'tenant_ms_enterprises',
         activeRole: resolvedRole || 'ADMIN',
@@ -568,7 +634,7 @@ export const useAppStore = () => {
     currentUser,
     isAuthenticated,
     authToken: memoryStore.authToken,
-    isMobilePreview: activeUserRole === 'AGENT' || activeUserRole === 'DISPATCHER',
+    isMobilePreview: activeUserRole === 'COMMISSION_AGENT' || activeUserRole === 'DISPATCHER',
     theme: memoryStore.theme || ('dark' as AppTheme),
     setTheme: (newTheme: AppTheme) => {
       memoryStore.theme = newTheme;
@@ -680,7 +746,7 @@ export const useAppStore = () => {
               memoryStore.activeRole = data.user.role;
               memoryStore.activeTenantId = data.user.tenant_id;
               memoryStore.authToken = data.token;
-              if (data.user.role === 'DISPATCHER' || data.user.role === 'AGENT') {
+              if (data.user.role === 'DISPATCHER' || data.user.role === 'COMMISSION_AGENT') {
                 memoryStore.isMobilePreview = true;
               } else {
                 memoryStore.isMobilePreview = false;
@@ -746,7 +812,7 @@ export const useAppStore = () => {
       memoryStore.activeRole = user.role;
       memoryStore.activeTenantId = user.tenant_id;
       memoryStore.authToken = sessionToken;
-      if (user.role === 'DISPATCHER' || user.role === 'AGENT') {
+      if (user.role === 'DISPATCHER' || user.role === 'COMMISSION_AGENT') {
         memoryStore.isMobilePreview = true;
       } else {
         memoryStore.isMobilePreview = false;
@@ -1450,10 +1516,35 @@ export const useAppStore = () => {
 
     // Order Punching & Editing
     addOrder: (order: Order) => {
-      memoryStore.orders = [order, ...memoryStore.orders];
+      // Auto-assign billing_executive_id from creator user (CFS, SE, Distributor) or distributor client
+      let assignedBE = order.billing_executive_id;
+      if (!assignedBE) {
+        const creator = memoryStore.users.find(
+          (u) => u.id === order.created_by_user_id || u.id === order.commission_agent_id
+        );
+        if (creator?.billing_executive_id) {
+          assignedBE = creator.billing_executive_id;
+        } else if (order.retailer_id) {
+          const dist = (memoryStore.distributors || []).find((d) => d.id === order.retailer_id);
+          if (dist?.billing_executive_id) {
+            assignedBE = dist.billing_executive_id;
+          }
+        }
+        if (!assignedBE) {
+          const defaultBE = memoryStore.users.find((u) => u.role === 'BILLING' && u.is_active !== false);
+          assignedBE = defaultBE?.id || 'usr_billing_1';
+        }
+      }
+
+      const effectiveOrder: Order = {
+        ...order,
+        billing_executive_id: assignedBE,
+      };
+
+      memoryStore.orders = [effectiveOrder, ...memoryStore.orders];
 
       if (isFirebaseConfigured()) {
-        saveRecordToFirestore(COLLECTIONS.ORDERS, order.id, order);
+        saveRecordToFirestore(COLLECTIONS.ORDERS, effectiveOrder.id, effectiveOrder);
       }
 
       // Automatically check for below-cost lines and raise claim entries if configured
@@ -1962,7 +2053,7 @@ export const useAppStore = () => {
         tenant_id: activeTenantId,
         asset_sku_id: 'sku_crate_standard',
         asset_name: 'Standard Crate',
-        holder_type: 'AGENT',
+        holder_type: 'COMMISSION_AGENT',
         holder_id: agentId,
         holder_name: targetAgent.name,
         movement_type: movementType,
@@ -2490,18 +2581,19 @@ export const useAppStore = () => {
       }
     },
 
-    // BE Absence Bulk Re-assignment & CA Profile Mapping
+    // BE Absence Bulk Re-assignment & Order Raiser (CFS / SE / Distributor) Mapping
     updateCAAssignments: (
       agentUserIds: string[],
       newBillingExecutiveId?: string | null,
-      newDispatchPointId?: string | null
+      _newDispatchPointId?: string | null
     ) => {
+      // 1. Update matching users (Commission Agents, Sales Executives, Distributors)
       memoryStore.users = memoryStore.users.map((u) => {
         if (agentUserIds.includes(u.id)) {
           const updated: User = {
             ...u,
             billing_executive_id: newBillingExecutiveId !== undefined ? newBillingExecutiveId : u.billing_executive_id,
-            dispatch_point_id: newDispatchPointId !== undefined ? newDispatchPointId : u.dispatch_point_id,
+            dispatch_point_id: u.role === 'DISPATCHER' ? u.dispatch_point_id : null,
           };
           if (isFirebaseConfigured()) {
             saveRecordToFirestore(COLLECTIONS.USERS, u.id, updated);
@@ -2510,6 +2602,22 @@ export const useAppStore = () => {
         }
         return u;
       });
+
+      // 2. Also update any matching distributor client entities
+      memoryStore.distributors = (memoryStore.distributors || []).map((d) => {
+        if (agentUserIds.includes(d.id)) {
+          const updated = {
+            ...d,
+            billing_executive_id: newBillingExecutiveId !== undefined ? newBillingExecutiveId : d.billing_executive_id,
+          };
+          if (isFirebaseConfigured()) {
+            saveRecordToFirestore(COLLECTIONS.DISTRIBUTORS, d.id, updated);
+          }
+          return updated;
+        }
+        return d;
+      });
+
       persist();
     },
 
@@ -2628,7 +2736,7 @@ export const useAppStore = () => {
           title: `Order ${order.order_number} Amended & Approved`,
           message: `Order #${order.order_number} for ${retName} has been amended. ${itemsText} to match credit limits. Click to view updated dispatch totals.`,
           type: 'ORDER_AMENDED_PARTIAL_APPROVAL',
-          target_roles: ['AGENT', 'ADMIN'],
+          target_roles: ['COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR', 'ADMIN'],
           target_user_id: order.commission_agent_id || order.created_by_user_id,
           related_entity_id: order.id,
           related_entity_type: 'ORDER',
@@ -2700,7 +2808,7 @@ export const useAppStore = () => {
         title: `Order ${order.order_number} Cancelled`,
         message: `Order #${order.order_number} for ${retName} has been cancelled by billing due to credit limit exposure. Reason: ${reason}`,
         type: 'ORDER_CANCELLED_CREDIT_LIMIT',
-        target_roles: ['AGENT', 'ADMIN'],
+        target_roles: ['COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR', 'ADMIN'],
         target_user_id: order.commission_agent_id || order.created_by_user_id,
         related_entity_id: order.id,
         related_entity_type: 'ORDER',

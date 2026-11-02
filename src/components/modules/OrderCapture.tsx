@@ -2364,7 +2364,7 @@ export const OrderCapture: React.FC = () => {
                     'APPROVED',
                   ].includes(selectedOrderForDetail.status);
                   const isDelivered = selectedOrderForDetail.status === 'DELIVERED';
-                  const isAgentRole = activeRole === 'AGENT';
+                  const isAgentRole = activeRole === 'COMMISSION_AGENT';
 
                   return (
                     <div className="flex flex-wrap items-center justify-between gap-2">

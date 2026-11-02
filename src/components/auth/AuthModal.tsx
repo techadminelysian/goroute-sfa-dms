@@ -35,7 +35,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setLanguage
   } = useAppStore();
 
-  const isWebUser = Boolean(currentUser && currentUser.role !== 'AGENT' && currentUser.role !== 'DISPATCHER');
+  const isWebUser = Boolean(currentUser && currentUser.role !== 'COMMISSION_AGENT' && currentUser.role !== 'DISPATCHER');
 
   // Form States
   const [mobileNumber, setMobileNumber] = useState('');
@@ -105,10 +105,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </div>
             <div>
               <h2 className="text-base font-bold text-white flex items-center gap-2">
-                Enterprise Login Gate
-                <span className="px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 text-[10px] font-semibold border border-blue-700/50">
-                  PBKDF2 Secure
-                </span>
+                Go Route
               </h2>
               <p className="text-xs text-slate-400 font-medium">
                 {activeTenant?.name || 'MS Enterprises'} • Multi-Tenant Access Terminal

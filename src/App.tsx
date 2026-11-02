@@ -18,10 +18,14 @@ import { AccessDenied } from './components/common/AccessDenied';
 import { TenantSettingsModal } from './components/settings/TenantSettingsModal';
 import { FirebaseConfigModal } from './components/settings/FirebaseConfigModal';
 import { AuthModal } from './components/auth/AuthModal';
+import { isTenantSettingsAuthorized, isOnboardingAuthorized } from './utils/authClient';
 import { Languages } from 'lucide-react';
 
 export default function App() {
-  const { activeTenant, activeRole, isMobilePreview, isAuthenticated, theme, language, setLanguage } = useAppStore();
+  const { activeTenant, activeRole, isMobilePreview, isAuthenticated, theme, language, setLanguage, currentUser } = useAppStore();
+
+  const isTenantSettingsAllowed = isTenantSettingsAuthorized(currentUser);
+  const isOnboardingAllowed = isOnboardingAuthorized(currentUser);
 
   const [activeModule, setActiveModule] = useState<string>('home');
   const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
@@ -31,7 +35,7 @@ export default function App() {
 
   // Enforce English language for web view users (all roles except Commission Agent & Dispatcher)
   useEffect(() => {
-    if (activeRole !== 'AGENT' && activeRole !== 'DISPATCHER' && language !== 'en') {
+    if (activeRole !== 'COMMISSION_AGENT' && activeRole !== 'DISPATCHER' && language !== 'en') {
       setLanguage('en');
     }
   }, [activeRole, language, setLanguage]);
@@ -54,15 +58,15 @@ export default function App() {
 
   // Define module role permissions
   const moduleRoleRules: Record<string, string[]> = {
-    home: ['ADMIN', 'BILLING', 'ORDER_PUNCHER', 'DISPATCHER', 'ACCOUNTANT', 'AGENT'],
-    orders: ['ADMIN', 'BILLING', 'ORDER_PUNCHER', 'AGENT'],
-    inventory: ['ADMIN', 'DISPATCHER'],
-    billing: ['ADMIN', 'BILLING', 'ACCOUNTANT'],
-    credit: ['ADMIN', 'ACCOUNTANT'],
-    claims: ['ADMIN'],
-    reports: ['ADMIN', 'BILLING', 'ACCOUNTANT'],
-    setup: ['ADMIN'],
-    my_retailers: ['ADMIN', 'AGENT', 'ORDER_PUNCHER']
+    home: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER', 'DISPATCHER', 'ACCOUNTANT', 'DISTRIBUTOR', 'SALES_EXECUTIVE', 'COMMISSION_AGENT', 'DELIVERY_VAN_EXECUTIVE'],
+    orders: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER', 'COMMISSION_AGENT'],
+    inventory: ['ADMIN', 'SUB_ADMIN', 'DISPATCHER'],
+    billing: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ACCOUNTANT'],
+    credit: ['ADMIN', 'SUB_ADMIN', 'ACCOUNTANT'],
+    claims: ['ADMIN', 'SUB_ADMIN'],
+    reports: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ACCOUNTANT'],
+    setup: ['ADMIN', 'SUB_ADMIN'],
+    my_retailers: ['ADMIN', 'SUB_ADMIN', 'COMMISSION_AGENT', 'ORDER_PUNCHER']
   };
 
   const isModuleAllowed = (mod: string): boolean => {
@@ -78,8 +82,12 @@ export default function App() {
     >
       {/* Top Header */}
       <Header
-        onOpenOnboarding={() => setIsOnboardingOpen(true)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenOnboarding={() => {
+          if (isOnboardingAllowed) setIsOnboardingOpen(true);
+        }}
+        onOpenSettings={() => {
+          if (isTenantSettingsAllowed) setIsSettingsOpen(true);
+        }}
         onOpenFirebaseModal={() => setIsFirebaseOpen(true)}
         onOpenAuth={() => setIsAuthOpen(true)}
         activeModule={activeModule}
@@ -136,7 +144,9 @@ export default function App() {
           <Sidebar
             activeModule={activeModule}
             setActiveModule={setActiveModule}
-            onOpenOnboarding={() => setIsOnboardingOpen(true)}
+            onOpenOnboarding={() => {
+              if (isOnboardingAllowed) setIsOnboardingOpen(true);
+            }}
           />
 
           {/* Main Module Canvas */}
@@ -153,7 +163,9 @@ export default function App() {
                   {activeModule === 'home' && (
                     <HomeView
                       onNavigate={setActiveModule}
-                      onOpenOnboarding={() => setIsOnboardingOpen(true)}
+                      onOpenOnboarding={() => {
+                        if (isOnboardingAllowed) setIsOnboardingOpen(true);
+                      }}
                     />
                   )}
 
@@ -171,8 +183,12 @@ export default function App() {
 
                   {(activeModule === 'setup' || activeModule === 'my_retailers') && (
                     <SetupView
-                      onOpenOnboarding={() => setIsOnboardingOpen(true)}
-                      onOpenSettings={() => setIsSettingsOpen(true)}
+                      onOpenOnboarding={() => {
+                        if (isOnboardingAllowed) setIsOnboardingOpen(true);
+                      }}
+                      onOpenSettings={() => {
+                        if (isTenantSettingsAllowed) setIsSettingsOpen(true);
+                      }}
                     />
                   )}
                 </>
@@ -190,8 +206,8 @@ export default function App() {
         />
       )}
 
-      {/* Onboarding Modal Overlay */}
-      {isOnboardingOpen && (
+      {/* Onboarding Modal Overlay - Strictly restricted to user Yash Sharma */}
+      {isOnboardingOpen && isOnboardingAllowed && (
         <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md overflow-y-auto p-4">
           <div className="relative max-w-4xl mx-auto">
             <button
@@ -210,8 +226,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Settings Modal Overlay */}
-      {isSettingsOpen && (
+      {/* Settings Modal Overlay - Only visible to backend user 7830260134 */}
+      {isSettingsOpen && isTenantSettingsAllowed && (
         <TenantSettingsModal onClose={() => setIsSettingsOpen(false)} />
       )}
 
