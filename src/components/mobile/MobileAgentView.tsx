@@ -335,18 +335,43 @@ export const MobileAgentView: React.FC = () => {
     lines: MobileTempLine[];
   }
 
+  // Business Requirement: Field User Principal Company & SKU Access Restriction (Zero-Trust by Default)
+  const allowedCompanies = useMemo(() => {
+    const isFieldRole = activeAgent?.role === 'COMMISSION_AGENT' || activeAgent?.role === 'SALES_EXECUTIVE' || activeAgent?.role === 'DISTRIBUTOR';
+    if (!isFieldRole) return companies;
+
+    const scope = activeAgent?.company_scope || [];
+    return companies.filter((c) => scope.includes(c.id));
+  }, [activeAgent, companies]);
+
+  const allowedCompanyIds = useMemo(() => new Set(allowedCompanies.map((c) => c.id)), [allowedCompanies]);
+
+  const allowedSkus = useMemo(() => {
+    const isFieldRole = activeAgent?.role === 'COMMISSION_AGENT' || activeAgent?.role === 'SALES_EXECUTIVE' || activeAgent?.role === 'DISTRIBUTOR';
+    if (!isFieldRole) return skus;
+
+    return skus.filter((s) => allowedCompanyIds.has(s.company_id));
+  }, [activeAgent, skus, allowedCompanyIds]);
+
+  const isAccessLocked = useMemo(() => {
+    const isFieldRole = activeAgent?.role === 'COMMISSION_AGENT' || activeAgent?.role === 'SALES_EXECUTIVE' || activeAgent?.role === 'DISTRIBUTOR';
+    if (!isFieldRole) return false;
+    return !activeAgent?.company_scope || activeAgent.company_scope.length === 0;
+  }, [activeAgent]);
+
   const [mobileCompanyGroups, setMobileCompanyGroups] = useState<MobileCompanyGroup[]>(() => {
-    const firstComp = companies[0];
-    const compSkus = firstComp ? skus.filter((s) => s.company_id === firstComp.id) : skus;
-    const firstSku = compSkus[0] || skus[0];
+    const firstComp = allowedCompanies[0];
+    const compSkus = firstComp ? allowedSkus.filter((s) => s.company_id === firstComp.id) : allowedSkus;
+    const firstSku = compSkus[0] || allowedSkus[0];
+    if (!firstComp || !firstSku) return [];
     return [
       {
         groupId: `mob_grp_${Date.now()}_1`,
-        companyId: firstComp?.id || '',
+        companyId: firstComp.id,
         lines: [
           {
             id: `mob_line_${Date.now()}_1`,
-            sku_id: firstSku?.id || '',
+            sku_id: firstSku.id,
             current_stock: 0,
             quantity: 10,
           },
@@ -354,6 +379,38 @@ export const MobileAgentView: React.FC = () => {
       },
     ];
   });
+
+  // Keep mobileCompanyGroups synchronized with allowedCompanies whenever agent or permissions change
+  useEffect(() => {
+    if (isAccessLocked || allowedCompanies.length === 0) {
+      setMobileCompanyGroups([]);
+    } else {
+      setMobileCompanyGroups((prev) => {
+        const valid = prev.filter((g) => allowedCompanyIds.has(g.companyId));
+        if (valid.length > 0) return valid;
+
+        const firstComp = allowedCompanies[0];
+        const compSkus = allowedSkus.filter((s) => s.company_id === firstComp.id);
+        const firstSku = compSkus[0] || allowedSkus[0];
+        if (!firstComp || !firstSku) return [];
+
+        return [
+          {
+            groupId: `mob_grp_${Date.now()}_1`,
+            companyId: firstComp.id,
+            lines: [
+              {
+                id: `mob_line_${Date.now()}_1`,
+                sku_id: firstSku.id,
+                current_stock: 0,
+                quantity: 10,
+              },
+            ],
+          },
+        ];
+      });
+    }
+  }, [activeAgent?.id, activeAgent?.company_scope, allowedCompanies, allowedSkus, allowedCompanyIds, isAccessLocked]);
 
   // Historical Order Lookup for Prev. Order calculation in Mobile View
   const getMobilePrevOrderQty = (retId: string, skuId: string): number => {
@@ -370,13 +427,13 @@ export const MobileAgentView: React.FC = () => {
     return 0;
   };
 
-  // Global SKU Search for Mobile
+  // Global SKU Search for Mobile (Strictly filtered by allowedSkus)
   const mobileSearchMatches = useMemo(() => {
-    if (!mobileSearchTerm.trim()) return [];
+    if (!mobileSearchTerm.trim() || isAccessLocked) return [];
     const q = mobileSearchTerm.toLowerCase();
-    return skus
+    return allowedSkus
       .filter((s) => {
-        const comp = companies.find((c) => c.id === s.company_id);
+        const comp = allowedCompanies.find((c) => c.id === s.company_id);
         return (
           s.name.toLowerCase().includes(q) ||
           s.code.toLowerCase().includes(q) ||
@@ -386,7 +443,7 @@ export const MobileAgentView: React.FC = () => {
         );
       })
       .slice(0, 6);
-  }, [mobileSearchTerm, skus, companies]);
+  }, [mobileSearchTerm, allowedSkus, allowedCompanies, isAccessLocked]);
 
   // Track all selected SKU IDs across the mobile order
   const allMobileSelectedSkuIds = useMemo(() => {
@@ -480,11 +537,16 @@ export const MobileAgentView: React.FC = () => {
 
   // Add Company Section in Mobile
   const handleAddMobileCompanyGroup = () => {
+    if (isAccessLocked || allowedCompanies.length === 0) {
+      alert('Access Restricted: No Principal Companies are assigned to your field profile. Please contact an administrator.');
+      return;
+    }
+
     const existingCompIds = new Set(mobileCompanyGroups.map((g) => g.companyId));
-    const availableCompanies = companies.filter((c) => !existingCompIds.has(c.id));
+    const availableCompanies = allowedCompanies.filter((c) => !existingCompIds.has(c.id));
 
     if (availableCompanies.length === 0) {
-      alert('All Principal Companies have already been added to this order.');
+      alert('All authorized Principal Companies have already been added to this order.');
       return;
     }
 
@@ -498,11 +560,11 @@ export const MobileAgentView: React.FC = () => {
 
     const companyWithAvailableSku =
       availableCompanies.find((c) => {
-        const compSkus = skus.filter((s) => s.company_id === c.id);
+        const compSkus = allowedSkus.filter((s) => s.company_id === c.id);
         return compSkus.some((s) => !usedSkuIds.has(s.id));
       }) || availableCompanies[0];
 
-    const compSkus = skus.filter((s) => s.company_id === companyWithAvailableSku.id);
+    const compSkus = allowedSkus.filter((s) => s.company_id === companyWithAvailableSku.id);
     const availableSku = compSkus.find((s) => !usedSkuIds.has(s.id)) || compSkus[0];
 
     if (!availableSku) {
@@ -540,19 +602,24 @@ export const MobileAgentView: React.FC = () => {
     if (!targetGroup) return;
     if (targetGroup.companyId === newCompanyId) return;
 
+    if (!allowedCompanyIds.has(newCompanyId)) {
+      alert('Access Restricted: You do not have permission to book products for this Principal Company.');
+      return;
+    }
+
     // Check if another group already uses this company
     const isCompanyAlreadyInOrder = mobileCompanyGroups.some(
       (g) => g.groupId !== groupId && g.companyId === newCompanyId
     );
     if (isCompanyAlreadyInOrder) {
-      const compObj = companies.find((c) => c.id === newCompanyId);
+      const compObj = allowedCompanies.find((c) => c.id === newCompanyId);
       alert(
         `"${compObj?.name || 'This company'}" is already added as a separate section in this order. Please use that existing section.`
       );
       return;
     }
 
-    const compSkus = skus.filter((s) => s.company_id === newCompanyId);
+    const compSkus = allowedSkus.filter((s) => s.company_id === newCompanyId);
     if (compSkus.length === 0) {
       alert('No products found for this company.');
       return;
@@ -774,6 +841,18 @@ export const MobileAgentView: React.FC = () => {
 
     if (!selectedRetailer) {
       alert('Please select a valid store outlet.');
+      return;
+    }
+
+    if (isAccessLocked || allowedCompanies.length === 0) {
+      alert('Order Punch Blocked: Zero-Trust Security Policy enforces that you must have at least one Principal Company assigned before punching orders. Please contact your administrator.');
+      return;
+    }
+
+    // Ensure all groups belong to allowed companies
+    const unauthorizedGroup = (mobileCompanyGroups || []).find((g) => !allowedCompanyIds.has(g.companyId));
+    if (unauthorizedGroup) {
+      alert('Order Punch Blocked: One or more selected Principal Companies are not authorized for your profile.');
       return;
     }
 
@@ -1560,65 +1639,89 @@ export const MobileAgentView: React.FC = () => {
             )}
           </div>
 
-          {/* Global Quick SKU Search */}
-          <div className="relative bg-slate-900 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
-            <div className="relative">
-              <Search size={13} className="absolute left-2.5 top-2.5 text-slate-400" />
-              <input
-                type="text"
-                placeholder={t('quickSearchSkuPlaceholder', language)}
-                value={mobileSearchTerm}
-                onChange={(e) => {
-                  setMobileSearchTerm(e.target.value);
-                  setIsMobileSearchOpen(true);
-                }}
-                onFocus={() => setIsMobileSearchOpen(true)}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-slate-500 focus:border-blue-500 focus:outline-none"
-              />
-            </div>
-
-            {isMobileSearchOpen && mobileSearchMatches.length > 0 && (
-              <div className="bg-slate-950 border border-slate-700 rounded-lg p-1 space-y-1 shadow-xl">
-                {mobileSearchMatches.map((sku) => {
-                  const comp = companies.find((c) => c.id === sku.company_id);
-                  const isAlreadyInOrder = allMobileSelectedSkuIds.has(sku.id);
-                  return (
-                    <button
-                      key={sku.id}
-                      type="button"
-                      onClick={() => handleMobileQuickAddSku(sku)}
-                      className="w-full text-left p-1.5 rounded hover:bg-slate-800 flex items-center justify-between text-[11px]"
-                    >
-                      <div className="truncate">
-                        <span className="font-semibold text-white">{sku.name}</span>
-                        <span className="text-[9px] text-purple-300 ml-1.5 font-mono">({comp?.code || 'SKU'})</span>
-                        {isAlreadyInOrder && (
-                          <span className="text-[9px] text-amber-300 bg-amber-500/20 px-1 py-0.2 rounded border border-amber-500/30 ml-1.5 font-semibold">
-                            {language === 'hi' ? 'ऑर्डर में (+10)' : 'In Order (+10 Qty)'}
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-1.5 flex-shrink-0">
-                        <span className="text-emerald-400 font-mono font-bold">₹{sku.selling_price}</span>
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${isAlreadyInOrder ? 'bg-amber-500/20 text-amber-300' : 'bg-blue-500/20 text-blue-300'}`}>
-                          {isAlreadyInOrder ? (language === 'hi' ? '+10 मात्रा' : '+10 Qty') : (language === 'hi' ? '+ जोड़ें' : '+ Add')}
-                        </span>
-                      </div>
-                    </button>
-                  );
-                })}
+          {/* Zero-Trust SKU Access Restriction Banner */}
+          {isAccessLocked && (
+            <div className="p-4 bg-rose-950/50 border border-rose-500/50 rounded-2xl text-rose-200 text-xs space-y-2 shadow-lg">
+              <div className="font-bold flex items-center gap-2 text-rose-400 text-sm">
+                <Lock size={16} />
+                <span>{language === 'hi' ? 'कंपनी और उत्पाद एक्सेस लॉक है (Zero-Trust)' : 'Principal Company & SKU Catalog Restricted (Zero-Trust)'}</span>
               </div>
-            )}
-          </div>
+              <p className="text-[11px] text-rose-200/90 leading-relaxed">
+                {language === 'hi'
+                  ? 'सुरक्षा नीति के तहत आपके फील्ड एजेंट खाते को किसी भी मुख्य कंपनी (Principal Company) की अनुमति नहीं है। नया ऑर्डर बनाने के लिए अपने एडमिनिस्ट्रेटर से फील्ड एसकेयू एक्सेस मैट्रिक्स (Field SKU Access Matrix) में ब्रांड आवंटन का अनुरोध करें।'
+                  : 'Zero-Trust Security Policy: No Principal Companies are assigned to your field profile. You cannot view products or punch orders until your Organization Administrator grants brand access in the Field SKU Access Matrix.'}
+              </p>
+              <div className="flex items-center gap-2 pt-1 text-[10px] text-rose-300 font-mono">
+                <span>Agent: {activeAgent?.name}</span>
+                <span>•</span>
+                <span>Role: {activeAgent?.role}</span>
+                <span>•</span>
+                <span className="text-rose-400 font-bold">0 Brands Assigned</span>
+              </div>
+            </div>
+          )}
+
+          {/* Global Quick SKU Search (hidden if access locked) */}
+          {!isAccessLocked && (
+            <div className="relative bg-slate-900 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-2.5 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder={t('quickSearchSkuPlaceholder', language)}
+                  value={mobileSearchTerm}
+                  onChange={(e) => {
+                    setMobileSearchTerm(e.target.value);
+                    setIsMobileSearchOpen(true);
+                  }}
+                  onFocus={() => setIsMobileSearchOpen(true)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-slate-500 focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+
+              {isMobileSearchOpen && mobileSearchMatches.length > 0 && (
+                <div className="bg-slate-950 border border-slate-700 rounded-lg p-1 space-y-1 shadow-xl">
+                  {mobileSearchMatches.map((sku) => {
+                    const comp = allowedCompanies.find((c) => c.id === sku.company_id);
+                    const isAlreadyInOrder = allMobileSelectedSkuIds.has(sku.id);
+                    return (
+                      <button
+                        key={sku.id}
+                        type="button"
+                        onClick={() => handleMobileQuickAddSku(sku)}
+                        className="w-full text-left p-1.5 rounded hover:bg-slate-800 flex items-center justify-between text-[11px]"
+                      >
+                        <div className="truncate">
+                          <span className="font-semibold text-white">{sku.name}</span>
+                          <span className="text-[9px] text-purple-300 ml-1.5 font-mono">({comp?.code || 'SKU'})</span>
+                          {isAlreadyInOrder && (
+                            <span className="text-[9px] text-amber-300 bg-amber-500/20 px-1 py-0.2 rounded border border-amber-500/30 ml-1.5 font-semibold">
+                              {language === 'hi' ? 'ऑर्डर में (+10)' : 'In Order (+10 Qty)'}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <span className="text-emerald-400 font-mono font-bold">₹{sku.selling_price}</span>
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${isAlreadyInOrder ? 'bg-amber-500/20 text-amber-300' : 'bg-blue-500/20 text-blue-300'}`}>
+                            {isAlreadyInOrder ? (language === 'hi' ? '+10 मात्रा' : '+10 Qty') : (language === 'hi' ? '+ जोड़ें' : '+ Add')}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Company-Grouped Product Sections */}
           <div className="space-y-3">
             {mobileCompanyGroups.map((group, gIdx) => {
-              const compObj = companies.find((c) => c.id === group.companyId);
-              const compSkus = skus.filter((s) => s.company_id === group.companyId);
+              const compObj = allowedCompanies.find((c) => c.id === group.companyId);
+              const compSkus = allowedSkus.filter((s) => s.company_id === group.companyId);
               const availableSkusForGroup = compSkus.filter((s) => !allMobileSelectedSkuIds.has(s.id));
               const groupSubtotal = group.lines.reduce((sum, l) => {
-                const sku = skus.find((s) => s.id === l.sku_id);
+                const sku = allowedSkus.find((s) => s.id === l.sku_id);
                 return sum + (sku?.selling_price || 0) * l.quantity;
               }, 0);
 
@@ -1640,7 +1743,7 @@ export const MobileAgentView: React.FC = () => {
                           onChange={(e) => handleMobileGroupCompanyChange(group.groupId, e.target.value)}
                           className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white focus:border-purple-500 focus:outline-none cursor-pointer"
                         >
-                          {companies.map((c) => {
+                          {allowedCompanies.map((c) => {
                             const isUsedInOtherGroup = mobileCompanyGroups.some(
                               (g) => g.groupId !== group.groupId && g.companyId === c.id
                             );
@@ -1776,7 +1879,7 @@ export const MobileAgentView: React.FC = () => {
           </div>
 
           {/* Add Another Principal Company */}
-          {companies.some((c) => !mobileCompanyGroups.some((g) => g.companyId === c.id)) ? (
+          {!isAccessLocked && allowedCompanies.some((c) => !mobileCompanyGroups.some((g) => g.companyId === c.id)) ? (
             <button
               type="button"
               onClick={handleAddMobileCompanyGroup}
@@ -1784,11 +1887,11 @@ export const MobileAgentView: React.FC = () => {
             >
               <Building size={13} /> {t('addAnotherPrincipalCompany', language)}
             </button>
-          ) : (
+          ) : !isAccessLocked && allowedCompanies.length > 0 ? (
             <div className="text-center py-2 px-3 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-500 italic">
               ✓ {t('allPrincipalCompaniesAdded', language)}
             </div>
-          )}
+          ) : null}
 
           {/* Visit Notes */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-1">
@@ -1838,11 +1941,13 @@ export const MobileAgentView: React.FC = () => {
           {/* Submit Button */}
           <button
             type="submit"
-            disabled={!selectedRetailer || agentAssignedStores.length === 0}
+            disabled={!selectedRetailer || agentAssignedStores.length === 0 || isAccessLocked || allowedCompanies.length === 0}
             className="w-full py-3.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-extrabold text-xs flex items-center justify-center gap-2 shadow-lg shadow-blue-900/40 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Send size={15} />
-            {agentAssignedBeats.length === 0
+            {isAccessLocked || allowedCompanies.length === 0
+              ? (language === 'hi' ? 'ऑर्डर निर्माण प्रतिबंधित (0 ब्रांड आवंटित)' : 'Order Punching Restricted (0 Brands Assigned)')
+              : agentAssignedBeats.length === 0
               ? t('orderPunchingDisabledNoBeats', language)
               : agentAssignedStores.length === 0
               ? t('orderPunchingDisabledNoStores', language)

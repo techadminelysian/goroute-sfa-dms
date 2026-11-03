@@ -5,6 +5,7 @@ import { validateStoreName, validateGSTIN } from '../../utils/validators';
 import { generateSecurePassword, isValidMobileNumber, sanitizeMobileNumber } from '../../utils/authClient';
 import { CAMappingMatrix } from './CAMappingMatrix';
 import { BEAbsenceRemappingTool } from './BEAbsenceRemappingTool';
+import { CompanySKUAccessMatrix } from './CompanySKUAccessMatrix';
 import {
   Building,
   Warehouse,
@@ -57,6 +58,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
     deleteCompany,
     bulkUpsertCompanies,
     addDispatchPoint,
+    deleteDispatchPoint,
     addUser,
     updateBeat,
     assignBeatsToAgent,
@@ -115,6 +117,9 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
 
   const [dpName, setDpName] = useState('');
   const [dpCode, setDpCode] = useState('');
+  const [deletingDispatchPoint, setDeletingDispatchPoint] = useState<DispatchPoint | null>(null);
+  const [dpError, setDpError] = useState<string | null>(null);
+  const [dpSuccess, setDpSuccess] = useState<string | null>(null);
 
   // User Creation States
   const [usrName, setUsrName] = useState('');
@@ -157,8 +162,8 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
   const [isSeedingDb, setIsSeedingDb] = useState(false);
   const [seedSuccessMsg, setSeedSuccessMsg] = useState<string | null>(null);
 
-  // Sub-tabs in Users & Roles (horizontally aligned): Create User & Roster, CA Mapping Matrix, BE Absence Tool
-  const [userSubTab, setUserSubTab] = useState<'USERS_ROSTER' | 'CA_MATRIX' | 'BE_ABSENCE'>('USERS_ROSTER');
+  // Sub-tabs in Users & Roles (horizontally aligned): Create User & Roster, CA Mapping Matrix, BE Absence Tool, Field SKU Matrix
+  const [userSubTab, setUserSubTab] = useState<'USERS_ROSTER' | 'CA_MATRIX' | 'BE_ABSENCE' | 'FIELD_SKU_MATRIX'>('USERS_ROSTER');
   const [userRosterSearch, setUserRosterSearch] = useState('');
   const [userRosterRoleFilter, setUserRosterRoleFilter] = useState<string>('ALL');
 
@@ -628,7 +633,33 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
 
     setDpName('');
     setDpCode('');
-    alert(`Dispatch point "${dpName}" added!`);
+    setDpSuccess(`Dispatch point "${nameVal.formatted}" added successfully!`);
+    setTimeout(() => setDpSuccess(null), 4000);
+  };
+
+  // Delete Dispatch Point confirmation handler
+  const handleConfirmDeleteDispatchPoint = () => {
+    if (!deletingDispatchPoint) return;
+
+    if (!canManageCompany) {
+      setDpError('Permission Denied: Only Admin and Sub-Admin accounts are authorized to delete Dispatch Points.');
+      setDeletingDispatchPoint(null);
+      return;
+    }
+
+    if (dispatchPoints.length <= 1) {
+      setDpError('Cannot delete: Every tenant must maintain at least one active Dispatch Point configured.');
+      setDeletingDispatchPoint(null);
+      return;
+    }
+
+    const dpNameDeleted = deletingDispatchPoint.name;
+    const dpCodeDeleted = deletingDispatchPoint.code;
+
+    deleteDispatchPoint(deletingDispatchPoint.id);
+    setDeletingDispatchPoint(null);
+    setDpSuccess(`Dispatch Point "${dpNameDeleted}" (${dpCodeDeleted}) has been deleted successfully.`);
+    setTimeout(() => setDpSuccess(null), 5000);
   };
 
   const handleAddUser = (e: React.FormEvent) => {
@@ -1532,7 +1563,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
       {/* Dispatch Points Management */}
       {type === 'DISPATCH' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between bg-slate-900 border border-slate-800 p-4 rounded-2xl gap-3">
             <div>
               <h2 className="text-sm font-bold text-white flex items-center gap-2">
                 <Warehouse size={16} className="text-emerald-400" />
@@ -1542,49 +1573,239 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                 Warehouses & depots linked to tenant "{activeTenant.name}".
               </p>
             </div>
+            {!canManageCompany && (
+              <span className="text-[11px] font-semibold text-amber-400/90 bg-amber-950/40 border border-amber-800/50 px-2.5 py-1 rounded-lg">
+                View Only (Admin / Sub-Admin access required to modify)
+              </span>
+            )}
           </div>
 
-          <form onSubmit={handleAddDispatch} className="p-3 bg-slate-900 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
-            <input
-              type="text"
-              placeholder="Warehouse / Depot Name"
-              value={dpName}
-              onChange={(e) => setDpName(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
-              required
-            />
-            <input
-              type="text"
-              placeholder="Code (e.g. WH-01)"
-              value={dpCode}
-              onChange={(e) => setDpCode(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono uppercase"
-            />
-            <button type="submit" className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg px-3 py-1.5">
-              + Add Dispatch Point
-            </button>
-          </form>
+          {dpSuccess && (
+            <div className="p-3 bg-emerald-950/40 border border-emerald-800/60 rounded-xl text-emerald-300 text-xs flex items-center gap-2 animate-in fade-in duration-150">
+              <CheckCircle2 size={15} className="shrink-0 text-emerald-400" />
+              <span>{dpSuccess}</span>
+            </div>
+          )}
 
-          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden text-xs">
+          {dpError && (
+            <div className="p-3 bg-rose-950/40 border border-rose-800/60 rounded-xl text-rose-300 text-xs flex items-center gap-2 animate-in fade-in duration-150">
+              <AlertCircle size={15} className="shrink-0 text-rose-400" />
+              <span>{dpError}</span>
+            </div>
+          )}
+
+          {canManageCompany && (
+            <form onSubmit={handleAddDispatch} className="p-3 bg-slate-900 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+              <input
+                type="text"
+                placeholder="Warehouse / Depot Name"
+                value={dpName}
+                onChange={(e) => setDpName(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+                required
+              />
+              <input
+                type="text"
+                placeholder="Code (e.g. WH-01)"
+                value={dpCode}
+                onChange={(e) => setDpCode(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono uppercase"
+              />
+              <button type="submit" className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg px-3 py-1.5 cursor-pointer transition-colors">
+                + Add Dispatch Point
+              </button>
+            </form>
+          )}
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden text-xs shadow-md">
             <table className="w-full text-left">
               <thead>
                 <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase font-semibold">
                   <th className="p-3">Hub Code</th>
                   <th className="p-3">Name</th>
                   <th className="p-3">Supervisor</th>
+                  <th className="p-3">Linked Principal Companies</th>
+                  <th className="p-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800 text-slate-200">
-                {dispatchPoints.map((dp) => (
-                  <tr key={dp.id}>
-                    <td className="p-3 font-mono font-bold text-white">{dp.code}</td>
-                    <td className="p-3 font-semibold">{dp.name}</td>
-                    <td className="p-3 text-slate-300">{dp.supervisor_name}</td>
+                {dispatchPoints.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="p-6 text-center text-slate-500">
+                      No Dispatch Points found.
+                    </td>
                   </tr>
-                ))}
+                ) : (
+                  dispatchPoints.map((dp) => {
+                    const linkedComps = companies.filter((c) => c.dispatch_point_id === dp.id);
+                    return (
+                      <tr key={dp.id} className="hover:bg-slate-800/40 transition-colors">
+                        <td className="p-3 font-mono font-bold text-white">{dp.code}</td>
+                        <td className="p-3 font-semibold text-slate-100">{dp.name}</td>
+                        <td className="p-3 text-slate-300">{dp.supervisor_name || 'N/A'}</td>
+                        <td className="p-3">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[11px] font-mono border ${
+                              linkedComps.length > 0
+                                ? 'bg-blue-950/40 text-blue-300 border-blue-800/50 font-bold'
+                                : 'bg-slate-800/60 text-slate-400 border-slate-700/50'
+                            }`}
+                          >
+                            {linkedComps.length} {linkedComps.length === 1 ? 'Company' : 'Companies'}
+                          </span>
+                        </td>
+                        <td className="p-3 text-right">
+                          {canManageCompany ? (
+                            <button
+                              type="button"
+                              onClick={() => setDeletingDispatchPoint(dp)}
+                              className="px-2.5 py-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 hover:text-rose-300 border border-rose-500/30 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                              title={`Delete Dispatch Point "${dp.name}"`}
+                            >
+                              <Trash2 size={13} />
+                              <span>Delete</span>
+                            </button>
+                          ) : (
+                            <span className="text-[11px] text-slate-500 italic">View Only</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
+
+          {/* DELETE DISPATCH POINT CONFIRMATION MODAL POPUP */}
+          {deletingDispatchPoint && (
+            <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-rose-500/40 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl animate-in fade-in zoom-in-95 duration-150 text-slate-200">
+                {/* Modal Header */}
+                <div className="flex items-start justify-between pb-3 border-b border-slate-800">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2.5 rounded-xl bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                      <AlertTriangle size={22} />
+                    </div>
+                    <div>
+                      <h3 className="text-base font-bold text-white">
+                        Delete Dispatch Point?
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        Confirmation required to prevent accidental removal
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDeletingDispatchPoint(null)}
+                    className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                {/* Target Dispatch Point Info Card */}
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2 text-xs">
+                  <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                    <span className="text-slate-400">Hub / Depot Name:</span>
+                    <span className="font-bold text-white text-sm">{deletingDispatchPoint.name}</span>
+                  </div>
+                  <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                    <span className="text-slate-400">Hub Code:</span>
+                    <span className="px-2 py-0.5 rounded bg-slate-800 text-emerald-400 font-mono font-bold text-xs border border-slate-700">
+                      {deletingDispatchPoint.code}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between pb-2 border-b border-slate-800/80">
+                    <span className="text-slate-400">Supervisor:</span>
+                    <span className="text-slate-200 font-medium">
+                      {deletingDispatchPoint.supervisor_name || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-400">Address / Location:</span>
+                    <span className="text-slate-300 font-medium truncate max-w-[200px]" title={deletingDispatchPoint.address}>
+                      {deletingDispatchPoint.address || 'Standard Hub Depot'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Impact Analysis & Warning Notice */}
+                {(() => {
+                  const linkedCompanies = (companies || []).filter((c) => c.dispatch_point_id === deletingDispatchPoint.id);
+                  const linkedUsers = (users || []).filter((u) => u.dispatch_point_id === deletingDispatchPoint.id);
+                  const isOnlyDispatchPoint = dispatchPoints.length <= 1;
+
+                  if (isOnlyDispatchPoint) {
+                    return (
+                      <div className="p-3.5 bg-rose-950/40 border border-rose-700/60 rounded-xl space-y-1.5 text-xs text-rose-300">
+                        <div className="font-bold flex items-center gap-1.5 text-rose-200">
+                          <AlertCircle size={15} className="text-rose-400 shrink-0" />
+                          <span>Deletion Blocked: Only Active Dispatch Point</span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-rose-300/90">
+                          Every tenant must maintain at least one active Dispatch Point for supply chain operations and Principal Company associations. You cannot delete the only remaining dispatch point.
+                        </p>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="p-3.5 bg-rose-950/30 border border-rose-800/50 rounded-xl space-y-2 text-xs text-rose-300">
+                      <div className="font-bold flex items-center gap-1.5 text-rose-200">
+                        <AlertCircle size={15} className="text-rose-400 shrink-0" />
+                        <span>Permanent Deletion Warning</span>
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-rose-300/90">
+                        Deleting this dispatch point will permanently remove this warehouse hub from your organization.
+                      </p>
+                      {(linkedCompanies.length > 0 || linkedUsers.length > 0) && (
+                        <div className="pt-1.5 border-t border-rose-800/40 text-[11px] space-y-1.5 text-amber-200">
+                          {linkedCompanies.length > 0 && (
+                            <div className="flex items-start gap-1.5">
+                              <Building size={13} className="text-amber-400 shrink-0 mt-0.5" />
+                              <span>
+                                <strong>{linkedCompanies.length}</strong> Principal Company(s) currently mapped to this dispatch point ({linkedCompanies.map((c) => c.name).slice(0, 2).join(', ')}{linkedCompanies.length > 2 ? '...' : ''}).
+                              </span>
+                            </div>
+                          )}
+                          {linkedUsers.length > 0 && (
+                            <div className="flex items-center gap-1.5">
+                              <Users size={13} className="text-amber-400 shrink-0" />
+                              <span>
+                                <strong>{linkedUsers.length}</strong> User account(s) currently stationed at this hub.
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Modal Actions */}
+                <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setDeletingDispatchPoint(null)}
+                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirmDeleteDispatchPoint}
+                    disabled={dispatchPoints.length <= 1}
+                    className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center gap-1.5 transition-all shadow-md shadow-rose-950/40 cursor-pointer"
+                  >
+                    <Trash2 size={14} />
+                    <span>Yes, Delete Dispatch Point</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1707,6 +1928,28 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                 }`}
               >
                 Failover
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setUserSubTab('FIELD_SKU_MATRIX')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer ${
+                userSubTab === 'FIELD_SKU_MATRIX'
+                  ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950/50'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+              }`}
+            >
+              <Shield size={15} />
+              <span>Field SKU Access Matrix</span>
+              <span
+                className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-semibold ${
+                  userSubTab === 'FIELD_SKU_MATRIX'
+                    ? 'bg-emerald-800 text-emerald-100'
+                    : 'bg-slate-800 text-slate-400'
+                }`}
+              >
+                {companies.length} Brands
               </span>
             </button>
           </div>
@@ -2203,6 +2446,13 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
           {userSubTab === 'BE_ABSENCE' && (
             <div className="animate-fadeIn">
               <BEAbsenceRemappingTool />
+            </div>
+          )}
+
+          {/* SUB-VIEW 4: FIELD SKU ACCESS MATRIX */}
+          {userSubTab === 'FIELD_SKU_MATRIX' && (
+            <div className="animate-fadeIn">
+              <CompanySKUAccessMatrix currentUser={currentUser} />
             </div>
           )}
         </div>

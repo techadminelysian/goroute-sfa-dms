@@ -23,6 +23,8 @@ import {
   upsertDbUser,
   addDbUser,
   updateDbUserPassword,
+  updateDbUserCompanyScope,
+  batchUpdateDbUserCompanyScopes,
   getDbOrders,
   findDbOrderById,
   upsertDbOrder,
@@ -454,6 +456,48 @@ async function startServer() {
         mobile_number: targetUser.mobile_number,
         role: targetUser.role
       }
+    });
+  });
+
+  // PATCH /api/users/:id/company-scope - Update individual user's allowed Principal Companies
+  app.patch("/api/users/:id/company-scope", (req, res) => {
+    const userId = req.params.id;
+    const { company_scope } = req.body;
+
+    if (!Array.isArray(company_scope)) {
+      return res.status(400).json({ success: false, error: "'company_scope' must be an array of company ID strings." });
+    }
+
+    const success = updateDbUserCompanyScope(userId, company_scope);
+    if (!success) {
+      return res.status(404).json({ success: false, error: `User with ID '${userId}' not found in database.` });
+    }
+
+    const updatedUser = findDbUserById(userId);
+    console.log(`[USER SCOPE AUDIT] Updated company scope for ${updatedUser?.name} (${userId}): [${company_scope.join(", ")}]`);
+
+    return res.json({
+      success: true,
+      message: `Updated Principal Company scope for user ${updatedUser?.name}.`,
+      user: updatedUser
+    });
+  });
+
+  // POST /api/users/batch-company-scope - Bulk update multiple field users' company scopes
+  app.post("/api/users/batch-company-scope", (req, res) => {
+    const { updates } = req.body;
+
+    if (!Array.isArray(updates)) {
+      return res.status(400).json({ success: false, error: "'updates' must be an array of { userId, company_scope } objects." });
+    }
+
+    const result = batchUpdateDbUserCompanyScopes(updates);
+    console.log(`[USER SCOPE AUDIT] Bulk updated company scopes for ${result.count} users in DB.`);
+
+    return res.json({
+      success: true,
+      message: `Successfully updated Principal Company scopes for ${result.count} field users.`,
+      count: result.count
     });
   });
 

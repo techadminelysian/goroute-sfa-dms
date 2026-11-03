@@ -208,16 +208,31 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
     return Array.from(compMap.values());
   }, [draftLines, skus, companies]);
 
-  const tenantCompanies = useMemo(() => {
+  const isFieldUser = currentUser?.role === 'DISTRIBUTOR' || currentUser?.role === 'SALES_EXECUTIVE' || currentUser?.role === 'COMMISSION_AGENT';
+  const allowedCompanies = useMemo(() => {
     const tid = activeTenant?.id || 'tenant_ms_enterprises';
-    return (companies || []).filter((c) => !c.tenant_id || c.tenant_id === tid);
-  }, [companies, activeTenant]);
+    const all = (companies || []).filter((c) => !c.tenant_id || c.tenant_id === tid);
+    if (!isFieldUser) return all;
+    const scope = currentUser?.company_scope || [];
+    return all.filter((c) => scope.includes(c.id));
+  }, [companies, activeTenant, currentUser, isFieldUser]);
+
+  const allowedCompanyIds = useMemo(() => new Set(allowedCompanies.map((c) => c.id)), [allowedCompanies]);
+
+  const accessibleSkus = useMemo(() => {
+    if (!isFieldUser) return skus;
+    return skus.filter((s) => allowedCompanyIds.has(s.company_id));
+  }, [skus, allowedCompanyIds, isFieldUser]);
+
+  const isDistributorAccessLocked = isFieldUser && (!currentUser?.company_scope || currentUser.company_scope.length === 0);
+
+  const tenantCompanies = allowedCompanies;
 
   // SKUs filtered by the selected Principal Company
   const companySkus = useMemo(() => {
-    if (selectedCompanyFilter === 'ALL') return skus;
-    return skus.filter((s) => s.company_id === selectedCompanyFilter);
-  }, [skus, selectedCompanyFilter]);
+    if (selectedCompanyFilter === 'ALL') return accessibleSkus;
+    return accessibleSkus.filter((s) => s.company_id === selectedCompanyFilter);
+  }, [accessibleSkus, selectedCompanyFilter]);
 
   // Filtered SKUs for search within selected company
   const filteredSkus = useMemo(() => {
@@ -595,6 +610,18 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
         ) : (
           /* Main Order Form */
           <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+            {isDistributorAccessLocked && (
+              <div className="p-3 bg-rose-950/60 border border-rose-600/70 rounded-xl text-rose-200 text-xs space-y-1.5 shadow-md">
+                <div className="font-bold flex items-center gap-1.5 text-rose-400">
+                  <AlertCircle size={15} />
+                  <span>Zero-Trust Security: No Principal Companies Assigned</span>
+                </div>
+                <p className="text-[11px] text-rose-200/90 leading-relaxed">
+                  Your field profile currently has 0 authorized Principal Companies. You cannot generate orders until your Organization Administrator assigns brand permissions in the Field SKU Access Matrix.
+                </p>
+              </div>
+            )}
+
             {/* Step 1: Select Distributor / Institution */}
             <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3.5 space-y-3">
               <div className="flex items-center gap-2">
@@ -1314,10 +1341,11 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                 <button
                   type="button"
                   onClick={handleGenerateOrder}
-                  className="flex-1 sm:flex-initial px-5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer"
+                  disabled={isDistributorAccessLocked || allowedCompanies.length === 0}
+                  className="flex-1 sm:flex-initial px-5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer"
                 >
                   <CheckCircle2 size={14} />
-                  <span>Generate Verified Order</span>
+                  <span>{isDistributorAccessLocked ? 'Access Restricted (0 Brands)' : 'Generate Verified Order'}</span>
                 </button>
               </div>
             </div>

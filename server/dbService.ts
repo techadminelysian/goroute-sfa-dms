@@ -157,6 +157,7 @@ export function upsertDbUser(user: User): User {
 
   if (existingIdx >= 0) {
     inMemoryDb.users[existingIdx] = { ...inMemoryDb.users[existingIdx], ...user };
+    saveDatabaseToDisk();
     return inMemoryDb.users[existingIdx];
   } else {
     inMemoryDb.users.push(user);
@@ -221,6 +222,30 @@ export function updateDbUserPassword(userId: string, newHash: string, salt: stri
   user.salt = salt;
   saveDatabaseToDisk();
   return true;
+}
+
+export function updateDbUserCompanyScope(userId: string, companyScope: string[]): boolean {
+  const user = inMemoryDb.users.find((u) => u.id === userId);
+  if (!user) return false;
+
+  user.company_scope = [...companyScope];
+  saveDatabaseToDisk();
+  return true;
+}
+
+export function batchUpdateDbUserCompanyScopes(updates: { userId: string; company_scope: string[] }[]): { success: boolean; count: number } {
+  let count = 0;
+  updates.forEach(({ userId, company_scope }) => {
+    const user = inMemoryDb.users.find((u) => u.id === userId);
+    if (user) {
+      user.company_scope = [...company_scope];
+      count++;
+    }
+  });
+  if (count > 0) {
+    saveDatabaseToDisk();
+  }
+  return { success: true, count };
 }
 
 // ---------------------------------------------------------------------------

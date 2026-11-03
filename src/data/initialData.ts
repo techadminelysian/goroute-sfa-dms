@@ -1781,7 +1781,7 @@ export const INITIAL_USERS: User[] = [
     password_hash: '900b73aa49e1e247_salt_agn',
     salt: 'salt_agn_9810067890',
     role: 'COMMISSION_AGENT',
-    company_scope: [],
+    company_scope: ['comp_brit', 'comp_amul'],
     dispatch_point_id: null,
     billing_executive_id: 'usr_billing_1',
     platform: 'MOBILE',
@@ -1854,7 +1854,7 @@ export const INITIAL_USERS: User[] = [
     password_hash: '900b73aa49e1e247_salt_se1',
     salt: 'salt_se1_9810078901',
     role: 'SALES_EXECUTIVE',
-    company_scope: [],
+    company_scope: ['comp_brit'],
     dispatch_point_id: null,
     billing_executive_id: 'usr_billing_1', // Mapped to Priya Verma (BE-1)
     platform: 'MOBILE',
@@ -1885,7 +1885,7 @@ export const INITIAL_USERS: User[] = [
     password_hash: '900b73aa49e1e247_salt_dst1',
     salt: 'salt_dst1_9811122334',
     role: 'DISTRIBUTOR',
-    company_scope: [],
+    company_scope: ['comp_brit', 'comp_amul'],
     dispatch_point_id: null,
     billing_executive_id: 'usr_billing_1', // Mapped to Priya Verma (BE-1)
     platform: 'WEB',

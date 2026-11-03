@@ -1193,6 +1193,15 @@ export const useAppStore = () => {
       }
     },
 
+    deleteDispatchPoint: (dpId: string) => {
+      memoryStore.dispatchPoints = memoryStore.dispatchPoints.filter((dp) => dp.id !== dpId);
+      persist();
+
+      if (isFirebaseConfigured()) {
+        deleteRecordFromFirestore(COLLECTIONS.DISPATCH_POINTS, dpId);
+      }
+    },
+
     // SKU CRUD
     addSKU: (sku: SKU) => {
       memoryStore.skus = [sku, ...memoryStore.skus];
@@ -2579,6 +2588,59 @@ export const useAppStore = () => {
       if (isFirebaseConfigured() && updatedUser) {
         saveRecordToFirestore(COLLECTIONS.USERS, userId, updatedUser);
       }
+    },
+
+    updateUserCompanyScope: (userId: string, companyScope: string[]) => {
+      let updatedUser: User | undefined;
+      memoryStore.users = memoryStore.users.map((u) => {
+        if (u.id === userId) {
+          updatedUser = { ...u, company_scope: [...companyScope] };
+          return updatedUser;
+        }
+        return u;
+      });
+      persist();
+
+      // Dual-sync to Firestore and backend DB
+      if (isFirebaseConfigured() && updatedUser) {
+        saveRecordToFirestore(COLLECTIONS.USERS, userId, updatedUser);
+      }
+
+      fetch(`/api/users/${userId}/company-scope`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ company_scope: companyScope })
+      }).catch((err) => console.warn('[DB SYNC] Failed to sync user company scope:', err));
+    },
+
+    bulkUpdateUserCompanyScopes: (updates: { userId: string; companyIds: string[] }[]) => {
+      const updateMap = new Map<string, string[]>();
+      updates.forEach((u) => updateMap.set(u.userId, u.companyIds));
+
+      const updatedUsers: User[] = [];
+      memoryStore.users = memoryStore.users.map((u) => {
+        if (updateMap.has(u.id)) {
+          const updated = { ...u, company_scope: [...(updateMap.get(u.id) || [])] };
+          updatedUsers.push(updated);
+          return updated;
+        }
+        return u;
+      });
+      persist();
+
+      if (isFirebaseConfigured()) {
+        updatedUsers.forEach((u) => {
+          saveRecordToFirestore(COLLECTIONS.USERS, u.id, u);
+        });
+      }
+
+      fetch('/api/users/batch-company-scope', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          updates: updates.map((u) => ({ userId: u.userId, company_scope: u.companyIds }))
+        })
+      }).catch((err) => console.warn('[DB SYNC] Failed to bulk sync user company scopes:', err));
     },
 
     // BE Absence Bulk Re-assignment & Order Raiser (CFS / SE / Distributor) Mapping
