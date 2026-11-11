@@ -20,28 +20,14 @@ import {
   DistributorInstitution,
   Beat,
   Order,
+  OrderLine,
   StockLedgerEntry,
   Invoice,
   Claim,
   Payment,
   User
 } from '../types';
-import {
-  INITIAL_TENANTS,
-  INITIAL_TENANT_SETTINGS,
-  INITIAL_COMPANIES,
-  INITIAL_DISPATCH_POINTS,
-  INITIAL_SKUS,
-  INITIAL_BEATS,
-  INITIAL_RETAILERS,
-  INITIAL_DISTRIBUTORS,
-  INITIAL_ORDERS,
-  INITIAL_STOCK_LEDGER,
-  INITIAL_INVOICES,
-  INITIAL_CLAIMS,
-  INITIAL_PAYMENTS,
-  INITIAL_USERS
-} from '../data/initialData';
+
 
 export enum OperationType {
   CREATE = 'create',
@@ -183,25 +169,38 @@ export const seedInitialFirestoreData = async (
     }
 
     let totalRecords = 0;
+    let seedSource: any = {};
+    try {
+      const res = await fetch('/api/bootstrap');
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && json.database) {
+          seedSource = json.database;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch bootstrap data from server for Firestore seeding', e);
+    }
+
     const collectionsToSeed = [
-      { name: COLLECTIONS.TENANTS, data: INITIAL_TENANTS, label: 'Tenants' },
+      { name: COLLECTIONS.TENANTS, data: seedSource.tenants || [], label: 'Tenants' },
       { 
         name: COLLECTIONS.TENANT_SETTINGS, 
-        data: Object.entries(INITIAL_TENANT_SETTINGS).map(([id, val]) => ({ ...val, id })), 
+        data: Object.entries(seedSource.tenantSettings || {}).map(([id, val]: [string, any]) => ({ ...val, id })), 
         label: 'Tenant Settings' 
       },
-      { name: COLLECTIONS.COMPANIES, data: INITIAL_COMPANIES, label: 'Principal Companies' },
-      { name: COLLECTIONS.DISPATCH_POINTS, data: INITIAL_DISPATCH_POINTS, label: 'Warehouses / Depots' },
-      { name: COLLECTIONS.SKUS, data: INITIAL_SKUS, label: 'SKU Catalog' },
-      { name: COLLECTIONS.BEATS, data: INITIAL_BEATS, label: 'Beats & Field Routes' },
-      { name: COLLECTIONS.RETAILERS, data: INITIAL_RETAILERS, label: 'Retail Outlets' },
-      { name: COLLECTIONS.DISTRIBUTORS, data: INITIAL_DISTRIBUTORS, label: 'Distributors & Institutions' },
-      { name: COLLECTIONS.ORDERS, data: INITIAL_ORDERS, label: 'Sales Orders' },
-      { name: COLLECTIONS.STOCK_LEDGER, data: INITIAL_STOCK_LEDGER, label: 'Stock Ledger' },
-      { name: COLLECTIONS.INVOICES, data: INITIAL_INVOICES, label: 'Invoices' },
-      { name: COLLECTIONS.CLAIMS, data: INITIAL_CLAIMS, label: 'Claims' },
-      { name: COLLECTIONS.PAYMENTS, data: INITIAL_PAYMENTS, label: 'Payment Collections' },
-      { name: COLLECTIONS.USERS, data: INITIAL_USERS, label: 'User Master Accounts' },
+      { name: COLLECTIONS.COMPANIES, data: seedSource.companies || [], label: 'Principal Companies' },
+      { name: COLLECTIONS.DISPATCH_POINTS, data: seedSource.dispatchPoints || [], label: 'Warehouses / Depots' },
+      { name: COLLECTIONS.SKUS, data: seedSource.skus || [], label: 'SKU Catalog' },
+      { name: COLLECTIONS.BEATS, data: seedSource.beats || [], label: 'Beats & Field Routes' },
+      { name: COLLECTIONS.RETAILERS, data: seedSource.retailers || [], label: 'Retail Outlets' },
+      { name: COLLECTIONS.DISTRIBUTORS, data: seedSource.distributors || [], label: 'Distributors & Institutions' },
+      { name: COLLECTIONS.ORDERS, data: seedSource.orders || [], label: 'Sales Orders' },
+      { name: COLLECTIONS.STOCK_LEDGER, data: seedSource.stockLedger || [], label: 'Stock Ledger' },
+      { name: COLLECTIONS.INVOICES, data: seedSource.invoices || [], label: 'Invoices' },
+      { name: COLLECTIONS.CLAIMS, data: seedSource.claims || [], label: 'Claims' },
+      { name: COLLECTIONS.PAYMENTS, data: seedSource.payments || [], label: 'Payment Collections' },
+      { name: COLLECTIONS.USERS, data: seedSource.users || [], label: 'User Master Accounts' },
     ];
 
     const totalSteps = collectionsToSeed.length + 1;
@@ -238,11 +237,11 @@ export const seedInitialFirestoreData = async (
       seeded_at: new Date().toISOString(),
       version: 1,
       total_records: totalRecords,
-      tenants_count: INITIAL_TENANTS.length,
-      companies_count: INITIAL_COMPANIES.length,
-      skus_count: INITIAL_SKUS.length,
-      retailers_count: INITIAL_RETAILERS.length,
-      orders_count: INITIAL_ORDERS.length,
+      tenants_count: (seedSource.tenants || []).length,
+      companies_count: (seedSource.companies || []).length,
+      skus_count: (seedSource.skus || []).length,
+      retailers_count: (seedSource.retailers || []).length,
+      orders_count: (seedSource.orders || []).length,
     });
 
     return {
@@ -279,6 +278,119 @@ export interface FetchFirestoreResult {
   isPermissionDenied: boolean;
   errorMessage?: string;
 }
+
+/**
+ * Normalizes an order document from Firestore on ingestion.
+ * Resolves missing tenant_id, maps lines from items, and ensures consistent keys,
+ * while strictly preserving the status from Firestore as-is (no CLEARED to VERIFIED conversion).
+ */
+export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
+  if (!raw) {
+    return {
+      id: docId,
+      tenant_id: 'tenant_ms_enterprises',
+      order_number: docId,
+      channel: 'GT',
+      company_id: '',
+      retailer_id: null,
+      retailer_name_raw: '',
+      beat_name: '',
+      dispatch_point_id: 'dp_sahibabad',
+      created_by_user_id: '',
+      order_date: new Date().toISOString(),
+      delivery_date: '',
+      status: 'PENDING_VERIFICATION',
+      total_amount: 0,
+      tax_amount: 0,
+      lines: [],
+      has_below_cost_lines: false,
+    };
+  }
+
+  const tenantId = raw.tenant_id || 'tenant_ms_enterprises';
+  const orderId = raw.id || docId;
+  const orderNumber = raw.order_number || docId;
+
+  let lines: OrderLine[] = [];
+  if (Array.isArray(raw.lines) && raw.lines.length > 0) {
+    lines = raw.lines;
+  } else if (Array.isArray(raw.items) && raw.items.length > 0) {
+    lines = raw.items.map((it: any, idx: number) => ({
+      id: it.id || `line_${orderId}_${it.sku_id || idx}`,
+      tenant_id: it.tenant_id || tenantId,
+      order_id: it.order_id || orderId,
+      sku_id: it.sku_id || '',
+      sku_name: it.sku_name || '',
+      quantity: Number(it.quantity) || 0,
+      verified_quantity: it.verified_quantity != null ? Number(it.verified_quantity) : Number(it.quantity) || 0,
+      is_amended: Boolean(it.is_amended),
+      unit_price: Number(it.unit_price) || 0,
+      landing_price: Number(it.landing_price) || 0,
+      total: Number(it.total) != null ? Number(it.total) : (Number(it.quantity) || 0) * (Number(it.unit_price) || 0),
+      discount_percentage: Number(it.discount_percentage) || 0,
+      discount_amount: Number(it.discount_amount) || 0,
+      principal_discount_slab: it.principal_discount_slab || undefined,
+      is_below_cost: Boolean(it.is_below_cost),
+      expected_claim_total: Number(it.expected_claim_total) || 0,
+      company_id: it.company_id || raw.company_id || undefined,
+      company_name: it.company_name || undefined,
+    }));
+  }
+
+  return {
+    ...raw,
+    id: orderId,
+    tenant_id: tenantId,
+    order_number: orderNumber,
+    retailer_name_raw: raw.retailer_name_raw || raw.retailer_name || '',
+    channel: raw.channel || 'GT',
+    company_id: raw.company_id || (raw.company_ids && raw.company_ids[0]) || '',
+    company_ids: Array.isArray(raw.company_ids) ? raw.company_ids : (raw.company_id ? [raw.company_id] : []),
+    retailer_id: raw.retailer_id || null,
+    beat_id: raw.beat_id || undefined,
+    beat_name: raw.beat_name || '',
+    dispatch_point_id: raw.dispatch_point_id || 'dp_sahibabad',
+    billing_executive_id: raw.billing_executive_id || null,
+    created_by_user_id: raw.created_by_user_id || '',
+    commission_agent_id: raw.commission_agent_id || null,
+    commission_agent_name: raw.commission_agent_name || undefined,
+    order_date: raw.order_date || new Date().toISOString(),
+    delivery_date: raw.delivery_date || '',
+    status: raw.status || 'PENDING_VERIFICATION',
+    total_amount: Number(raw.total_amount) || lines.reduce((s, l) => s + (Number(l.total) || 0), 0),
+    original_total_amount: Number(raw.original_total_amount) || Number(raw.total_amount) || 0,
+    tax_amount: Number(raw.tax_amount) || 0,
+    lines,
+    has_below_cost_lines: Boolean(raw.has_below_cost_lines),
+    credit_limit_exceeded: Boolean(raw.credit_limit_exceeded),
+    exposure_variance: Number(raw.exposure_variance) || 0,
+    approved_credit_limit_snapshot: Number(raw.approved_credit_limit_snapshot) || 0,
+    retailer_outstanding_snapshot: Number(raw.retailer_outstanding_snapshot) || 0,
+    be_approval_reason: raw.be_approval_reason || null,
+    verified_by_user_id: raw.verified_by_user_id || null,
+    verified_at: raw.verified_at || null,
+    is_locked: Boolean(raw.is_locked),
+    order_invoicing_type: raw.order_invoicing_type || null,
+    crates_issued: Number(raw.crates_issued) || 0,
+    crates_returned: Number(raw.crates_returned) || 0,
+  };
+};
+
+/**
+ * Deduplicates orders by unique ID to prevent any duplicate key errors.
+ */
+export const deduplicateOrders = (orders: Order[]): Order[] => {
+  const seen = new Set<string>();
+  const result: Order[] = [];
+  for (const o of orders) {
+    const key = o.id || o.order_number;
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      result.push(o);
+    }
+  }
+  return result;
+};
 
 /**
  * Fetches all collections from Firestore to hydrate local memory store.
@@ -342,7 +454,7 @@ export const fetchAllFromFirestore = async (): Promise<FetchFirestoreResult> => 
       beats: beatsSnap.docs.map((d) => d.data() as Beat),
       retailers: retailersSnap.docs.map((d) => d.data() as Retailer),
       distributors: distributorsSnap.docs.map((d) => d.data() as DistributorInstitution),
-      orders: ordersSnap.docs.map((d) => d.data() as Order),
+      orders: deduplicateOrders(ordersSnap.docs.map((d) => normalizeFirestoreOrder(d.id, d.data()))),
       stockLedger: stockLedgerSnap.docs.map((d) => d.data() as StockLedgerEntry),
       invoices: invoicesSnap.docs.map((d) => d.data() as Invoice),
       claims: claimsSnap.docs.map((d) => d.data() as Claim),
@@ -511,7 +623,7 @@ export const subscribeToAllCollections = (onDataUpdate: (data: Partial<Firestore
         collection(db, COLLECTIONS.ORDERS),
         (snapshot) => {
           if (!snapshot.empty) {
-            onDataUpdate({ orders: snapshot.docs.map((d) => d.data() as Order) });
+            onDataUpdate({ orders: deduplicateOrders(snapshot.docs.map((d) => normalizeFirestoreOrder(d.id, d.data()))) });
           }
         },
         (error) => {

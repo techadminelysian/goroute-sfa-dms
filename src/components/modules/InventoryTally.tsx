@@ -692,9 +692,9 @@ export const InventoryTally: React.FC = () => {
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {pendingDispatchOrders.map((ord) => (
+                {pendingDispatchOrders.map((ord, idx) => (
                   <div
-                    key={ord.id}
+                    key={`${ord.id || ord.order_number}_${idx}`}
                     className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-3 text-xs"
                   >
                     <div>

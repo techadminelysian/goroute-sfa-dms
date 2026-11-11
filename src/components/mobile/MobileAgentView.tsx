@@ -84,30 +84,41 @@ export const MobileAgentView: React.FC = () => {
     setLanguage
   } = useAppStore();
 
-  // Commission Agents for Admin Simulation
+  // Field Raisers for Admin Simulation & Field Sessions (CFS, Sales Executives, Distributors)
+  const fieldRaisers = useMemo(() => {
+    return (users || []).filter(
+      (u) => u.role === 'COMMISSION_AGENT' || u.role === 'SALES_EXECUTIVE' || u.role === 'DISTRIBUTOR'
+    );
+  }, [users]);
+
+  // Backward-compatible alias
   const commissionAgents = useMemo(() => (users || []).filter((u) => u.role === 'COMMISSION_AGENT'), [users]);
-  const [simulatedAgentId, setSimulatedAgentId] = useState<string>(() => commissionAgents[0]?.id || '');
+  const [simulatedAgentId, setSimulatedAgentId] = useState<string>(() => fieldRaisers[0]?.id || commissionAgents[0]?.id || '');
   const [selectedBeatFilterId, setSelectedBeatFilterId] = useState<string>('ALL');
 
-  // Dynamically resolve active Commission Agent from session or Admin simulation
+  // Dynamically resolve active Field Agent / Raiser from session or Admin simulation
   const activeAgent: AppUser = useMemo(() => {
     // 1. If currentUser is ADMIN, use the simulated agent
     if (currentUser?.role === 'ADMIN') {
-      const match = commissionAgents.find((u) => u.id === simulatedAgentId);
+      const match = fieldRaisers.find((u) => u.id === simulatedAgentId);
       if (match) return match;
-      if (commissionAgents[0]) return commissionAgents[0];
+      if (fieldRaisers[0]) return fieldRaisers[0];
       return currentUser;
     }
-    // 2. Authenticated currentUser from session if role is COMMISSION_AGENT
-    if (currentUser?.role === 'COMMISSION_AGENT') {
+    // 2. Authenticated currentUser from session if role is COMMISSION_AGENT, SALES_EXECUTIVE, or DISTRIBUTOR
+    if (
+      currentUser?.role === 'COMMISSION_AGENT' ||
+      currentUser?.role === 'SALES_EXECUTIVE' ||
+      currentUser?.role === 'DISTRIBUTOR'
+    ) {
       return currentUser;
     }
-    // 3. Fallback to first COMMISSION_AGENT
-    const anyAgent = commissionAgents[0];
-    if (anyAgent) return anyAgent;
+    // 3. Fallback to first field raiser
+    const anyRaiser = fieldRaisers[0] || commissionAgents[0];
+    if (anyRaiser) return anyRaiser;
     // 4. Default fallback
     return currentUser || (users || [])[0];
-  }, [currentUser, commissionAgents, simulatedAgentId, users]);
+  }, [currentUser, fieldRaisers, commissionAgents, simulatedAgentId, users]);
 
   const agentName = activeAgent?.name || 'Commission Agent';
 
@@ -1366,11 +1377,12 @@ export const MobileAgentView: React.FC = () => {
                 }}
                 className="w-full bg-slate-950 border border-indigo-700/60 rounded-xl p-2 text-xs font-bold text-white focus:border-indigo-400 focus:outline-none"
               >
-                {commissionAgents.map((ag) => {
+                {fieldRaisers.map((ag) => {
                   const agBeats = getAgentAssignedBeats(ag, beats);
+                  const roleTag = ag.role === 'SALES_EXECUTIVE' ? 'SE' : ag.role === 'DISTRIBUTOR' ? 'Dist' : 'CFS';
                   return (
                     <option key={ag.id} value={ag.id}>
-                      {ag.name} ({agBeats.length} beats)
+                      {ag.name} [{roleTag}] ({agBeats.length} beats)
                     </option>
                   );
                 })}

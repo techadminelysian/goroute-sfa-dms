@@ -1,15 +1,18 @@
-import fs from 'fs';
-import path from 'path';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getFirestore, collection, getDocs, doc, setDoc, updateDoc } from 'firebase/firestore';
 import {
   Tenant,
   TenantSettings,
   Company,
   DispatchPoint,
   SKU,
+  Beat,
   Retailer,
+  DistributorInstitution,
   Order,
   OrderInvoicingType,
   StockLedgerEntry,
+  ReturnableAssetLedgerEntry,
   Invoice,
   Claim,
   Payment,
@@ -17,22 +20,6 @@ import {
   PrinciplePurchaseOrder,
   WorkflowNotification
 } from '../src/types';
-import {
-  INITIAL_TENANTS,
-  INITIAL_TENANT_SETTINGS,
-  INITIAL_COMPANIES,
-  INITIAL_DISPATCH_POINTS,
-  INITIAL_SKUS,
-  INITIAL_RETAILERS,
-  INITIAL_ORDERS,
-  INITIAL_STOCK_LEDGER,
-  INITIAL_INVOICES,
-  INITIAL_CLAIMS,
-  INITIAL_PAYMENTS,
-  INITIAL_USERS,
-  INITIAL_PURCHASE_ORDERS,
-  INITIAL_WORKFLOW_NOTIFICATIONS
-} from '../src/data/initialData';
 import { hashPassword } from './authService';
 
 export interface DatabaseSchema {
@@ -41,11 +28,14 @@ export interface DatabaseSchema {
   companies: Company[];
   dispatchPoints: DispatchPoint[];
   skus: SKU[];
+  beats: Beat[];
   retailers: Retailer[];
+  distributors: DistributorInstitution[];
   orders: Order[];
   purchaseOrders: PrinciplePurchaseOrder[];
   workflowNotifications: WorkflowNotification[];
   stockLedger: StockLedgerEntry[];
+  returnableAssetLedger?: ReturnableAssetLedgerEntry[];
   invoices: Invoice[];
   claims: Claim[];
   payments: Payment[];
@@ -57,63 +47,233 @@ export interface DatabaseSchema {
   };
 }
 
-// Database service for persistent and in-memory multi-tenant operations
-function generateDefaultDatabase(): DatabaseSchema {
-  // Pre-seed users with valid PBKDF2 hashes for 'Fmcg@2025' and 'Admin@123'
-  const seededUsers: User[] = INITIAL_USERS.map((u) => {
-    // Default initial password for all seeded accounts is Fmcg@2025 (or Admin@123)
-    const initialPwd = u.role === 'ADMIN' ? 'Admin@123' : 'Fmcg@2025';
-    const { hash, salt } = hashPassword(initialPwd);
-    return {
-      ...u,
-      password_hash: hash,
-      salt: salt
-    };
-  });
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCyVaFVFfEmANuVZmbKIoMA91TJNWceXaU",
+  authDomain: "you-can-touch-me-8919838-dba1d.firebaseapp.com",
+  projectId: "you-can-touch-me-8919838-dba1d",
+  databaseId: "goroute-sfa-dms",
+  storageBucket: "you-can-touch-me-8919838-dba1d.firebasestorage.app",
+  messagingSenderId: "731815279263",
+  appId: "1:731815279263:web:d93eb61d3231bdecb180aa",
+};
 
-  const total =
-    INITIAL_TENANTS.length +
-    INITIAL_COMPANIES.length +
-    INITIAL_DISPATCH_POINTS.length +
-    INITIAL_SKUS.length +
-    INITIAL_RETAILERS.length +
-    INITIAL_ORDERS.length +
-    INITIAL_STOCK_LEDGER.length +
-    INITIAL_INVOICES.length +
-    INITIAL_CLAIMS.length +
-    INITIAL_PAYMENTS.length +
-    seededUsers.length;
+let firestoreInstance: any = null;
+export function getFirestoreDb() {
+  if (firestoreInstance) return firestoreInstance;
+  try {
+    const app = getApps().length > 0 ? getApp() : initializeApp(FIREBASE_CONFIG);
+    firestoreInstance = getFirestore(app, "goroute-sfa-dms");
+    return firestoreInstance;
+  } catch (err) {
+    console.error("[DATABASE] Failed to initialize Firestore on server:", err);
+    return null;
+  }
+}
 
+function createEmptyDatabase(): DatabaseSchema {
   return {
-    tenants: [...INITIAL_TENANTS],
-    tenantSettings: { ...INITIAL_TENANT_SETTINGS },
-    companies: [...INITIAL_COMPANIES],
-    dispatchPoints: [...INITIAL_DISPATCH_POINTS],
-    skus: [...INITIAL_SKUS],
-    retailers: [...INITIAL_RETAILERS],
-    orders: [...INITIAL_ORDERS],
-    purchaseOrders: [...INITIAL_PURCHASE_ORDERS],
-    workflowNotifications: [...INITIAL_WORKFLOW_NOTIFICATIONS],
-    stockLedger: [...INITIAL_STOCK_LEDGER],
-    invoices: [...INITIAL_INVOICES],
-    claims: [...INITIAL_CLAIMS],
-    payments: [...INITIAL_PAYMENTS],
-    users: seededUsers,
+    tenants: [],
+    tenantSettings: {},
+    companies: [],
+    dispatchPoints: [],
+    skus: [],
+    beats: [],
+    retailers: [],
+    distributors: [],
+    orders: [],
+    purchaseOrders: [],
+    workflowNotifications: [],
+    stockLedger: [],
+    returnableAssetLedger: [],
+    invoices: [],
+    claims: [],
+    payments: [],
+    users: [],
     metadata: {
       lastSeededAt: new Date().toISOString(),
-      version: 1,
-      totalRecords: total
+      version: 2,
+      totalRecords: 0
     }
   };
 }
 
-let inMemoryDb: DatabaseSchema = generateDefaultDatabase();
+// In-memory cache holding real-time Cloud Firestore state for high-performance server lookups
+let inMemoryDb: DatabaseSchema = createEmptyDatabase();
+let isInitialized = false;
 
-export function initDatabase(): DatabaseSchema {
-  console.log(`[DATABASE] Initialized dynamic DB store with ${inMemoryDb.users.length} users and ${inMemoryDb.skus.length} SKUs.`);
+/**
+ * Normalizes an order from Firestore for server cache consistency.
+ */
+function normalizeServerOrder(docId: string, raw: any): Order {
+  const tenantId = raw.tenant_id || 'tenant_ms_enterprises';
+  const orderId = raw.id || docId;
+  const orderNumber = raw.order_number || docId;
+
+  let lines = raw.lines || [];
+  if ((!lines || lines.length === 0) && Array.isArray(raw.items) && raw.items.length > 0) {
+    lines = raw.items.map((it: any, idx: number) => ({
+      id: it.id || `line_${orderId}_${it.sku_id || idx}`,
+      tenant_id: it.tenant_id || tenantId,
+      order_id: it.order_id || orderId,
+      sku_id: it.sku_id || '',
+      sku_name: it.sku_name || '',
+      quantity: Number(it.quantity) || 0,
+      verified_quantity: it.verified_quantity != null ? Number(it.verified_quantity) : Number(it.quantity) || 0,
+      is_amended: Boolean(it.is_amended),
+      unit_price: Number(it.unit_price) || 0,
+      landing_price: Number(it.landing_price) || 0,
+      total: Number(it.total) != null ? Number(it.total) : (Number(it.quantity) || 0) * (Number(it.unit_price) || 0),
+      discount_percentage: Number(it.discount_percentage) || 0,
+      discount_amount: Number(it.discount_amount) || 0,
+      is_below_cost: Boolean(it.is_below_cost),
+      expected_claim_total: Number(it.expected_claim_total) || 0,
+      company_id: it.company_id || raw.company_id || undefined,
+      company_name: it.company_name || undefined,
+    }));
+  }
+
+  return {
+    ...raw,
+    id: orderId,
+    tenant_id: tenantId,
+    order_number: orderNumber,
+    retailer_name_raw: raw.retailer_name_raw || raw.retailer_name || '',
+    channel: raw.channel || 'GT',
+    company_id: raw.company_id || (raw.company_ids && raw.company_ids[0]) || '',
+    company_ids: Array.isArray(raw.company_ids) ? raw.company_ids : (raw.company_id ? [raw.company_id] : []),
+    retailer_id: raw.retailer_id || null,
+    beat_id: raw.beat_id || undefined,
+    beat_name: raw.beat_name || '',
+    dispatch_point_id: raw.dispatch_point_id || 'dp_sahibabad',
+    billing_executive_id: raw.billing_executive_id || null,
+    created_by_user_id: raw.created_by_user_id || '',
+    commission_agent_id: raw.commission_agent_id || null,
+    commission_agent_name: raw.commission_agent_name || undefined,
+    order_date: raw.order_date || new Date().toISOString(),
+    delivery_date: raw.delivery_date || '',
+    status: raw.status || 'PENDING_VERIFICATION',
+    total_amount: Number(raw.total_amount) || lines.reduce((s: number, l: any) => s + (Number(l.total) || 0), 0),
+    original_total_amount: Number(raw.original_total_amount) || Number(raw.total_amount) || 0,
+    tax_amount: Number(raw.tax_amount) || 0,
+    lines,
+    has_below_cost_lines: Boolean(raw.has_below_cost_lines),
+    credit_limit_exceeded: Boolean(raw.credit_limit_exceeded),
+    exposure_variance: Number(raw.exposure_variance) || 0,
+    approved_credit_limit_snapshot: Number(raw.approved_credit_limit_snapshot) || 0,
+    retailer_outstanding_snapshot: Number(raw.retailer_outstanding_snapshot) || 0,
+    be_approval_reason: raw.be_approval_reason || null,
+    verified_by_user_id: raw.verified_by_user_id || null,
+    verified_at: raw.verified_at || null,
+    is_locked: Boolean(raw.is_locked),
+    order_invoicing_type: raw.order_invoicing_type || null,
+    crates_issued: Number(raw.crates_issued) || 0,
+    crates_returned: Number(raw.crates_returned) || 0,
+  };
+}
+
+/**
+ * Deduplicates orders by unique ID or order_number to guarantee unique records.
+ */
+export function deduplicateOrders(orders: Order[]): Order[] {
+  const seen = new Set<string>();
+  const result: Order[] = [];
+  for (const o of orders) {
+    const key = o.id || o.order_number;
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      result.push(o);
+    }
+  }
+  return result;
+}
+
+/**
+ * Single source of truth: Cloud Firestore hydration
+ */
+export async function initDatabase(): Promise<DatabaseSchema> {
+  const db = getFirestoreDb();
+  if (!db) {
+    console.warn('[DATABASE] Cloud Firestore not accessible, using in-memory defaults.');
+    return inMemoryDb;
+  }
+
+  try {
+    const [
+      tenantsSnap,
+      tenantSettingsSnap,
+      companiesSnap,
+      dispatchPointsSnap,
+      skusSnap,
+      beatsSnap,
+      retailersSnap,
+      distributorsSnap,
+      ordersSnap,
+      stockLedgerSnap,
+      invoicesSnap,
+      claimsSnap,
+      paymentsSnap,
+      usersSnap,
+    ] = await Promise.all([
+      getDocs(collection(db, "tenants")),
+      getDocs(collection(db, "tenant_settings")),
+      getDocs(collection(db, "companies")),
+      getDocs(collection(db, "dispatch_points")),
+      getDocs(collection(db, "skus")),
+      getDocs(collection(db, "beats")),
+      getDocs(collection(db, "retailers")),
+      getDocs(collection(db, "distributors")),
+      getDocs(collection(db, "orders")),
+      getDocs(collection(db, "stock_ledger")),
+      getDocs(collection(db, "invoices")),
+      getDocs(collection(db, "claims")),
+      getDocs(collection(db, "payments")),
+      getDocs(collection(db, "users")),
+    ]);
+
+    const tenantSettings: Record<string, TenantSettings> = {};
+    tenantSettingsSnap.docs.forEach((d) => {
+      tenantSettings[d.id] = d.data() as TenantSettings;
+    });
+
+    inMemoryDb = {
+      tenants: tenantsSnap.docs.map((d) => d.data() as Tenant),
+      tenantSettings,
+      companies: companiesSnap.docs.map((d) => d.data() as Company),
+      dispatchPoints: dispatchPointsSnap.docs.map((d) => d.data() as DispatchPoint),
+      skus: skusSnap.docs.map((d) => d.data() as SKU),
+      beats: beatsSnap.docs.map((d) => d.data() as Beat),
+      retailers: retailersSnap.docs.map((d) => d.data() as Retailer),
+      distributors: distributorsSnap.docs.map((d) => d.data() as DistributorInstitution),
+      orders: deduplicateOrders(ordersSnap.docs.map((d) => normalizeServerOrder(d.id, d.data()))),
+      purchaseOrders: [],
+      workflowNotifications: [],
+      stockLedger: stockLedgerSnap.docs.map((d) => d.data() as StockLedgerEntry),
+      returnableAssetLedger: [],
+      invoices: invoicesSnap.docs.map((d) => d.data() as Invoice),
+      claims: claimsSnap.docs.map((d) => d.data() as Claim),
+      payments: paymentsSnap.docs.map((d) => d.data() as Payment),
+      users: usersSnap.docs.map((d) => d.data() as User),
+      metadata: {
+        lastSeededAt: new Date().toISOString(),
+        version: 2,
+        totalRecords: usersSnap.size + ordersSnap.size + skusSnap.size,
+      },
+    };
+
+    isInitialized = true;
+    console.log(`[DATABASE] Single Source of Truth connected to Cloud Firestore (goroute-sfa-dms): ${inMemoryDb.users.length} users, ${inMemoryDb.orders.length} orders.`);
+  } catch (err) {
+    console.error('[DATABASE] Failed to hydrate database from Cloud Firestore:', err);
+  }
   return inMemoryDb;
 }
 
+// Initial fire-and-forget hydration on module load so synchronous getters have cached state
+initDatabase().catch(() => {});
+
+/**
+ * Retires disk file storage (no-op retained for backwards compatibility)
+ */
 export function saveDatabaseToDisk(): boolean {
   return true;
 }
@@ -123,12 +283,11 @@ export function getDatabase(): DatabaseSchema {
 }
 
 export function seedDatabase(force = false): { success: boolean; totalRecords: number; message: string } {
-  inMemoryDb = generateDefaultDatabase();
-  saveDatabaseToDisk();
+  initDatabase().catch((e) => console.error('[DATABASE] seed re-sync error:', e));
   return {
     success: true,
     totalRecords: inMemoryDb.metadata.totalRecords,
-    message: `Database successfully seeded with ${inMemoryDb.metadata.totalRecords} records across all collections.`
+    message: `Cloud Firestore synced as single source of truth (${inMemoryDb.metadata.totalRecords} records across collections).`
   };
 }
 
@@ -157,14 +316,20 @@ export function upsertDbUser(user: User): User {
 
   if (existingIdx >= 0) {
     inMemoryDb.users[existingIdx] = { ...inMemoryDb.users[existingIdx], ...user };
-    saveDatabaseToDisk();
-    return inMemoryDb.users[existingIdx];
   } else {
     inMemoryDb.users.push(user);
     inMemoryDb.metadata.totalRecords += 1;
-    saveDatabaseToDisk();
-    return user;
   }
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    setDoc(doc(db, 'users', user.id), user).catch((err) =>
+      console.error('[DATABASE] Firestore upsert user error:', err)
+    );
+  }
+
+  return user;
 }
 
 export function addDbUser(userData: {
@@ -176,6 +341,8 @@ export function addDbUser(userData: {
   password?: string;
   dispatch_point_id?: string | null;
   beat_id?: string | null;
+  billing_executive_id?: string | null;
+  id?: string;
 }): { success: boolean; user?: User; error?: string } {
   const sanitize = (m: string) => m.replace(/[\s\-\(\)\+]/g, '').slice(-10);
   const targetMobile = sanitize(userData.mobile_number);
@@ -192,7 +359,7 @@ export function addDbUser(userData: {
   const { hash, salt } = hashPassword(userData.password || 'Fmcg@2025');
 
   const newUser: User = {
-    id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    id: userData.id || `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
     tenant_id: userData.tenant_id || 'tenant_ms_enterprises',
     name: userData.name.trim(),
     email: (userData.email || '').trim().toLowerCase(),
@@ -202,16 +369,41 @@ export function addDbUser(userData: {
     role: userData.role,
     company_scope: [],
     dispatch_point_id: userData.dispatch_point_id !== undefined ? userData.dispatch_point_id : (userData.role === 'DISPATCHER' ? 'dp_central' : null),
+    billing_executive_id: userData.billing_executive_id || null,
     beat_id: userData.beat_id || null,
-    platform: userData.role === 'DISPATCHER' || userData.role === 'COMMISSION_AGENT' ? 'MOBILE' : 'WEB',
+    platform: userData.role === 'DISPATCHER' || userData.role === 'COMMISSION_AGENT' || userData.role === 'SALES_EXECUTIVE' ? 'MOBILE' : 'WEB',
     is_active: true
   };
 
   inMemoryDb.users.push(newUser);
   inMemoryDb.metadata.totalRecords += 1;
-  saveDatabaseToDisk();
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    setDoc(doc(db, 'users', newUser.id), newUser).catch((err) =>
+      console.error('[DATABASE] Firestore add user error:', err)
+    );
+  }
 
   return { success: true, user: newUser };
+}
+
+export function updateDbUser(userId: string, updates: Partial<User>): User | undefined {
+  const user = inMemoryDb.users.find((u) => u.id === userId);
+  if (!user) return undefined;
+
+  Object.assign(user, updates);
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    setDoc(doc(db, 'users', userId), user, { merge: true }).catch((err) =>
+      console.error('[DATABASE] Firestore update user error:', err)
+    );
+  }
+
+  return user;
 }
 
 export function updateDbUserPassword(userId: string, newHash: string, salt: string): boolean {
@@ -220,7 +412,15 @@ export function updateDbUserPassword(userId: string, newHash: string, salt: stri
 
   user.password_hash = newHash;
   user.salt = salt;
-  saveDatabaseToDisk();
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    updateDoc(doc(db, 'users', userId), { password_hash: newHash, salt }).catch((err) =>
+      console.error('[DATABASE] Firestore update password error:', err)
+    );
+  }
+
   return true;
 }
 
@@ -229,22 +429,35 @@ export function updateDbUserCompanyScope(userId: string, companyScope: string[])
   if (!user) return false;
 
   user.company_scope = [...companyScope];
-  saveDatabaseToDisk();
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    updateDoc(doc(db, 'users', userId), { company_scope: [...companyScope] }).catch((err) =>
+      console.error('[DATABASE] Firestore update company scope error:', err)
+    );
+  }
+
   return true;
 }
 
 export function batchUpdateDbUserCompanyScopes(updates: { userId: string; company_scope: string[] }[]): { success: boolean; count: number } {
   let count = 0;
+  const db = getFirestoreDb();
+
   updates.forEach(({ userId, company_scope }) => {
     const user = inMemoryDb.users.find((u) => u.id === userId);
     if (user) {
       user.company_scope = [...company_scope];
       count++;
+      if (db) {
+        updateDoc(doc(db, 'users', userId), { company_scope: [...company_scope] }).catch((err) =>
+          console.error('[DATABASE] Firestore batch update company scope error:', err)
+        );
+      }
     }
   });
-  if (count > 0) {
-    saveDatabaseToDisk();
-  }
+
   return { success: true, count };
 }
 
@@ -264,14 +477,20 @@ export function upsertDbOrder(order: Order): Order {
   const existingIdx = inMemoryDb.orders.findIndex((o) => o.id === order.id);
   if (existingIdx >= 0) {
     inMemoryDb.orders[existingIdx] = { ...inMemoryDb.orders[existingIdx], ...order };
-    saveDatabaseToDisk();
-    return inMemoryDb.orders[existingIdx];
   } else {
     inMemoryDb.orders.unshift(order);
     inMemoryDb.metadata.totalRecords += 1;
-    saveDatabaseToDisk();
-    return order;
   }
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    setDoc(doc(db, 'orders', order.id), order).catch((err) =>
+      console.error('[DATABASE] Firestore upsert order error:', err)
+    );
+  }
+
+  return order;
 }
 
 export function updateDbOrder(orderId: string, updates: Partial<Order>): Order | undefined {
@@ -282,7 +501,15 @@ export function updateDbOrder(orderId: string, updates: Partial<Order>): Order |
     ...inMemoryDb.orders[existingIdx],
     ...updates,
   };
-  saveDatabaseToDisk();
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    setDoc(doc(db, 'orders', orderId), updates, { merge: true }).catch((err) =>
+      console.error('[DATABASE] Firestore update order error:', err)
+    );
+  }
+
   return inMemoryDb.orders[existingIdx];
 }
 
@@ -349,8 +576,14 @@ export function verifyAndApproveDbOrder(
   };
 
   inMemoryDb.orders[existingIdx] = updatedOrder;
-  saveDatabaseToDisk();
+
+  // Persist directly to Cloud Firestore
+  const db = getFirestoreDb();
+  if (db) {
+    setDoc(doc(db, 'orders', orderId), updatedOrder).catch((err) =>
+      console.error('[DATABASE] Firestore verify order error:', err)
+    );
+  }
 
   return { success: true, order: updatedOrder };
 }
-

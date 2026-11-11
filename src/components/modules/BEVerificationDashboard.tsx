@@ -76,7 +76,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
   // Identify Billing Executives
   const billingExecutives = useMemo(() => {
-    return users.filter((u) => u.role === 'BILLING' || u.role === 'ADMIN');
+    return users.filter((u) => u.role === 'BILLING');
   }, [users]);
 
   // Identify Commission Agents
@@ -84,43 +84,74 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
     return users.filter((u) => u.role === 'COMMISSION_AGENT');
   }, [users]);
 
+  // Desk Selection: 'ALL' (Consolidated queue across all BEs) or specific BE user ID
+  // Strictly enforce: Billing Executive user CANNOT access supervisor selector and is locked to their assigned desk
+  const isBillingUser = currentUser?.role === 'BILLING' || activeRole === 'BILLING';
+  const isSupervisorRole =
+    !isBillingUser &&
+    (currentUser?.role === 'ADMIN' ||
+      currentUser?.role === 'SUB_ADMIN' ||
+      (!currentUser && (activeRole === 'ADMIN' || activeRole === 'SUB_ADMIN')));
+
+  const defaultBEFilter = isBillingUser
+    ? (currentUser?.id || 'usr_billing_1')
+    : 'ALL';
+
+  const [selectedBEFilter, setSelectedBEFilter] = useState<string>(defaultBEFilter);
+
+  // Effective BE Desk Filter: If logged in as BE (like Ramesh Patil), force filter to their user ID
+  const effectiveBEDeskFilter = isBillingUser ? (currentUser?.id || 'usr_billing_1') : selectedBEFilter;
+
   // Current BE Profile & ID
-  const effectiveCurrentBEUser = useMemo(() => {
-    if (currentUser?.role === 'BILLING') {
-      return currentUser;
-    }
-    const matched = users.find((u) => u.id === currentUser?.id && u.role === 'BILLING');
-    if (matched) return matched;
-    return billingExecutives.find((u) => u.role === 'BILLING') || billingExecutives[0];
-  }, [currentUser, users, billingExecutives]);
+  const selectedBEUser = useMemo(() => {
+    if (effectiveBEDeskFilter === 'ALL') return null;
+    return billingExecutives.find((u) => u.id === effectiveBEDeskFilter) || users.find((u) => u.id === effectiveBEDeskFilter);
+  }, [effectiveBEDeskFilter, billingExecutives, users]);
 
-  const effectiveCurrentBEId = effectiveCurrentBEUser?.id || 'usr_billing_1';
-  const effectiveCurrentBEName = effectiveCurrentBEUser?.name || 'Priya Verma (BE-1)';
+  const effectiveCurrentBEId =
+    selectedBEUser?.id ||
+    (isBillingUser ? currentUser?.id : billingExecutives[0]?.id || 'usr_billing_1') ||
+    'usr_billing_1';
 
-  // Order Raisers mapped to this Billing Executive
+  const effectiveCurrentBEName =
+    effectiveBEDeskFilter === 'ALL'
+      ? 'All BE Desks (Consolidated)'
+      : selectedBEUser?.name || currentUser?.name || 'Assigned BE Desk';
+
+  // Order Raisers mapped to selected Billing Executive (or all if ALL selected)
   const assignedCAs = useMemo(() => {
-    return users.filter((u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === effectiveCurrentBEId);
-  }, [users, effectiveCurrentBEId]);
+    return users.filter(
+      (u) => u.role === 'COMMISSION_AGENT' && (effectiveBEDeskFilter === 'ALL' || u.billing_executive_id === effectiveBEDeskFilter)
+    );
+  }, [users, effectiveBEDeskFilter]);
 
   const assignedSEs = useMemo(() => {
-    return users.filter((u) => u.role === 'SALES_EXECUTIVE' && u.billing_executive_id === effectiveCurrentBEId);
-  }, [users, effectiveCurrentBEId]);
+    return users.filter(
+      (u) => u.role === 'SALES_EXECUTIVE' && (effectiveBEDeskFilter === 'ALL' || u.billing_executive_id === effectiveBEDeskFilter)
+    );
+  }, [users, effectiveBEDeskFilter]);
 
   const assignedDistributors = useMemo(() => {
-    const distUsers = users.filter((u) => u.role === 'DISTRIBUTOR' && u.billing_executive_id === effectiveCurrentBEId);
-    const distClients = distributors.filter((d) => d.billing_executive_id === effectiveCurrentBEId);
+    const distUsers = users.filter(
+      (u) => u.role === 'DISTRIBUTOR' && (effectiveBEDeskFilter === 'ALL' || u.billing_executive_id === effectiveBEDeskFilter)
+    );
+    const distClients = distributors.filter(
+      (d) => effectiveBEDeskFilter === 'ALL' || d.billing_executive_id === effectiveBEDeskFilter
+    );
     return {
       users: distUsers,
       clients: distClients,
       totalCount: distUsers.length + distClients.length,
     };
-  }, [users, distributors, effectiveCurrentBEId]);
+  }, [users, distributors, effectiveBEDeskFilter]);
 
-  // Filter Orders: strictly to current Billing Executive's assigned CFS, Sales Executives, and Distributors
+  // Filter Orders: strictly to selected Billing Executive's mapped raisers (or all BEs if ALL selected)
   const filteredOrders = useMemo(() => {
     return orders.filter((o) => {
-      // 1. BE Filter: Strictly orders from this BE's mapped raisers
-      if (!isOrderAssignedToBE(o, effectiveCurrentBEId, users, distributors)) return false;
+      // 1. BE Filter: Strictly orders from selected BE's mapped raisers, or all if ALL selected
+      if (effectiveBEDeskFilter !== 'ALL') {
+        if (!isOrderAssignedToBE(o, effectiveBEDeskFilter, users, distributors)) return false;
+      }
 
       // 1b. Raiser Role Filter
       if (selectedRaiserRoleFilter !== 'ALL') {
@@ -161,7 +192,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
       return true;
     });
-  }, [orders, effectiveCurrentBEId, users, distributors, selectedRaiserRoleFilter, selectedDPFilter, statusFilter, searchTerm]);
+  }, [orders, effectiveBEDeskFilter, users, distributors, selectedRaiserRoleFilter, selectedDPFilter, statusFilter, searchTerm]);
 
   // Handle Opening Partial Approval / Amendment Modal
   const handleOpenAmendmentModal = (order: Order) => {
@@ -189,9 +220,10 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
       verified_quantity: qty,
     }));
 
+    const approverBEId = activeAmendingOrder.billing_executive_id || effectiveCurrentBEId;
     verifyAndApproveOrderByBilling(
       activeAmendingOrder.id,
-      effectiveCurrentBEId,
+      approverBEId,
       approvalReason,
       amendedLines,
       amendingInvoicingType
@@ -212,9 +244,10 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
         ? `Approved with Credit Limit Override (Variance: ₹${(exposure.variance || 0).toLocaleString('en-IN')})`
         : 'Approved in Full';
 
+      const approverBEId = order.billing_executive_id || effectiveCurrentBEId;
       verifyAndApproveOrderByBilling(
         order.id,
-        effectiveCurrentBEId,
+        approverBEId,
         reason,
         undefined,
         order.order_invoicing_type
@@ -238,9 +271,10 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
       ? `Approved with Credit Limit Override (Variance: ₹${(exposure.variance || 0).toLocaleString('en-IN')})`
       : 'Approved in Full';
 
+    const approverBEId = activeApprovingOrder.billing_executive_id || effectiveCurrentBEId;
     verifyAndApproveOrderByBilling(
       activeApprovingOrder.id,
-      effectiveCurrentBEId,
+      approverBEId,
       reason,
       undefined,
       selectedInvoicingTypeForApproval
@@ -254,7 +288,8 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
     e.preventDefault();
     if (!activeCancellingOrder) return;
 
-    cancelOrderByBilling(activeCancellingOrder.id, effectiveCurrentBEId, cancellationReason);
+    const cancelBEId = activeCancellingOrder.billing_executive_id || effectiveCurrentBEId;
+    cancelOrderByBilling(activeCancellingOrder.id, cancelBEId, cancellationReason);
     setActiveCancellingOrder(null);
     if (onOrderProcessed) onOrderProcessed();
   };
@@ -331,16 +366,46 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
         {/* Filters */}
         <div className="flex flex-wrap items-center gap-2">
-          {/* Active Desk Queue Indicator with Multi-Raiser Counts */}
-          <div className="flex items-center gap-1.5 bg-purple-950/50 border border-purple-800/60 rounded-xl px-3 py-1.5 text-xs text-purple-200">
-            <UserCheck size={13} className="text-purple-400 shrink-0" />
-            <span>
-              <strong className="text-white font-semibold">Desk: {effectiveCurrentBEName}</strong>
-              <span className="text-purple-300/80 ml-1.5 text-[11px]">
+          {/* Active Desk Queue Selector (Supervisor) or Read-Only Desk Badge (Billing Executive) */}
+          {isSupervisorRole ? (
+            <div className="flex items-center gap-1.5 bg-purple-950/60 border border-purple-800/70 rounded-xl px-2.5 py-1.5 text-xs text-purple-200 shadow-xs">
+              <UserCheck size={14} className="text-purple-400 shrink-0" />
+              <span className="text-purple-300 font-semibold text-[11px]">BE Desk:</span>
+              <select
+                aria-label="Select BE Desk Queue"
+                value={selectedBEFilter}
+                onChange={(e) => setSelectedBEFilter(e.target.value)}
+                className="bg-slate-900 border border-purple-700/70 rounded-lg px-2 py-1 text-xs text-white font-bold focus:outline-none focus:border-purple-400 cursor-pointer"
+              >
+                <option value="ALL">All BE Desks (Consolidated • {orders.length} Orders)</option>
+                {billingExecutives.map((be) => {
+                  const countCA = users.filter((u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === be.id).length;
+                  const countSE = users.filter((u) => u.role === 'SALES_EXECUTIVE' && u.billing_executive_id === be.id).length;
+                  const countDist = users.filter((u) => u.role === 'DISTRIBUTOR' && u.billing_executive_id === be.id).length +
+                    distributors.filter((d) => d.billing_executive_id === be.id).length;
+                  return (
+                    <option key={be.id} value={be.id}>
+                      {be.name} ({countCA} CFS • {countSE} SE • {countDist} Dist)
+                    </option>
+                  );
+                })}
+              </select>
+              <span className="text-purple-300/80 ml-1 text-[11px] hidden md:inline font-medium">
                 ({assignedCAs.length} CFS • {assignedSEs.length} SE • {assignedDistributors.totalCount} Dist)
               </span>
-            </span>
-          </div>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 bg-purple-950/60 border border-purple-800/70 rounded-xl px-2.5 py-1.5 text-xs text-purple-200 shadow-xs">
+              <Lock size={13} className="text-purple-400 shrink-0" />
+              <span className="text-purple-300 font-semibold text-[11px]">BE Desk:</span>
+              <span className="bg-slate-900 border border-purple-700/70 rounded-lg px-2.5 py-1 text-xs text-white font-bold flex items-center gap-1.5">
+                {currentUser?.name || effectiveCurrentBEName}
+              </span>
+              <span className="text-purple-300/80 ml-1 text-[11px] hidden md:inline font-medium">
+                ({assignedCAs.length} CFS • {assignedSEs.length} SE • {assignedDistributors.totalCount} Dist)
+              </span>
+            </div>
+          )}
 
           {/* Raiser Role Filter */}
           <div className="flex items-center gap-1.5">
@@ -402,7 +467,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {filteredOrders.map((ord) => {
+          {filteredOrders.map((ord, idx) => {
             const retailer = retailers.find((r) => r.id === ord.retailer_id);
             const dp = dispatchPoints.find((d) => d.id === ord.dispatch_point_id);
             const assignedBE = users.find((u) => u.id === ord.billing_executive_id);
@@ -412,7 +477,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
             return (
               <div
-                key={ord.id}
+                key={`${ord.id || ord.order_number}_${idx}`}
                 className={`p-4 rounded-2xl border transition-all space-y-3.5 bg-slate-900 ${
                   exposure.isExceeded && !isVerified && !isCancelled
                     ? 'border-rose-500/50 shadow-rose-950/20 shadow-lg'

@@ -29,25 +29,6 @@ import {
   AppLanguage,
   AppTheme
 } from '../types';
-import {
-  INITIAL_TENANTS,
-  INITIAL_TENANT_SETTINGS,
-  INITIAL_COMPANIES,
-  INITIAL_DISPATCH_POINTS,
-  INITIAL_SKUS,
-  INITIAL_BEATS,
-  INITIAL_RETAILERS,
-  INITIAL_DISTRIBUTORS,
-  INITIAL_ORDERS,
-  INITIAL_STOCK_LEDGER,
-  INITIAL_INVOICES,
-  INITIAL_CLAIMS,
-  INITIAL_PAYMENTS,
-  INITIAL_PURCHASE_ORDERS,
-  INITIAL_WORKFLOW_NOTIFICATIONS,
-  INITIAL_USERS,
-  INITIAL_RETURNABLE_ASSET_LEDGER
-} from './initialData';
 import { isFirebaseConfigured } from '../firebase/config';
 import {
   COLLECTIONS,
@@ -127,13 +108,14 @@ const loadStore = (): StoreData => {
     if (saved) {
       const parsed = JSON.parse(saved);
       const savedUsers: User[] = Array.isArray(parsed.users) ? parsed.users : [];
-      // Ensure INITIAL_USERS exist in saved users list if not already present
-      let mergedUsers = [...savedUsers];
-      INITIAL_USERS.forEach((initU) => {
-        if (!mergedUsers.some((u) => u.id === initU.id || (u.mobile_number && u.mobile_number === initU.mobile_number))) {
-          mergedUsers.push(initU);
+      let mergedUsers = savedUsers.map((u) => {
+        if (u.id === 'usr_admin_prashant_alt' && u.mobile_number === '8668829674') {
+          return { ...u, mobile_number: '7830260199' };
         }
+        return u;
       });
+
+      const savedOrders: Order[] = Array.isArray(parsed.orders) ? parsed.orders : [];
       
       // Determine resolved current user & token with priority to active session
       let resolvedUserId = parsed.currentUserId;
@@ -158,61 +140,54 @@ const loadStore = (): StoreData => {
           return {
             ...u,
             role: 'COMMISSION_AGENT' as UserRole,
-            dispatch_point_id: null // Commission Agents have no dispatch point association
+            dispatch_point_id: null
           };
         }
         return u;
       });
 
-      const loadedDps: DispatchPoint[] = Array.isArray(parsed.dispatchPoints) && parsed.dispatchPoints.length > 0
-        ? parsed.dispatchPoints
-        : INITIAL_DISPATCH_POINTS;
-
-      const loadedCompanies: Company[] = Array.isArray(parsed.companies) && parsed.companies.length > 0
-        ? parsed.companies
-        : INITIAL_COMPANIES;
+      const loadedDps: DispatchPoint[] = Array.isArray(parsed.dispatchPoints) ? parsed.dispatchPoints : [];
+      const loadedCompanies: Company[] = Array.isArray(parsed.companies) ? parsed.companies : [];
 
       const normalizedCompanies: Company[] = loadedCompanies.map((c) => {
-        if (!c.dispatch_point_id) {
-          const fallbackDp = loadedDps.find((dp) => dp.tenant_id === c.tenant_id)?.id || 'dp_central';
+        if (!c.dispatch_point_id && loadedDps.length > 0) {
+          const fallbackDp = loadedDps.find((dp) => dp.tenant_id === c.tenant_id)?.id || loadedDps[0]?.id || null;
           return { ...c, dispatch_point_id: fallbackDp };
         }
         return c;
       });
 
       return {
-        tenants: Array.isArray(parsed.tenants) && parsed.tenants.length > 0 ? parsed.tenants : INITIAL_TENANTS,
-        tenantSettings: parsed.tenantSettings || INITIAL_TENANT_SETTINGS,
+        tenants: Array.isArray(parsed.tenants) ? parsed.tenants : [],
+        tenantSettings: parsed.tenantSettings || {},
         companies: normalizedCompanies,
         dispatchPoints: loadedDps,
-        skus: Array.isArray(parsed.skus) ? parsed.skus : INITIAL_SKUS,
-        beats: Array.isArray(parsed.beats) && parsed.beats.length > 0 ? parsed.beats : INITIAL_BEATS,
+        skus: Array.isArray(parsed.skus) ? parsed.skus : [],
+        beats: Array.isArray(parsed.beats) ? parsed.beats : [],
         retailers: Array.isArray(parsed.retailers)
           ? parsed.retailers.map((r: any) => ({
               ...r,
               current_outstanding: Number(r.current_outstanding) || 0,
               credit_limit: Number(r.credit_limit) || 50000,
             }))
-          : INITIAL_RETAILERS,
-        distributors: Array.isArray(parsed.distributors) ? parsed.distributors : INITIAL_DISTRIBUTORS,
-        orders: Array.isArray(parsed.orders)
-          ? parsed.orders.map((o: any) => ({
-              ...o,
-              total_amount: Number(o.total_amount) || (Array.isArray(o.lines) ? o.lines.reduce((s: number, l: any) => s + (Number(l?.total) || 0), 0) : 0),
-              lines: Array.isArray(o.lines)
-                ? o.lines.map((l: any) => ({
-                    ...l,
-                    quantity: Number(l?.quantity) || 0,
-                    unit_price: Number(l?.unit_price) || 0,
-                    total: Number(l?.total) != null && !isNaN(Number(l?.total)) ? Number(l.total) : (Number(l?.quantity) || 0) * (Number(l?.unit_price) || 0),
-                  }))
-                : [],
-            }))
-          : INITIAL_ORDERS,
-        purchaseOrders: Array.isArray(parsed.purchaseOrders) ? parsed.purchaseOrders : INITIAL_PURCHASE_ORDERS,
-        workflowNotifications: Array.isArray(parsed.workflowNotifications) ? parsed.workflowNotifications : INITIAL_WORKFLOW_NOTIFICATIONS,
-        stockLedger: Array.isArray(parsed.stockLedger) ? parsed.stockLedger : INITIAL_STOCK_LEDGER,
-        returnableAssetLedger: Array.isArray(parsed.returnableAssetLedger) ? parsed.returnableAssetLedger : INITIAL_RETURNABLE_ASSET_LEDGER,
+          : [],
+        distributors: Array.isArray(parsed.distributors) ? parsed.distributors : [],
+        orders: savedOrders.map((o: any) => ({
+          ...o,
+          total_amount: Number(o.total_amount) || (Array.isArray(o.lines) ? o.lines.reduce((s: number, l: any) => s + (Number(l?.total) || 0), 0) : 0),
+          lines: Array.isArray(o.lines)
+            ? o.lines.map((l: any) => ({
+                ...l,
+                quantity: Number(l?.quantity) || 0,
+                unit_price: Number(l?.unit_price) || 0,
+                total: Number(l?.total) != null && !isNaN(Number(l?.total)) ? Number(l.total) : (Number(l?.quantity) || 0) * (Number(l?.unit_price) || 0),
+              }))
+            : [],
+        })),
+        purchaseOrders: Array.isArray(parsed.purchaseOrders) ? parsed.purchaseOrders : [],
+        workflowNotifications: Array.isArray(parsed.workflowNotifications) ? parsed.workflowNotifications : [],
+        stockLedger: Array.isArray(parsed.stockLedger) ? parsed.stockLedger : [],
+        returnableAssetLedger: Array.isArray(parsed.returnableAssetLedger) ? parsed.returnableAssetLedger : [],
         invoices: Array.isArray(parsed.invoices)
           ? parsed.invoices.map((inv: any) => ({
               ...inv,
@@ -223,14 +198,14 @@ const loadStore = (): StoreData => {
               sgst: Number(inv.sgst) || 0,
               igst: Number(inv.igst) || 0,
             }))
-          : INITIAL_INVOICES,
-        claims: Array.isArray(parsed.claims) ? parsed.claims : INITIAL_CLAIMS,
+          : [],
+        claims: Array.isArray(parsed.claims) ? parsed.claims : [],
         payments: Array.isArray(parsed.payments)
           ? parsed.payments.map((p: any) => ({
               ...p,
               amount: Number(p.amount) || 0,
             }))
-          : INITIAL_PAYMENTS,
+          : [],
         users: mergedUsers,
         activeTenantId: resolvedTenantId || 'tenant_ms_enterprises',
         activeRole: resolvedRole || 'ADMIN',
@@ -256,23 +231,23 @@ const loadStore = (): StoreData => {
   const initTenantId = savedSession?.user?.tenant_id || 'tenant_ms_enterprises';
 
   return {
-    tenants: INITIAL_TENANTS,
-    tenantSettings: INITIAL_TENANT_SETTINGS,
-    companies: INITIAL_COMPANIES,
-    dispatchPoints: INITIAL_DISPATCH_POINTS,
-    skus: INITIAL_SKUS,
-    beats: INITIAL_BEATS,
-    retailers: INITIAL_RETAILERS,
-    distributors: INITIAL_DISTRIBUTORS,
-    orders: INITIAL_ORDERS,
-    purchaseOrders: INITIAL_PURCHASE_ORDERS,
-    workflowNotifications: INITIAL_WORKFLOW_NOTIFICATIONS,
-    stockLedger: INITIAL_STOCK_LEDGER,
-    returnableAssetLedger: INITIAL_RETURNABLE_ASSET_LEDGER,
-    invoices: INITIAL_INVOICES,
-    claims: INITIAL_CLAIMS,
-    payments: INITIAL_PAYMENTS,
-    users: INITIAL_USERS,
+    tenants: [],
+    tenantSettings: {},
+    companies: [],
+    dispatchPoints: [],
+    skus: [],
+    beats: [],
+    retailers: [],
+    distributors: [],
+    orders: [],
+    purchaseOrders: [],
+    workflowNotifications: [],
+    stockLedger: [],
+    returnableAssetLedger: [],
+    invoices: [],
+    claims: [],
+    payments: [],
+    users: [],
     activeTenantId: initTenantId,
     activeRole: initRole,
     currentUserId: initUserId,
@@ -311,102 +286,91 @@ const persist = () => {
   listeners.forEach((listener) => listener());
 };
 
-// Background Firestore Initializer & Auto-Seeder
+// Background Firestore Initializer & Real-time Live Synchronizer
 let hasInitializedFirestore = false;
+let unsubscribeFromFirestore: (() => void) | null = null;
+
 export const initFirestoreIntegration = async (forceRefetch = false) => {
   if (hasInitializedFirestore && !forceRefetch) return;
   hasInitializedFirestore = true;
 
-  // Also sync DB users from backend server API
-  try {
-    const res = await fetch('/api/users');
-    if (res.ok) {
-      const data = await res.json();
-      if (data.success && Array.isArray(data.users) && data.users.length > 0) {
-        // Merge server DB users into local store without losing local state
-        const serverUserIds = new Set(data.users.map((u: User) => u.id));
-        const combined = [
-          ...data.users,
-          ...memoryStore.users.filter((u) => !serverUserIds.has(u.id))
-        ];
-        memoryStore.users = combined;
-        persist();
-      }
-    }
-  } catch (err) {
-    console.warn('[DB SYNC] Could not fetch server DB users:', err);
-  }
-
-  if (!isFirebaseConfigured()) {
-    memoryStore.firebaseStatus = 'STANDBY';
-    memoryStore.firebaseErrorMessage = null;
-    persist();
-    return;
-  }
-
-  try {
-    memoryStore.firebaseStatus = 'SYNCING';
-    memoryStore.firebaseErrorMessage = null;
-    persist();
-
-    // 1. Fetch collections from Firestore
-    const fetchResult = await fetchAllFromFirestore();
-
-    if (fetchResult.isPermissionDenied) {
-      memoryStore.firebaseStatus = 'PERMISSION_DENIED';
-      memoryStore.firebaseErrorMessage = fetchResult.errorMessage || 'Missing or insufficient permissions.';
-      persist();
-      return;
-    }
-
-    if (fetchResult.success && fetchResult.data && fetchResult.data.tenants && fetchResult.data.tenants.length > 0) {
-      // Hydrate local store with remote data
-      memoryStore.tenants = fetchResult.data.tenants;
-      memoryStore.tenantSettings = { ...memoryStore.tenantSettings, ...fetchResult.data.tenantSettings };
-      memoryStore.companies = fetchResult.data.companies;
-      memoryStore.dispatchPoints = fetchResult.data.dispatchPoints;
-      memoryStore.skus = fetchResult.data.skus;
-      memoryStore.beats = fetchResult.data.beats && fetchResult.data.beats.length > 0 ? fetchResult.data.beats : memoryStore.beats;
-      memoryStore.retailers = fetchResult.data.retailers;
-      if (fetchResult.data.distributors) {
-        memoryStore.distributors = fetchResult.data.distributors;
-      }
-      memoryStore.orders = fetchResult.data.orders;
-      memoryStore.stockLedger = fetchResult.data.stockLedger;
-      memoryStore.invoices = fetchResult.data.invoices;
-      memoryStore.claims = fetchResult.data.claims;
-      memoryStore.payments = fetchResult.data.payments;
-      memoryStore.users = fetchResult.data.users;
-      memoryStore.firebaseStatus = 'CONNECTED';
+  // 1. Primary: If Cloud Firestore is configured, use it as Single Source of Truth
+  if (isFirebaseConfigured()) {
+    try {
+      memoryStore.firebaseStatus = 'SYNCING';
       memoryStore.firebaseErrorMessage = null;
-      memoryStore.lastSyncedAt = new Date().toISOString();
       persist();
-      return;
-    }
 
-    // 2. If database is empty or needs seeding, trigger initial seed
-    const checkResult = await checkDatabaseNeedsSeeding();
-    if (checkResult.needsSeeding) {
-      memoryStore.isSeeding = true;
-      persist();
-      const seedRes = await seedInitialFirestoreData(false);
-      memoryStore.isSeeding = false;
-      if (!seedRes.success && seedRes.error?.includes('permission-denied')) {
+      // Fetch all collections directly from Cloud Firestore
+      const fetchResult = await fetchAllFromFirestore();
+
+      if (fetchResult.isPermissionDenied) {
         memoryStore.firebaseStatus = 'PERMISSION_DENIED';
-        memoryStore.firebaseErrorMessage = seedRes.message;
+        memoryStore.firebaseErrorMessage = fetchResult.errorMessage || 'Missing or insufficient permissions.';
         persist();
-        return;
+      } else if (fetchResult.success && fetchResult.data) {
+        if (Array.isArray(fetchResult.data.tenants) && fetchResult.data.tenants.length > 0) {
+          memoryStore.tenants = fetchResult.data.tenants;
+        }
+        if (fetchResult.data.tenantSettings) {
+          memoryStore.tenantSettings = { ...memoryStore.tenantSettings, ...fetchResult.data.tenantSettings };
+        }
+        if (Array.isArray(fetchResult.data.companies) && fetchResult.data.companies.length > 0) {
+          memoryStore.companies = fetchResult.data.companies;
+        }
+        if (Array.isArray(fetchResult.data.dispatchPoints) && fetchResult.data.dispatchPoints.length > 0) {
+          memoryStore.dispatchPoints = fetchResult.data.dispatchPoints;
+        }
+        if (Array.isArray(fetchResult.data.skus) && fetchResult.data.skus.length > 0) {
+          memoryStore.skus = fetchResult.data.skus;
+        }
+        if (Array.isArray(fetchResult.data.beats) && fetchResult.data.beats.length > 0) {
+          memoryStore.beats = fetchResult.data.beats;
+        }
+        if (Array.isArray(fetchResult.data.retailers) && fetchResult.data.retailers.length > 0) {
+          memoryStore.retailers = fetchResult.data.retailers;
+        }
+        if (Array.isArray(fetchResult.data.distributors) && fetchResult.data.distributors.length > 0) {
+          memoryStore.distributors = fetchResult.data.distributors;
+        }
+        if (Array.isArray(fetchResult.data.orders)) {
+          memoryStore.orders = fetchResult.data.orders;
+        }
+        if (Array.isArray(fetchResult.data.stockLedger)) {
+          memoryStore.stockLedger = fetchResult.data.stockLedger;
+        }
+        if (Array.isArray(fetchResult.data.invoices)) {
+          memoryStore.invoices = fetchResult.data.invoices;
+        }
+        if (Array.isArray(fetchResult.data.claims)) {
+          memoryStore.claims = fetchResult.data.claims;
+        }
+        if (Array.isArray(fetchResult.data.payments)) {
+          memoryStore.payments = fetchResult.data.payments;
+        }
+        if (Array.isArray(fetchResult.data.users) && fetchResult.data.users.length > 0) {
+          memoryStore.users = fetchResult.data.users;
+        }
+
+        memoryStore.firebaseStatus = 'CONNECTED';
+        memoryStore.firebaseErrorMessage = null;
+        memoryStore.lastSyncedAt = new Date().toISOString();
+        persist();
       }
-    }
 
-    // Re-verify connection status
-    memoryStore.firebaseStatus = 'CONNECTED';
-    memoryStore.firebaseErrorMessage = null;
-    memoryStore.lastSyncedAt = new Date().toISOString();
-    persist();
+      // Check if Firestore needs initial seeding
+      const checkResult = await checkDatabaseNeedsSeeding();
+      if (checkResult.needsSeeding) {
+        memoryStore.isSeeding = true;
+        persist();
+        await seedInitialFirestoreData(false);
+        memoryStore.isSeeding = false;
+        persist();
+      }
 
-    // Attach real-time snapshot listeners for bidirectional synchronization with goroute-sfa-dms Firestore
-    subscribeToAllCollections((liveData) => {
+      // 2. ALWAYS attach real-time snapshot listeners for instant bidirectional sync
+      if (!unsubscribeFromFirestore) {
+        unsubscribeFromFirestore = subscribeToAllCollections((liveData) => {
       let changed = false;
       if (liveData.tenants && liveData.tenants.length > 0) {
         memoryStore.tenants = liveData.tenants;
@@ -456,17 +420,23 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
         memoryStore.users = liveData.users;
         changed = true;
       }
-      if (changed) {
-        memoryStore.lastSyncedAt = new Date().toISOString();
-        persist();
-      }
-    });
+        if (changed) {
+          memoryStore.lastSyncedAt = new Date().toISOString();
+          persist();
+        }
+      });
+    }
   } catch (error: any) {
     const isPermission = error?.message?.includes('Missing or insufficient permissions') || error?.code === 'permission-denied';
     memoryStore.firebaseStatus = isPermission ? 'PERMISSION_DENIED' : 'ERROR';
     memoryStore.firebaseErrorMessage = error?.message || 'Failed during Firestore initialization';
     persist();
   }
+} else {
+  memoryStore.firebaseStatus = 'STANDBY';
+  memoryStore.firebaseErrorMessage = null;
+  persist();
+}
 };
 
 // Trigger async initialization
@@ -543,9 +513,20 @@ export const calculateRetailerOutstanding = (
 export const useAppStore = () => {
   useSyncExternalStore(subscribeToStore, getStoreSnapshot);
 
-  const allTenants = Array.isArray(memoryStore.tenants) && memoryStore.tenants.length > 0 ? memoryStore.tenants : INITIAL_TENANTS;
-  const activeTenantId = memoryStore.activeTenantId || allTenants[0].id;
-  const activeTenant = allTenants.find((t) => t.id === activeTenantId) || allTenants[0];
+  const allTenants = Array.isArray(memoryStore.tenants) && memoryStore.tenants.length > 0 ? memoryStore.tenants : [];
+  const activeTenantId = memoryStore.activeTenantId || (allTenants[0]?.id || 'tenant_ms_enterprises');
+  const defaultFallbackTenant: Tenant = {
+    id: activeTenantId,
+    name: 'Decode Enterprises',
+    type: 'SUPER_STOCKIST',
+    accent_color: '#3B82F6',
+    gstin: '',
+    address: '',
+    phone: '',
+    email: '',
+    created_at: new Date().toISOString()
+  };
+  const activeTenant: Tenant = allTenants.find((t) => t.id === activeTenantId) || allTenants[0] || defaultFallbackTenant;
   const activeTenantSettings = (memoryStore.tenantSettings && memoryStore.tenantSettings[activeTenantId]) || {
     tenant_id: activeTenantId,
     credit_limit_default: 50000,
@@ -559,20 +540,20 @@ export const useAppStore = () => {
   };
 
   // Helper functions strictly scoped to active tenant
-  const tenantCompanies = (memoryStore.companies || INITIAL_COMPANIES).filter((c) => c.tenant_id === activeTenantId);
-  const tenantDispatchPoints = (memoryStore.dispatchPoints || INITIAL_DISPATCH_POINTS).filter((dp) => dp.tenant_id === activeTenantId);
-  const tenantSkus = (memoryStore.skus || INITIAL_SKUS).filter((s) => s.tenant_id === activeTenantId);
-  const rawTenantBeats = (memoryStore.beats || INITIAL_BEATS).filter((b) => b.tenant_id === activeTenantId);
-  const rawTenantRetailers = (memoryStore.retailers || INITIAL_RETAILERS).filter((r) => r.tenant_id === activeTenantId);
-  const rawTenantDistributors = (memoryStore.distributors || INITIAL_DISTRIBUTORS).filter((d) => d.tenant_id === activeTenantId);
-  const tenantOrders = (memoryStore.orders || INITIAL_ORDERS).filter((o) => o.tenant_id === activeTenantId);
-  const tenantPurchaseOrders = (memoryStore.purchaseOrders || INITIAL_PURCHASE_ORDERS).filter((po) => po.tenant_id === activeTenantId);
-  const tenantWorkflowNotifications = (memoryStore.workflowNotifications || INITIAL_WORKFLOW_NOTIFICATIONS);
-  const tenantStockLedger = (memoryStore.stockLedger || INITIAL_STOCK_LEDGER).filter((st) => st.tenant_id === activeTenantId);
-  const tenantReturnableAssetLedger = (memoryStore.returnableAssetLedger || INITIAL_RETURNABLE_ASSET_LEDGER).filter((entry) => entry.tenant_id === activeTenantId);
-  const tenantInvoices = (memoryStore.invoices || INITIAL_INVOICES).filter((inv) => inv.tenant_id === activeTenantId);
-  const tenantClaims = (memoryStore.claims || INITIAL_CLAIMS).filter((c) => c.tenant_id === activeTenantId);
-  const tenantPayments = (memoryStore.payments || INITIAL_PAYMENTS).filter((p) => p.tenant_id === activeTenantId);
+  const tenantCompanies = (memoryStore.companies || []).filter((c) => c.tenant_id === activeTenantId);
+  const tenantDispatchPoints = (memoryStore.dispatchPoints || []).filter((dp) => dp.tenant_id === activeTenantId);
+  const tenantSkus = (memoryStore.skus || []).filter((s) => s.tenant_id === activeTenantId);
+  const rawTenantBeats = (memoryStore.beats || []).filter((b) => b.tenant_id === activeTenantId);
+  const rawTenantRetailers = (memoryStore.retailers || []).filter((r) => r.tenant_id === activeTenantId);
+  const rawTenantDistributors = (memoryStore.distributors || []).filter((d) => d.tenant_id === activeTenantId);
+  const tenantOrders = (memoryStore.orders || []).filter((o) => o.tenant_id === activeTenantId);
+  const tenantPurchaseOrders = (memoryStore.purchaseOrders || []).filter((po) => po.tenant_id === activeTenantId);
+  const tenantWorkflowNotifications = (memoryStore.workflowNotifications || []);
+  const tenantStockLedger = (memoryStore.stockLedger || []).filter((st) => st.tenant_id === activeTenantId);
+  const tenantReturnableAssetLedger = (memoryStore.returnableAssetLedger || []).filter((entry) => entry.tenant_id === activeTenantId);
+  const tenantInvoices = (memoryStore.invoices || []).filter((inv) => inv.tenant_id === activeTenantId);
+  const tenantClaims = (memoryStore.claims || []).filter((c) => c.tenant_id === activeTenantId);
+  const tenantPayments = (memoryStore.payments || []).filter((p) => p.tenant_id === activeTenantId);
   const tenantUsers = (memoryStore.users || []).filter((u) => u.tenant_id === activeTenantId);
 
   // Map tenant retailers with real-time live current_outstanding synchronized across all orders, invoices & payments
@@ -1551,6 +1532,14 @@ export const useAppStore = () => {
       };
 
       memoryStore.orders = [effectiveOrder, ...memoryStore.orders];
+      persist();
+
+      // Persist order to server backend database (sync across Android mobile app and web console)
+      fetch('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(effectiveOrder),
+      }).catch((err) => console.warn('[DB SYNC] Failed to save order to server database:', err));
 
       if (isFirebaseConfigured()) {
         saveRecordToFirestore(COLLECTIONS.ORDERS, effectiveOrder.id, effectiveOrder);
@@ -2556,6 +2545,7 @@ export const useAppStore = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          id: userWithAuth.id,
           name: user.name,
           email: user.email || '',
           mobile_number: user.mobile_number,
@@ -2584,6 +2574,13 @@ export const useAppStore = () => {
         return u;
       });
       persist();
+
+      // Persist user updates to backend persistent DB (e.g. BE mapping, dispatch point)
+      fetch(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      }).catch((err) => console.warn('[DB SYNC] Failed to update user in backend DB:', err));
 
       if (isFirebaseConfigured() && updatedUser) {
         saveRecordToFirestore(COLLECTIONS.USERS, userId, updatedUser);
@@ -2900,26 +2897,26 @@ export const useAppStore = () => {
       }
     },
 
-    // Reset store to initial defaults (e.g. for demo reload)
+    // Reset store to clean state and re-sync from server DB
     resetStoreToDefault: () => {
       memoryStore = {
-        tenants: INITIAL_TENANTS,
-        tenantSettings: INITIAL_TENANT_SETTINGS,
-        companies: INITIAL_COMPANIES,
-        dispatchPoints: INITIAL_DISPATCH_POINTS,
-        skus: INITIAL_SKUS,
-        retailers: INITIAL_RETAILERS,
-        distributors: INITIAL_DISTRIBUTORS,
-        beats: INITIAL_BEATS,
-        orders: INITIAL_ORDERS,
-        purchaseOrders: INITIAL_PURCHASE_ORDERS,
-        workflowNotifications: INITIAL_WORKFLOW_NOTIFICATIONS,
-        stockLedger: INITIAL_STOCK_LEDGER,
-        returnableAssetLedger: INITIAL_RETURNABLE_ASSET_LEDGER,
-        invoices: INITIAL_INVOICES,
-        claims: INITIAL_CLAIMS,
-        payments: INITIAL_PAYMENTS,
-        users: INITIAL_USERS,
+        tenants: [],
+        tenantSettings: {},
+        companies: [],
+        dispatchPoints: [],
+        skus: [],
+        retailers: [],
+        distributors: [],
+        beats: [],
+        orders: [],
+        purchaseOrders: [],
+        workflowNotifications: [],
+        stockLedger: [],
+        returnableAssetLedger: [],
+        invoices: [],
+        claims: [],
+        payments: [],
+        users: [],
         activeTenantId: 'tenant_ms_enterprises',
         activeRole: 'ADMIN',
         currentUserId: null,
@@ -2934,6 +2931,7 @@ export const useAppStore = () => {
       };
       applyThemeToDOM('dark');
       persist();
+      initFirestoreIntegration(true);
     }
   };
 };

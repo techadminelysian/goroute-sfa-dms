@@ -22,6 +22,7 @@ import {
   findDbUserById,
   upsertDbUser,
   addDbUser,
+  updateDbUser,
   updateDbUserPassword,
   updateDbUserCompanyScope,
   batchUpdateDbUserCompanyScopes,
@@ -41,8 +42,8 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Initialize and seed persistent database on startup
-  initDatabase();
+  // Initialize and hydrate single source of truth from Cloud Firestore on startup
+  await initDatabase();
 
   // Helper to sanitize mobile
   const sanitizeMobile = (input: string) => {
@@ -112,6 +113,15 @@ async function startServer() {
     });
   });
 
+  // GET /api/bootstrap - Complete dynamic database state for client store initialization
+  app.get("/api/bootstrap", (_req, res) => {
+    const db = getDatabase();
+    res.json({
+      success: true,
+      database: db
+    });
+  });
+
   // GET /api/users - List users from DB
   app.get("/api/users", (_req, res) => {
     const users = getDbUsers().map((u) => ({
@@ -131,7 +141,7 @@ async function startServer() {
 
   // POST /api/users - Create new user in DB
   app.post("/api/users", (req, res) => {
-    const { name, email, mobile_number, role, tenant_id, password, dispatch_point_id, beat_id } = req.body;
+    const { id, name, email, mobile_number, role, tenant_id, password, dispatch_point_id, beat_id, billing_executive_id } = req.body;
     if (!name || !mobile_number || !role) {
       return res.status(400).json({
         success: false,
@@ -140,6 +150,7 @@ async function startServer() {
     }
 
     const result = addDbUser({
+      id: id || undefined,
       name,
       email: email || "",
       mobile_number,
@@ -147,14 +158,15 @@ async function startServer() {
       tenant_id: tenant_id || "tenant_ms_enterprises",
       password: password || "Fmcg@2025",
       dispatch_point_id: dispatch_point_id || null,
-      beat_id: beat_id || null
+      beat_id: beat_id || null,
+      billing_executive_id: billing_executive_id || null
     });
 
     if (!result.success || !result.user) {
       return res.status(400).json({ success: false, error: result.error || "Failed to create user." });
     }
 
-    console.log(`[DATABASE] Added new user into DB: ${result.user.name} (${result.user.mobile_number}) as ${result.user.role}`);
+    console.log(`[DATABASE] Added new user into DB: ${result.user.name} (${result.user.mobile_number}) as ${result.user.role} with BE: ${result.user.billing_executive_id || 'none'}`);
     res.status(201).json({
       success: true,
       message: `User ${result.user.name} successfully registered in database.`,
@@ -166,9 +178,21 @@ async function startServer() {
         mobile_number: result.user.mobile_number,
         role: result.user.role,
         dispatch_point_id: result.user.dispatch_point_id,
+        billing_executive_id: result.user.billing_executive_id,
         platform: result.user.platform
       }
     });
+  });
+
+  // PATCH /api/users/:id - Update user properties (BE mapping, DP, etc.)
+  app.patch("/api/users/:id", (req, res) => {
+    const userId = req.params.id;
+    const updates = req.body;
+    const updated = updateDbUser(userId, updates);
+    if (!updated) {
+      return res.status(404).json({ success: false, error: "User not found." });
+    }
+    res.json({ success: true, user: updated });
   });
 
   // ---------------------------------------------------------------------------

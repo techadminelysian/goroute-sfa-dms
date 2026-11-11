@@ -1043,8 +1043,8 @@ export const BillingInvoicing: React.FC = () => {
                 Verified Depot Dispatch Orders Ready for GST Tax Invoicing ({readyToInvoiceOrders.length})
               </h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {readyToInvoiceOrders.map((ord) => (
-                  <div key={ord.id} className="p-3 bg-slate-900 border border-slate-800 rounded-xl space-y-2 text-xs">
+                {readyToInvoiceOrders.map((ord, idx) => (
+                  <div key={`${ord.id || ord.order_number}_${idx}`} className="p-3 bg-slate-900 border border-slate-800 rounded-xl space-y-2 text-xs">
                     <div className="flex justify-between items-start">
                       <div>
                         <div className="font-bold text-white">{ord.order_number}</div>
@@ -1334,9 +1334,9 @@ export const BillingInvoicing: React.FC = () => {
                             Orders Included in this Manifest ({grp.orders.length}):
                           </div>
                           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                            {grp.orders.map((ord) => (
+                            {grp.orders.map((ord, idx) => (
                               <div
-                                key={ord.id}
+                                key={`${ord.id || ord.order_number}_${idx}`}
                                 className="bg-slate-900 border border-slate-800 p-2.5 rounded-lg flex items-center justify-between text-xs"
                               >
                                 <div>

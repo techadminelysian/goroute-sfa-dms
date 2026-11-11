@@ -1305,8 +1305,8 @@ export const CreditManagement: React.FC = () => {
                         ))}
 
                       {/* Uninvoiced Delivered Orders */}
-                      {unInvoicedDeliveredOrders.map((ord) => (
-                        <tr key={ord.id} className="hover:bg-slate-800/30 bg-amber-950/20">
+                      {unInvoicedDeliveredOrders.map((ord, idx) => (
+                        <tr key={`${ord.id || ord.order_number}_${idx}`} className="hover:bg-slate-800/30 bg-amber-950/20">
                           <td className="py-2 px-3 text-slate-400">{ord.delivery_date || ord.order_date}</td>
                           <td className="py-2 px-3 font-sans text-amber-300 font-bold">DELIVERED ORDER</td>
                           <td className="py-2 px-3 font-bold text-amber-200">{ord.order_number}</td>

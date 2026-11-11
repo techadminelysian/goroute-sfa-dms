@@ -33,7 +33,8 @@ import {
   getDatabase,
   saveDatabaseToDisk,
   findDbUserByMobile,
-  findDbUserById
+  findDbUserById,
+  updateDbUserPassword
 } from '../server/dbService.js';
 import { hashPassword, generateStrongPassword } from '../server/authService.js';
 
@@ -73,8 +74,8 @@ async function main() {
   console.log('       (Dev Engineering & System Maintenance Access)');
   console.log('='.repeat(64));
 
-  // Initialize DB
-  initDatabase();
+  // Initialize DB from Cloud Firestore
+  await initDatabase();
   const db = getDatabase();
 
   const args = parseArgs();
@@ -155,10 +156,8 @@ async function main() {
   // Generate PBKDF2 hash with fresh random salt
   const { hash, salt } = hashPassword(finalPassword);
 
-  // Update in DB
-  targetUser.password_hash = hash;
-  targetUser.salt = salt;
-  saveDatabaseToDisk();
+  // Update in DB (Cloud Firestore Single Source of Truth)
+  updateDbUserPassword(targetUser.id, hash, salt);
 
   console.log('\n' + '='.repeat(64));
   console.log('                ADMIN PASSWORD RESET SUCCESSFUL');
@@ -172,8 +171,9 @@ async function main() {
   console.log(`>>> NEW PASSWORD:  ${finalPassword}`);
   console.log('-'.repeat(64));
   console.log('[SECURITY AUDIT] All active sessions for this admin have been invalidated.');
-  console.log('[SECURITY AUDIT] Password hash updated in persistent database.');
+  console.log('[SECURITY AUDIT] Password hash updated in Cloud Firestore database.');
   console.log('='.repeat(64) + '\n');
+  process.exit(0);
 }
 
 main().catch((err) => {

@@ -240,9 +240,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             </div>
 
             <div className="space-y-2">
-              {orders.slice(0, 4).map((ord) => (
+              {orders.slice(0, 4).map((ord, idx) => (
                 <div
-                  key={ord.id}
+                  key={`${ord.id || ord.order_number}_${idx}`}
                   className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between text-xs"
                 >
                   <div>
@@ -496,7 +496,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-              {pendingVerificationOrders.slice(0, 6).map((ord) => {
+              {pendingVerificationOrders.slice(0, 6).map((ord, idx) => {
                 const agentName =
                   ord.commission_agent_name ||
                   users.find((u) => u.id === ord.commission_agent_id || u.id === ord.created_by_user_id)?.name ||
@@ -504,7 +504,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
                 return (
                   <div
-                    key={ord.id}
+                    key={`${ord.id || ord.order_number}_${idx}`}
                     className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-3"
                   >
                     <div className="space-y-1 min-w-0">
@@ -560,9 +560,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-              {readyToInvoiceOrders.map((ord) => (
+              {readyToInvoiceOrders.map((ord, idx) => (
                 <div
-                  key={ord.id}
+                  key={`${ord.id || ord.order_number}_${idx}`}
                   className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-3"
                 >
                   <div className="space-y-0.5">
@@ -641,9 +641,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
-              {directBEOrders.slice(0, 6).map((ord) => (
+              {directBEOrders.slice(0, 6).map((ord, idx) => (
                 <div
-                  key={ord.id}
+                  key={`${ord.id || ord.order_number}_${idx}`}
                   className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex flex-col justify-between gap-2.5"
                 >
                   <div className="space-y-1">
@@ -1257,9 +1257,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                 All order queues are clear! No pending orders.
               </div>
             ) : (
-              newOrdersQueue.map((ord) => (
+              newOrdersQueue.map((ord, idx) => (
                 <div
-                  key={ord.id}
+                  key={`${ord.id || ord.order_number}_${idx}`}
                   className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-3"
                 >
                   <div>
@@ -1503,7 +1503,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
         </div>
 
         <div className="space-y-2">
-          {orders.map((ord) => {
+          {orders.map((ord, idx) => {
             const isDelivered = ord.status === 'DELIVERED';
             const isPendingVerification = ord.status === 'PENDING_VERIFICATION' || ord.status === 'PUNCHED';
             const isVerified = [
@@ -1517,7 +1517,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
             return (
               <div
-                key={ord.id}
+                key={`${ord.id || ord.order_number}_${idx}`}
                 className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-2"
               >
                 <div>
