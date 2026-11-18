@@ -15,7 +15,7 @@ import {
   Moon,
   Languages
 } from 'lucide-react';
-import { sanitizeMobileNumber, isTenantSettingsAuthorized, isOnboardingAuthorized } from '../../utils/authClient';
+import { sanitizeMobileNumber, isTenantSettingsAuthorized, isOnboardingAuthorized, isMobileOnlyRole } from '../../utils/authClient';
 
 interface HeaderProps {
   onOpenOnboarding: () => void;
@@ -52,7 +52,7 @@ export const Header: React.FC<HeaderProps> = ({
     ORDER_PUNCHER: { label: 'Order Puncher', platform: 'WEB' },
     DISPATCHER: { label: 'Dispatcher', platform: 'MOBILE' },
     ACCOUNTANT: { label: 'Accountant', platform: 'WEB' },
-    DISTRIBUTOR: { label: 'Distributor', platform: 'WEB' },
+    DISTRIBUTOR: { label: 'Distributor', platform: 'MOBILE' },
     SALES_EXECUTIVE: { label: 'Sales Executive', platform: 'MOBILE' },
     COMMISSION_AGENT: { label: 'Commission Agent', platform: 'MOBILE' },
     DELIVERY_VAN_EXECUTIVE: { label: 'Delivery Van Executive', platform: 'MOBILE' },
@@ -60,7 +60,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   const userAssignedRole = currentUser?.role || activeRole || 'ADMIN';
   const roleInfo = roleLabelMap[userAssignedRole] || { label: userAssignedRole, platform: 'WEB' };
-  const isMobileUserRole = userAssignedRole === 'COMMISSION_AGENT' || userAssignedRole === 'DISPATCHER';
+  const isMobileUserRole = isMobileOnlyRole(userAssignedRole);
 
   // Super-admin / backend developer check strictly scoped to user ID / mobile 7830260134
   const isSuperTechAdmin = isTenantSettingsAuthorized(currentUser);

@@ -19,19 +19,28 @@ import {
   seedDatabase,
   getDbUsers,
   findDbUserByMobile,
+  findDbUserByMobileLive,
   findDbUserById,
+  findDbUserByIdLive,
   upsertDbUser,
   addDbUser,
   updateDbUser,
   updateDbUserPassword,
   updateDbUserCompanyScope,
   batchUpdateDbUserCompanyScopes,
+  deleteDbUser,
   getDbOrders,
   findDbOrderById,
   upsertDbOrder,
   updateDbOrder,
-  verifyAndApproveDbOrder
+  verifyAndApproveDbOrder,
+  upsertDbDispatchPoint,
+  updateDbDispatchPoint,
+  deleteDbDispatchPoint,
+  getLivePartyCreditProfileFromDb
 } from "./server/dbService.js";
+import { splitOrderByDispatchPoint } from "./src/utils/dispatchRouting.js";
+import { isMobileOnlyRole, getWebPortalBlockedMessage, getPlatformForRole } from "./src/utils/authClient.js";
 
 async function startServer() {
   const app = express();
@@ -126,22 +135,30 @@ async function startServer() {
   app.get("/api/users", (_req, res) => {
     const users = getDbUsers().map((u) => ({
       id: u.id,
+      firestore_doc_id: u.firestore_doc_id,
       tenant_id: u.tenant_id,
       name: u.name,
       email: u.email,
       mobile_number: u.mobile_number,
       role: u.role,
-      company_scope: u.company_scope,
+      company_scope: Array.isArray(u.company_scope) ? u.company_scope : [],
       dispatch_point_id: u.dispatch_point_id,
+      billing_executive_id: u.billing_executive_id,
+      beat_id: u.beat_id,
+      beat_name: u.beat_name,
       platform: u.platform,
-      is_active: u.is_active
+      is_active: u.is_active,
+      credit_limit: u.credit_limit,
+      current_outstanding: u.current_outstanding,
+      credit_gate_enabled: u.credit_gate_enabled !== false,
+      distributor_id: u.distributor_id ?? null
     }));
     res.json({ success: true, users });
   });
 
   // POST /api/users - Create new user in DB
   app.post("/api/users", (req, res) => {
-    const { id, name, email, mobile_number, role, tenant_id, password, dispatch_point_id, beat_id, billing_executive_id } = req.body;
+    const { id, name, email, mobile_number, role, tenant_id, password, dispatch_point_id, beat_id, billing_executive_id, company_scope } = req.body;
     if (!name || !mobile_number || !role) {
       return res.status(400).json({
         success: false,
@@ -159,7 +176,8 @@ async function startServer() {
       password: password || "Fmcg@2025",
       dispatch_point_id: dispatch_point_id || null,
       beat_id: beat_id || null,
-      billing_executive_id: billing_executive_id || null
+      billing_executive_id: billing_executive_id || null,
+      company_scope: Array.isArray(company_scope) ? company_scope : []
     });
 
     if (!result.success || !result.user) {
@@ -172,11 +190,13 @@ async function startServer() {
       message: `User ${result.user.name} successfully registered in database.`,
       user: {
         id: result.user.id,
+        firestore_doc_id: result.user.firestore_doc_id,
         tenant_id: result.user.tenant_id,
         name: result.user.name,
         email: result.user.email,
         mobile_number: result.user.mobile_number,
         role: result.user.role,
+        company_scope: result.user.company_scope,
         dispatch_point_id: result.user.dispatch_point_id,
         billing_executive_id: result.user.billing_executive_id,
         platform: result.user.platform
@@ -193,6 +213,55 @@ async function startServer() {
       return res.status(404).json({ success: false, error: "User not found." });
     }
     res.json({ success: true, user: updated });
+  });
+
+  // DELETE /api/users/:id - Delete user from DB and Cloud Firestore
+  app.delete("/api/users/:id", async (req, res) => {
+    const userId = req.params.id;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "User ID is required." });
+    }
+
+    const result = await deleteDbUser(userId);
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: result.error || "Failed to delete user from database."
+      });
+    }
+
+    invalidateAllUserSessions(userId);
+    console.log(`[DATABASE] Deleted user ${result.deletedUser?.name || userId} (${userId}) and revoked sessions.`);
+    return res.json({
+      success: true,
+      message: `User ${result.deletedUser?.name || userId} deleted successfully.`
+    });
+  });
+
+  // DISPATCH POINTS API ROUTES
+  app.post("/api/dispatch-points", (req, res) => {
+    const dp = req.body;
+    if (!dp || !dp.id) {
+      return res.status(400).json({ success: false, error: "Valid dispatch point object with id is required." });
+    }
+    const saved = upsertDbDispatchPoint(dp);
+    return res.status(201).json({ success: true, dispatchPoint: saved });
+  });
+
+  app.patch("/api/dispatch-points/:id", (req, res) => {
+    const updated = updateDbDispatchPoint(req.params.id, req.body || {});
+    if (!updated) {
+      return res.status(404).json({ success: false, error: "Dispatch point not found." });
+    }
+    return res.json({ success: true, dispatchPoint: updated });
+  });
+
+  app.delete("/api/dispatch-points/:id", async (req, res) => {
+    const ok = await deleteDbDispatchPoint(req.params.id);
+    if (!ok) {
+      return res.status(500).json({ success: false, error: "Failed to delete dispatch point." });
+    }
+    return res.json({ success: true });
   });
 
   // ---------------------------------------------------------------------------
@@ -227,14 +296,26 @@ async function startServer() {
     res.json({ success: true, order });
   });
 
-  // POST /api/orders - Create or upsert order into database
+  // POST /api/orders - Create or upsert order into database (with dynamic multi-Dispatch Point splitting)
   app.post("/api/orders", (req, res) => {
     const order = req.body;
     if (!order || !order.id) {
       return res.status(400).json({ success: false, error: "Valid order object with id is required." });
     }
-    const saved = upsertDbOrder(order);
-    res.json({ success: true, order: saved });
+    const db = getDatabase();
+    const splitOrders = splitOrderByDispatchPoint(
+      order,
+      db.companies || [],
+      db.skus || [],
+      db.dispatchPoints || []
+    );
+    const savedOrders = splitOrders.map((splitOrd) => upsertDbOrder(splitOrd));
+    res.json({
+      success: true,
+      order: savedOrders[0],
+      orders: savedOrders,
+      splitCount: savedOrders.length,
+    });
   });
 
   // PATCH /api/orders/:id/verify - BE Order Verification with mandatory order_invoicing_type
@@ -286,7 +367,7 @@ async function startServer() {
   // ---------------------------------------------------------------------------
 
   // 1. POST /api/auth/login
-  app.post("/api/auth/login", (req, res) => {
+  app.post("/api/auth/login", async (req, res) => {
     const { mobile_number, password } = req.body;
     const clientIp = req.ip || req.socket.remoteAddress || "unknown_ip";
     const sanitizedMobile = sanitizeMobile(mobile_number);
@@ -315,19 +396,19 @@ async function startServer() {
       });
     }
 
-    // Lookup user dynamically from persistent Database
-    const user = findDbUserByMobile(sanitizedMobile);
+    // Lookup user dynamically from persistent Database (with live Firestore fallback)
+    const user = await findDbUserByMobileLive(sanitizedMobile);
 
     // Generic error to prevent mobile number enumeration
     const genericAuthError = "Invalid mobile number or password.";
 
     if (!user) {
       const lockStatus = recordFailedAttempt(sanitizedMobile);
-      console.warn(`[AUTH AUDIT] Failed login attempt for unregistered/wrong mobile ${sanitizedMobile} from IP ${clientIp}`);
+      console.log(`[AUTH AUDIT] Rejected login attempt for unregistered/wrong mobile ${sanitizedMobile} from IP ${clientIp}`);
       return res.status(401).json({
         success: false,
         error: lockStatus.isNowLocked
-          ? `Account locked out for 15 minutes due to repeated failed attempts.`
+          ? `Account locked out for ${lockStatus.lockDurationMinutes || 30} minutes due to repeated failed attempts.`
           : genericAuthError
       });
     }
@@ -345,11 +426,11 @@ async function startServer() {
 
     if (!passwordMatches) {
       const lockStatus = recordFailedAttempt(sanitizedMobile);
-      console.warn(`[AUTH AUDIT] Failed password attempt for user ${user.name} (${sanitizedMobile}) from IP ${clientIp}`);
+      console.log(`[AUTH AUDIT] Failed password attempt for user ${user.name} (${sanitizedMobile}) from IP ${clientIp}`);
       return res.status(401).json({
         success: false,
         error: lockStatus.isNowLocked
-          ? `Too many failed attempts. Account locked out for 15 minutes.`
+          ? `Too many failed attempts. Account locked out for ${lockStatus.lockDurationMinutes || 30} minutes.`
           : genericAuthError
       });
     }
@@ -357,10 +438,22 @@ async function startServer() {
     // Success: Reset rate limit counter
     recordSuccessfulAttempt(sanitizedMobile);
 
+    // Enforce RBAC: Block mobile-only roles from accessing the Web Portal
+    const clientPlatform = String(req.body?.client_platform || req.headers["x-client-platform"] || "WEB").toUpperCase();
+    if (clientPlatform !== "MOBILE_APP" && isMobileOnlyRole(user.role)) {
+      console.warn(`[AUTH AUDIT] Blocked Web Portal login attempt for mobile-only role ${user.role} (${user.name}, +91-${sanitizedMobile}) from IP ${clientIp}`);
+      return res.status(403).json({
+        success: false,
+        code: "WEB_PORTAL_ACCESS_DENIED",
+        error: getWebPortalBlockedMessage(user.role)
+      });
+    }
+
     // Establish secure session with user role attached
     const session = createSession(user);
 
     // Safe user object (omit password_hash and salt)
+    const liveCredit = await getLivePartyCreditProfileFromDb(user.id).catch(() => null);
     const safeUser = {
       id: user.id,
       tenant_id: user.tenant_id,
@@ -370,7 +463,15 @@ async function startServer() {
       role: user.role,
       company_scope: user.company_scope,
       dispatch_point_id: user.dispatch_point_id,
-      platform: user.platform
+      billing_executive_id: user.billing_executive_id,
+      platform: getPlatformForRole(user.role),
+      credit_limit: liveCredit?.credit_limit ?? user.credit_limit,
+      current_outstanding: liveCredit?.current_outstanding ?? user.current_outstanding,
+      utilized_credit: liveCredit?.utilized_credit ?? user.utilized_credit,
+      available_credit: liveCredit?.available_credit,
+      remaining_credit: liveCredit?.remaining_credit,
+      fund_shortage: liveCredit?.fund_shortage ?? 0,
+      credit_gate_enabled: user.credit_gate_enabled !== false,
     };
 
     console.log(`[AUTH AUDIT] Successful DB login: ${user.name} (${user.role}) via mobile +91-${sanitizedMobile}`);
@@ -393,21 +494,23 @@ async function startServer() {
   });
 
   // 3. POST /api/admin/users/:id/reset-password - Admin-Only Password Reset for Non-Admin Staff
-  app.post("/api/admin/users/:id/reset-password", (req, res) => {
+  app.post("/api/admin/users/:id/reset-password", async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({ success: false, error: "Authentication required. Bearer token missing." });
     }
 
-    const token = authHeader.substring(7);
+    const token = authHeader.substring(7).trim();
     const session = getSession(token);
     if (!session) {
       return res.status(401).json({ success: false, error: "Session expired or invalid. Please re-login." });
     }
 
-    // Role check: Only ADMIN role can perform staff password resets
-    if (session.role !== "ADMIN") {
-      console.warn(`[SECURITY AUDIT] Unauthorized password reset attempt by user ${session.name} (${session.userId}, role: ${session.role})`);
+    // Verify caller identity and ADMIN role against authoritative user store
+    const callerUser = await findDbUserByIdLive(session.userId);
+    const effectiveCallerRole = callerUser?.role || session.role;
+    if (effectiveCallerRole !== "ADMIN") {
+      console.warn(`[SECURITY AUDIT] Unauthorized password reset attempt by user ${session.name} (${session.userId}, role: ${effectiveCallerRole})`);
       return res.status(403).json({
         success: false,
         error: "Access Denied: Only administrators have permission to reset user passwords."
@@ -415,7 +518,7 @@ async function startServer() {
     }
 
     const targetUserId = req.params.id;
-    const targetUser = findDbUserById(targetUserId);
+    const targetUser = await findDbUserByIdLive(targetUserId);
 
     if (!targetUser) {
       return res.status(404).json({
@@ -434,7 +537,7 @@ async function startServer() {
     }
 
     // Determine new password (either custom provided or auto-generated strong 14-char password)
-    const customPassword = req.body?.new_password;
+    const customPassword = typeof req.body?.new_password === "string" ? req.body.new_password.trim() : "";
     let newPasswordToSet = customPassword;
 
     if (newPasswordToSet) {
@@ -454,9 +557,9 @@ async function startServer() {
       newPasswordToSet = generateStrongPassword(14);
     }
 
-    // Hash with unique salt and update DB
+    // Hash with PBKDF2-SHA512 + unique salt and await DB/Firestore persistence
     const { hash, salt } = hashPassword(newPasswordToSet);
-    const updated = updateDbUserPassword(targetUser.id, hash, salt);
+    const updated = await updateDbUserPassword(targetUser.id, hash, salt);
 
     if (!updated) {
       return res.status(500).json({
@@ -465,10 +568,12 @@ async function startServer() {
       });
     }
 
-    // Invalidate all active sessions for target user to enforce immediate credential re-verification
-    invalidateAllUserSessions(targetUser.id);
+    // Invalidate ONLY the target user's active sessions (Admin's session remains valid)
+    if (targetUser.id !== session.userId) {
+      invalidateAllUserSessions(targetUser.id);
+    }
 
-    console.log(`[ADMIN SECURITY AUDIT] Admin "${session.name}" successfully reset password for ${targetUser.role} "${targetUser.name}" (+91-${targetUser.mobile_number}). All prior sessions revoked.`);
+    console.log(`[ADMIN SECURITY AUDIT] Admin "${session.name}" successfully reset password for ${targetUser.role} "${targetUser.name}" (+91-${targetUser.mobile_number}). Target user sessions revoked.`);
 
     return res.json({
       success: true,
@@ -525,86 +630,91 @@ async function startServer() {
     });
   });
 
-  // 4. POST /api/auth/sync-session - Synchronize client/Firestore active session with backend
-  app.post("/api/auth/sync-session", (req, res) => {
-    const { user, token } = req.body;
+  // 4. POST /api/auth/sync-session - Synchronize client/Firestore active session with backend signed token
+  app.post("/api/auth/sync-session", async (req, res) => {
+    const { user, client_platform } = req.body || {};
     if (!user || !user.id) {
       return res.status(400).json({ success: false, error: "Valid user object is required." });
     }
 
-    // Upsert user to backend database
-    const savedUser = upsertDbUser(user);
-    const sessionToken = token || `sess_sync_${Date.now()}_${savedUser.id}`;
+    // Resolve authoritative user record from DB / Firestore so role/identity cannot be forged
+    const existingById = await findDbUserByIdLive(user.id);
+    const sanitizedMobile = sanitizeMobile(user.mobile_number || "");
+    const existingByMobile = !existingById && sanitizedMobile ? await findDbUserByMobileLive(sanitizedMobile) : undefined;
+    const authoritative = existingById || existingByMobile;
 
-    // Create / activate session in backend memory map
-    const sessionData = {
-      userId: savedUser.id,
-      role: savedUser.role,
-      tenantId: savedUser.tenant_id || "tenant_ms_enterprises",
-      created_at: Date.now(),
-      expires_at: Date.now() + 24 * 60 * 60 * 1000
-    };
-    // Register token in session map
-    createSession(savedUser);
+    if (!authoritative) {
+      return res.status(404).json({
+        success: false,
+        error: "User account not found in database. Please re-login."
+      });
+    }
 
-    console.log(`[AUTH AUDIT] Session synchronized for ${savedUser.name} (${savedUser.role}) - ID: ${savedUser.id}`);
+    const clientPlatform = String(client_platform || req.headers["x-client-platform"] || "WEB").toUpperCase();
+    if (clientPlatform !== "MOBILE_APP" && isMobileOnlyRole(authoritative.role)) {
+      return res.status(403).json({
+        success: false,
+        code: "WEB_PORTAL_ACCESS_DENIED",
+        error: getWebPortalBlockedMessage(authoritative.role)
+      });
+    }
+
+    // Issue a signed server session token bound to authoritative user state
+    const session = createSession(authoritative);
+
+    console.log(`[AUTH AUDIT] Signed session synchronized for ${authoritative.name} (${authoritative.role}) - ID: ${authoritative.id}`);
 
     return res.json({
       success: true,
-      token: sessionToken,
+      token: session.token,
+      expires_at: new Date(session.expires_at).toISOString(),
       user: {
-        id: savedUser.id,
-        tenant_id: savedUser.tenant_id,
-        name: savedUser.name,
-        email: savedUser.email,
-        mobile_number: savedUser.mobile_number,
-        role: savedUser.role,
-        company_scope: savedUser.company_scope,
-        dispatch_point_id: savedUser.dispatch_point_id,
-        billing_executive_id: (savedUser as any).billing_executive_id,
-        platform: savedUser.platform
+        id: authoritative.id,
+        tenant_id: authoritative.tenant_id,
+        name: authoritative.name,
+        email: authoritative.email,
+        mobile_number: authoritative.mobile_number,
+        role: authoritative.role,
+        company_scope: authoritative.company_scope,
+        dispatch_point_id: authoritative.dispatch_point_id,
+        billing_executive_id: (authoritative as any).billing_executive_id,
+        platform: getPlatformForRole(authoritative.role),
+        credit_limit: authoritative.credit_limit,
+        current_outstanding: authoritative.current_outstanding,
+        credit_gate_enabled: authoritative.credit_gate_enabled !== false
       }
     });
   });
 
   // 5. GET /api/auth/me
-  app.get("/api/auth/me", (req, res) => {
+  app.get("/api/auth/me", async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({ success: false, error: "No authorization token provided." });
     }
 
-    const token = authHeader.substring(7);
-    let session = getSession(token);
-
-    // If local session token format, recover user session automatically
-    if (!session && token.startsWith("sess_local_")) {
-      const parts = token.split("_");
-      // Format: sess_local_<timestamp>_<userId>
-      const userId = parts.slice(3).join("_");
-      const user = findDbUserById(userId);
-      if (user) {
-        session = {
-          token,
-          userId: user.id,
-          role: user.role,
-          tenant_id: user.tenant_id,
-          mobile_number: user.mobile_number,
-          name: user.name,
-          created_at: Date.now(),
-          expires_at: Date.now() + 24 * 60 * 60 * 1000
-        };
-      }
-    }
+    const token = authHeader.substring(7).trim();
+    const session = getSession(token);
 
     if (!session) {
       return res.status(401).json({ success: false, error: "Session expired or invalid." });
     }
 
-    const user = findDbUserById(session.userId);
+    const user = await findDbUserByIdLive(session.userId);
     if (!user) {
       return res.status(404).json({ success: false, error: "User no longer exists in database." });
     }
+
+    const clientPlatform = String(req.headers["x-client-platform"] || "WEB").toUpperCase();
+    if (clientPlatform !== "MOBILE_APP" && isMobileOnlyRole(user.role)) {
+      return res.status(403).json({
+        success: false,
+        code: "WEB_PORTAL_ACCESS_DENIED",
+        error: getWebPortalBlockedMessage(user.role)
+      });
+    }
+
+    const liveCredit = await getLivePartyCreditProfileFromDb(user.id).catch(() => null);
 
     return res.json({
       success: true,
@@ -618,9 +728,31 @@ async function startServer() {
         company_scope: user.company_scope,
         dispatch_point_id: user.dispatch_point_id,
         billing_executive_id: (user as any).billing_executive_id,
-        platform: user.platform
+        platform: getPlatformForRole(user.role),
+        credit_limit: liveCredit?.credit_limit ?? user.credit_limit,
+        current_outstanding: liveCredit?.current_outstanding ?? user.current_outstanding,
+        utilized_credit: liveCredit?.utilized_credit ?? liveCredit?.current_outstanding ?? user.current_outstanding,
+        available_credit: liveCredit?.available_credit,
+        remaining_credit: liveCredit?.remaining_credit ?? liveCredit?.available_credit,
+        fund_shortage: liveCredit?.fund_shortage ?? liveCredit?.over_limit_amount ?? 0,
+        credit_gate_enabled: user.credit_gate_enabled !== false
       }
     });
+  });
+
+  // GET /api/mobile/credit-profile/:userId - Live Firestore credit limit, outstanding & available credit for Mobile App
+  app.get("/api/mobile/credit-profile/:userId", async (req, res) => {
+    const userId = req.params.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "User ID is required." });
+    }
+
+    const profile = await getLivePartyCreditProfileFromDb(userId);
+    if (!profile) {
+      return res.status(404).json({ success: false, error: "Party profile not found." });
+    }
+
+    return res.json({ success: true, profile });
   });
 
   // 6. POST /api/auth/logout

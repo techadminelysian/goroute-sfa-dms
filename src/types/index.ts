@@ -288,6 +288,10 @@ export interface DistributorInstitution {
   dispatch_point_id?: string | null;
   billing_executive_id?: string | null; // Fixed mapping: Distributor -> Billing Executive (Many-to-One)
   current_outstanding: number;
+  utilized_credit?: number;
+  available_credit?: number;
+  remaining_credit?: number;
+  fund_shortage?: number;
   onboarded_by_role?: string | null;
   onboarded_by_user_id?: string | null;
   created_at?: string;
@@ -332,6 +336,10 @@ export interface Retailer {
   credit_days?: number | null;
   dispatch_point_id?: string | null;
   current_outstanding: number;
+  utilized_credit?: number;
+  available_credit?: number;
+  remaining_credit?: number;
+  fund_shortage?: number;
   onboarded_by_role?: string | null;
   onboarded_by_user_id?: string | null;
   crate_custody_balance?: number; // Running balance of standard crates held
@@ -346,6 +354,7 @@ export type OrderStatus =
   | 'PUNCHED'
   | 'VERIFIED'
   | 'VERIFIED_BY_BILLING'
+  | 'CONFIRMED'
   | 'PO_GENERATED'
   | 'PUNCHED_TO_PRINCIPAL'
   | 'PRINCIPAL_DISPATCHED'
@@ -406,6 +415,8 @@ export interface PrinciplePurchaseOrder {
 export type NotificationType =
   | 'VERIFIED_PARALLEL_ALERT'
   | 'PO_SUBMITTED'
+  | 'ORDER_CONFIRMED_PO_SUBMITTED'
+  | 'ORDER_CONFIRMED_DEPOT_STOCK'
   | 'PRINCIPLE_DISPATCH'
   | 'INWARD_COMPLETED'
   | 'OUTWARD_ALLOCATED'
@@ -505,6 +516,16 @@ export interface Order {
   company_discount_slabs?: Record<string, { company_id: string; company_name: string; slab_name: string; discount_percent: number }>;
   crates_issued?: number;
   crates_returned?: number;
+  fulfillment_source?: 'PRINCIPAL_PO' | 'DEPOT_STOCK' | null;
+  parent_order_id?: string | null;
+  split_sequence?: number;
+  dispatched_at?: string | null;
+  invoiced_at?: string | null;
+  is_credit_note_discount?: boolean;
+  credit_note_discount_amount?: number;
+  credit_note_number?: string | null;
+  credit_note_reason?: string | null;
+  firestore_doc_id?: string;
 }
 
 export type StockEntryType = 'INWARD' | 'DISPATCH_OUT' | 'ADJUSTMENT_DAMAGE' | 'RETURN';
@@ -571,6 +592,10 @@ export interface Invoice {
   e_way_bill_no?: string;
   irn_no?: string;
   zoho_synced?: boolean;
+  is_credit_note_discount?: boolean;
+  credit_note_discount_amount?: number;
+  credit_note_number?: string | null;
+  credit_note_reason?: string | null;
 }
 
 export type ClaimType = 'SCHEME_MARGIN' | 'DAMAGE_EXPIRY' | 'PRICE_DIFFERENCE' | 'PROMOTIONAL';
@@ -644,10 +669,52 @@ export interface User {
   billing_executive_id?: string | null; // Fixed mapping: CFS/Commission Agent, Sales Executive, or Distributor -> Billing Executive (Many-to-One)
   platform: 'WEB' | 'MOBILE';
   is_active?: boolean;
+  credit_limit?: number;
+  current_outstanding?: number;
+  utilized_credit?: number;
+  available_credit?: number;
+  remaining_credit?: number;
+  fund_shortage?: number;
+  credit_gate_enabled?: boolean;
+  distributor_id?: string | null;
   crate_custody_balance?: number; // Running balance of standard crates held in transit/van
   last_crate_return_date?: string | null;
   last_crate_issue_date?: string | null;
   last_login_at?: string;
+  firestore_doc_id?: string;
+}
+
+export type PartyLedgerEntryType =
+  | 'ORDER_DEBIT'
+  | 'ORDER_AMEND_ADJUSTMENT'
+  | 'ORDER_CANCELLATION_REVERSAL'
+  | 'PAYMENT_CREDIT'
+  | 'CREDIT_NOTE_DISCOUNT';
+
+export interface PartyLedgerEntry {
+  id: string;
+  tenant_id: string;
+  party_id: string;
+  party_kind: 'RETAILER' | 'DISTRIBUTOR_INSTITUTION' | 'USER';
+  party_name: string;
+  entry_type: PartyLedgerEntryType;
+  order_id?: string | null;
+  order_number?: string | null;
+  invoice_id?: string | null;
+  invoice_number?: string | null;
+  payment_id?: string | null;
+  debit_amount: number;
+  credit_amount: number;
+  balance_after: number;
+  credit_limit_snapshot: number;
+  remaining_credit_after: number;
+  fund_shortage_after: number;
+  is_credit_note_discount?: boolean;
+  credit_note_number?: string | null;
+  notes?: string;
+  created_by_user_id?: string | null;
+  created_by_name?: string | null;
+  created_at: string;
 }
 
 export interface AuthSession {

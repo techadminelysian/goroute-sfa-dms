@@ -181,15 +181,15 @@ export const BEDistributorOrdersView: React.FC<BEDistributorOrdersViewProps> = (
         <KPICard
           title="Direct Orders Placed"
           value={directOrders.length}
-          delta={{ value: 'Auto-Verified', isPositive: true, label: 'ready for dispatch' }}
+          delta={{ value: 'Universal Queue', isPositive: true, label: 'BE verification required' }}
           icon={ShoppingCart}
-          subtext="Direct BE punch orders"
+          subtext="Direct client punch orders"
           accentColor="#3b82f6"
         />
         <KPICard
           title="Total Order Value"
           value={`₹${totalDirectOrderValue.toLocaleString('en-IN')}`}
-          delta={{ value: 'Bypassed Queue', isPositive: true, label: 'instant verification' }}
+          delta={{ value: 'Full Governance', isPositive: true, label: 'desk verification' }}
           icon={Receipt}
           subtext="Gross commercial billing"
           accentColor="#10b981"
@@ -384,8 +384,10 @@ export const BEDistributorOrdersView: React.FC<BEDistributorOrdersViewProps> = (
                         <td className="p-3 text-center">
                           <span
                             className={`px-2.5 py-1 rounded-full text-[10px] font-bold border inline-flex items-center gap-1 ${
-                              ord.status === 'VERIFIED_BY_BILLING' || ord.status === 'APPROVED'
+                              ord.status === 'CONFIRMED' || ord.status === 'APPROVED' || ord.status === 'PUNCHED_TO_PRINCIPAL'
                                 ? 'bg-emerald-950 text-emerald-300 border-emerald-800/80'
+                                : ord.status === 'VERIFIED' || ord.status === 'VERIFIED_BY_BILLING'
+                                ? 'bg-cyan-950 text-cyan-300 border-cyan-800/80'
                                 : ord.status === 'INVOICED'
                                 ? 'bg-blue-950 text-blue-300 border-blue-800/80'
                                 : 'bg-slate-800 text-slate-300 border-slate-700'
@@ -395,7 +397,7 @@ export const BEDistributorOrdersView: React.FC<BEDistributorOrdersViewProps> = (
                             <span>{ord.status}</span>
                           </span>
                           <span className="block text-[9px] text-slate-500 mt-0.5">
-                            {isDirectBE ? 'BE Auto-Verified' : 'Agent Order'}
+                            {isDirectBE ? 'Direct BE Order' : 'Agent Order'}
                           </span>
                         </td>
 
@@ -408,16 +410,17 @@ export const BEDistributorOrdersView: React.FC<BEDistributorOrdersViewProps> = (
                             >
                               Details
                             </button>
-                            {onNavigateToBilling && (
-                              <button
-                                type="button"
-                                onClick={onNavigateToBilling}
-                                className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
-                              >
-                                <span>Invoice</span>
-                                <ChevronRight size={12} />
-                              </button>
-                            )}
+                            {onNavigateToBilling &&
+                              ['CONFIRMED', 'APPROVED', 'DISPATCHED', 'PUNCHED_TO_PRINCIPAL', 'INVOICED', 'DELIVERED'].includes(ord.status) && (
+                                <button
+                                  type="button"
+                                  onClick={onNavigateToBilling}
+                                  className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                                >
+                                  <span>Invoice</span>
+                                  <ChevronRight size={12} />
+                                </button>
+                              )}
                           </div>
                         </td>
                       </tr>
@@ -567,23 +570,32 @@ export const BEDistributorOrdersView: React.FC<BEDistributorOrdersViewProps> = (
             <div className="space-y-2">
               <div className="text-xs font-semibold text-slate-400 uppercase">Product Lines</div>
               <div className="bg-slate-950 rounded-xl p-2 max-h-56 overflow-y-auto space-y-1 text-xs">
-                {selectedOrderDetail.lines?.map((line, idx) => (
-                  <div
-                    key={idx}
-                    className="p-2 bg-slate-900/60 rounded flex items-center justify-between text-slate-300"
-                  >
-                    <div>
-                      <div className="font-semibold text-white">{line.sku_name}</div>
-                      <div className="text-[10px] text-slate-500">
-                        Qty: {line.quantity} × ₹{line.unit_price}
-                        {line.discount_percentage ? ` (Disc ${line.discount_percentage}%)` : ''}
+                {selectedOrderDetail.lines?.map((line, idx) => {
+                  const skuObj = skus.find((s) => s.id === line.sku_id);
+                  const taxRate = skuObj?.tax_rate !== undefined ? Number(skuObj.tax_rate) : 18;
+                  return (
+                    <div
+                      key={idx}
+                      className="p-2 bg-slate-900/60 rounded flex items-center justify-between text-slate-300"
+                    >
+                      <div>
+                        <div className="font-semibold text-white flex items-center gap-1.5 flex-wrap">
+                          <span>{line.sku_name}</span>
+                          <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono font-bold text-[9px]">
+                            GST {taxRate}%
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-500">
+                          Qty: {line.quantity} × ₹{line.unit_price}
+                          {line.discount_percentage ? ` (Disc ${line.discount_percentage}%)` : ''}
+                        </div>
+                      </div>
+                      <div className="font-mono font-bold text-emerald-400">
+                        ₹{Math.round(line.total).toLocaleString('en-IN')}
                       </div>
                     </div>
-                    <div className="font-mono font-bold text-emerald-400">
-                      ₹{Math.round(line.total).toLocaleString('en-IN')}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 

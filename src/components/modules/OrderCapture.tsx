@@ -6,6 +6,11 @@ import { StoreOnboardSuccessModal } from '../common/StoreOnboardSuccessModal';
 import { BEDistributorOrdersView } from './BEDistributorOrdersView';
 import { getOrderFinancialSummary } from '../../utils/caRoutingLogic';
 import {
+  getDepotAvailableStockMap,
+  evaluateOrdersAgainstDepotStock,
+  OrderDepotEvaluation,
+} from '../../utils/stockAvailability';
+import {
   validateGSTIN,
   validatePhoneNumber,
   validateStoreName,
@@ -40,7 +45,10 @@ import {
   AlertCircle,
   ShieldCheck,
   Truck,
-  Lock
+  Lock,
+  Warehouse,
+  GitBranch,
+  X
 } from 'lucide-react';
 
 interface AuditBatchLog {
@@ -67,12 +75,16 @@ export const OrderCapture: React.FC = () => {
     beats,
     orders,
     purchaseOrders,
+    stockLedger,
     workflowNotifications,
     users,
+    currentUser,
     addOrder,
     updateOrder,
     updateOrderStatus,
     addPurchaseOrder,
+    confirmOrdersFromDepotStock,
+    splitAndConfirmOrderFromDepotStock,
     updatePurchaseOrderStatus,
     verifyPORates,
     markNotificationAsRead,
@@ -100,6 +112,13 @@ export const OrderCapture: React.FC = () => {
       total_landing_amount: number;
       verified: boolean;
     }[];
+  } | null>(null);
+
+  // Depot Stock Fast-Track & Partial Split Modal State
+  const [depotStockModal, setDepotStockModal] = useState<{
+    company: typeof companies[0];
+    eligibleOrders: Order[];
+    evaluations: Record<string, OrderDepotEvaluation>;
   } | null>(null);
 
   const [poStatusFilter, setPoStatusFilter] = useState<string>('ALL');
@@ -199,18 +218,15 @@ export const OrderCapture: React.FC = () => {
       if (!matchesCompany) return false;
 
       if (compilationStatusScope === 'VERIFIED_ONLY') {
-        return (
-          o.status === 'VERIFIED_BY_BILLING' ||
-          o.status === 'APPROVED' ||
-          o.status === 'INVOICED' ||
-          o.status === 'CLEARED'
-        );
+        return o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING';
       } else if (compilationStatusScope === 'ALL_CLEARED') {
         return (
+          o.status === 'VERIFIED' ||
           o.status === 'VERIFIED_BY_BILLING' ||
+          o.status === 'CONFIRMED' ||
           o.status === 'APPROVED' ||
-          o.status === 'CLEARED' ||
-          o.status === 'INVOICED'
+          o.status === 'INVOICED' ||
+          o.status === 'PUNCHED_TO_PRINCIPAL'
         );
       } else {
         return o.status !== 'FLAGGED' && o.status !== 'CANCELLED';
@@ -253,9 +269,11 @@ export const OrderCapture: React.FC = () => {
   const totalCapturedCount = orders.length;
   const pendingReviewCount = orders.filter((o) => o.status === 'PUNCHED' || o.status === 'PENDING_VERIFICATION').length;
   const verifiedByBillingCount = orders.filter(
-    (o) => o.status === 'VERIFIED_BY_BILLING' || o.status === 'INVOICED' || o.status === 'APPROVED'
+    (o) => o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING'
   ).length;
-  const clearedCount = orders.filter((o) => o.status === 'CLEARED' || o.status === 'APPROVED' || o.status === 'VERIFIED_BY_BILLING').length;
+  const clearedCount = orders.filter((o) =>
+    ['VERIFIED', 'VERIFIED_BY_BILLING', 'CONFIRMED', 'APPROVED', 'INVOICED', 'PUNCHED_TO_PRINCIPAL'].includes(o.status)
+  ).length;
   const flaggedCount = orders.filter((o) => o.status === 'FLAGGED' || o.has_below_cost_lines).length;
   const distributorOrdersCount = orders.filter(
     (o) =>
@@ -375,7 +393,7 @@ export const OrderCapture: React.FC = () => {
     link.click();
     document.body.removeChild(link);
 
-    // Record Audit Log
+    // Record Audit Log (PO CSV export does not bypass Principal PO submission)
     const newLog: AuditBatchLog = {
       id: `log_${Date.now()}`,
       timestamp: new Date().toLocaleString(),
@@ -390,12 +408,7 @@ export const OrderCapture: React.FC = () => {
     };
     setAuditLogs([newLog, ...auditLogs]);
 
-    // Update status to PUNCHED_TO_PRINCIPAL
-    companyOrders.forEach((o) => {
-      updateOrderStatus(o.id, 'PUNCHED_TO_PRINCIPAL');
-    });
-
-    alert(`Successfully generated and downloaded ${filename} (${companyOrders.length} verified store orders) for ${comp.name} portal upload!\nAll ${companyOrders.length} orders updated to "PUNCHED TO PRINCIPAL COMPANY".`);
+    alert(`Successfully generated and downloaded ${filename} (${companyOrders.length} store orders) for ${comp.name}.\nClick "Submit Principle PO" to transition orders to CONFIRMED.`);
   };
 
   // 2. EXPORT STORE-WISE ITEMIZED LINES CSV FOR A COMPANY
@@ -637,83 +650,172 @@ export const OrderCapture: React.FC = () => {
     alert(`Exported Master Store-Wise Verified Lines CSV (${filename}) successfully!`);
   };
 
-  // 6. DIRECTLY MARK ORDERS AS PUNCHED TO PRINCIPAL COMPANY (BATCH / COMPILED LEVEL)
+  // 6. SUBMIT CONSOLIDATED BATCH AS PRINCIPLE PO -> TRANSITION TO CONFIRMED
   const handleMarkAsPunchedToPrincipal = (comp: typeof companies[0], companyOrders: Order[]) => {
-    if (companyOrders.length === 0) {
-      alert(`No compiled orders available to mark as punched for ${comp.name}`);
+    const eligibleOrders = companyOrders.filter(
+      (o) => o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING'
+    );
+    if (eligibleOrders.length === 0) {
+      alert(`No VERIFIED orders available to submit Principal PO for ${comp.name}`);
       return;
     }
 
-    const targetOrders = companyOrders.filter((o) => o.status !== 'PUNCHED_TO_PRINCIPAL');
-    const ordersToUpdate = targetOrders.length > 0 ? targetOrders : companyOrders;
-
-    ordersToUpdate.forEach((o) => {
-      updateOrderStatus(o.id, 'PUNCHED_TO_PRINCIPAL');
+    const skuQtyMap: Record<string, { sku_id: string; code: string; name: string; pack: string; qty: number; landing: number }> = {};
+    eligibleOrders.forEach((o) => {
+      (o.lines || [])
+        .filter((l) => l.company_id === comp.id || getCompanyForSku(l.sku_id)?.id === comp.id)
+        .forEach((l) => {
+          const skuObj = skus.find((s) => s.id === l.sku_id);
+          if (!skuQtyMap[l.sku_id]) {
+            skuQtyMap[l.sku_id] = {
+              sku_id: l.sku_id,
+              code: skuObj?.code || 'SKU-00',
+              name: l.sku_name,
+              pack: skuObj?.pack_size || '1x12',
+              qty: 0,
+              landing: skuObj?.landing_price || l.unit_price * 0.85,
+            };
+          }
+          skuQtyMap[l.sku_id].qty += l.verified_quantity ?? l.quantity;
+        });
     });
 
-    // Record Audit Log
+    const items = Object.values(skuQtyMap).map((it) => ({
+      sku_id: it.sku_id,
+      sku_code: it.code,
+      sku_name: it.name,
+      pack_size: it.pack,
+      total_quantity: it.qty,
+      demanded_quantity: it.qty,
+      purchase_price: it.landing,
+      master_landing_price: it.landing,
+      total_amount: it.qty * it.landing,
+      verified_rate: true,
+      is_rate_verified: true,
+    }));
+    const poNumber = `PO-${comp.code}-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`;
+    const totalQty = items.reduce((s, i) => s + i.total_quantity, 0);
+    const totalVal = items.reduce((s, i) => s + i.total_amount, 0);
+
+    addPurchaseOrder({
+      id: `po_${Date.now()}_${comp.code.toLowerCase()}`,
+      tenant_id: activeTenant?.id || 't1',
+      po_number: poNumber,
+      company_id: comp.id,
+      company_name: comp.name,
+      company_code: comp.code,
+      status: 'SUBMITTED_TO_PRINCIPLE',
+      gate_verified_by: currentUser?.name || 'Order Puncher',
+      items,
+      total_quantity: totalQty,
+      total_amount: totalVal,
+      created_at: new Date().toISOString(),
+      submitted_at: new Date().toISOString(),
+      linked_order_ids: eligibleOrders.map((o) => o.id),
+      notes: `Batch PO submitted for ${eligibleOrders.length} verified store order(s).`,
+    });
+
     const newLog: AuditBatchLog = {
       id: `log_${Date.now()}`,
       timestamp: new Date().toLocaleString(),
       company_name: comp.name,
       company_code: comp.code,
-      order_count: ordersToUpdate.length,
-      sku_count: 0,
-      total_quantity: ordersToUpdate.reduce((s, o) => {
-        const compLines = (o.lines || []).filter((l) => l.company_id === comp.id || getCompanyForSku(l.sku_id)?.id === comp.id);
-        return s + compLines.reduce((q, l) => q + l.quantity, 0);
-      }, 0),
-      total_value: ordersToUpdate.reduce((s, o) => {
-        const compLines = (o.lines || []).filter((l) => l.company_id === comp.id || getCompanyForSku(l.sku_id)?.id === comp.id);
-        return s + compLines.reduce((q, l) => q + l.total, 0);
-      }, 0),
-      exported_by: 'Order Puncher / Sub-Admin (Company Batch Punch)',
-      file_name: 'Status Marked: PUNCHED_TO_PRINCIPAL',
+      order_count: eligibleOrders.length,
+      sku_count: items.length,
+      total_quantity: totalQty,
+      total_value: totalVal,
+      exported_by: currentUser?.name || 'Order Puncher (Company Batch PO)',
+      file_name: `PO ${poNumber} -> Status: CONFIRMED`,
     };
     setAuditLogs([newLog, ...auditLogs]);
 
-    alert(`Marked compiled batch of ${ordersToUpdate.length} store order(s) for ${comp.name} as "PUNCHED TO PRINCIPAL COMPANY".\n\nAll underlying Commission Agent and Sub-Distributor store orders have automatically updated to "Punched to Principal".`);
+    alert(`Submitted Principle PO ${poNumber} for ${comp.name}!\n\nAll ${eligibleOrders.length} store order(s) transitioned to CONFIRMED and are now visible in Dispatch Sheet & Mobile Dispatcher App.`);
   };
 
-  // 7. BATCH PUNCH ALL VERIFIED ORDERS ACROSS ALL PRINCIPAL COMPANIES AT ONCE
+  // 7. BATCH SUBMIT PRINCIPLE POs ACROSS ALL COMPANIES FOR VERIFIED ORDERS
   const handlePunchAllCompaniesBatch = () => {
-    let totalPunched = 0;
+    let totalConfirmed = 0;
     companies.forEach((comp) => {
-      const companyOrders = getCompanyCompilationOrders(comp).filter(
-        (o) => o.status !== 'PUNCHED_TO_PRINCIPAL' && o.status !== 'CANCELLED' && o.status !== 'FLAGGED'
+      const eligibleOrders = getCompanyCompilationOrders(comp).filter(
+        (o) => o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING'
       );
-      if (companyOrders.length > 0) {
-        companyOrders.forEach((o) => {
-          updateOrderStatus(o.id, 'PUNCHED_TO_PRINCIPAL');
-          totalPunched++;
+      if (eligibleOrders.length > 0) {
+        const skuQtyMap: Record<string, { sku_id: string; code: string; name: string; pack: string; qty: number; landing: number }> = {};
+        eligibleOrders.forEach((o) => {
+          (o.lines || [])
+            .filter((l) => l.company_id === comp.id || getCompanyForSku(l.sku_id)?.id === comp.id)
+            .forEach((l) => {
+              const skuObj = skus.find((s) => s.id === l.sku_id);
+              if (!skuQtyMap[l.sku_id]) {
+                skuQtyMap[l.sku_id] = {
+                  sku_id: l.sku_id,
+                  code: skuObj?.code || 'SKU-00',
+                  name: l.sku_name,
+                  pack: skuObj?.pack_size || '1x12',
+                  qty: 0,
+                  landing: skuObj?.landing_price || l.unit_price * 0.85,
+                };
+              }
+              skuQtyMap[l.sku_id].qty += l.verified_quantity ?? l.quantity;
+            });
         });
+
+        const items = Object.values(skuQtyMap).map((it) => ({
+          sku_id: it.sku_id,
+          sku_code: it.code,
+          sku_name: it.name,
+          pack_size: it.pack,
+          total_quantity: it.qty,
+          demanded_quantity: it.qty,
+          purchase_price: it.landing,
+          master_landing_price: it.landing,
+          total_amount: it.qty * it.landing,
+          verified_rate: true,
+          is_rate_verified: true,
+        }));
+        const poNumber = `PO-${comp.code}-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`;
+        const totalQty = items.reduce((s, i) => s + i.total_quantity, 0);
+        const totalVal = items.reduce((s, i) => s + i.total_amount, 0);
+
+        addPurchaseOrder({
+          id: `po_${Date.now()}_${comp.code.toLowerCase()}`,
+          tenant_id: activeTenant?.id || 't1',
+          po_number: poNumber,
+          company_id: comp.id,
+          company_name: comp.name,
+          company_code: comp.code,
+          status: 'SUBMITTED_TO_PRINCIPLE',
+          gate_verified_by: currentUser?.name || 'Order Puncher',
+          items,
+          total_quantity: totalQty,
+          total_amount: totalVal,
+          created_at: new Date().toISOString(),
+          submitted_at: new Date().toISOString(),
+          linked_order_ids: eligibleOrders.map((o) => o.id),
+          notes: `Batch PO across all companies (${eligibleOrders.length} store orders).`,
+        });
+        totalConfirmed += eligibleOrders.length;
 
         const newLog: AuditBatchLog = {
           id: `log_${Date.now()}_${comp.code}`,
           timestamp: new Date().toLocaleString(),
           company_name: comp.name,
           company_code: comp.code,
-          order_count: companyOrders.length,
-          sku_count: 0,
-          total_quantity: companyOrders.reduce((s, o) => {
-            const compLines = (o.lines || []).filter((l) => l.company_id === comp.id || getCompanyForSku(l.sku_id)?.id === comp.id);
-            return s + compLines.reduce((q, l) => q + l.quantity, 0);
-          }, 0),
-          total_value: companyOrders.reduce((s, o) => {
-            const compLines = (o.lines || []).filter((l) => l.company_id === comp.id || getCompanyForSku(l.sku_id)?.id === comp.id);
-            return s + compLines.reduce((q, l) => q + l.total, 0);
-          }, 0),
-          exported_by: 'Order Puncher / Sub-Admin (All-Company Batch Punch)',
-          file_name: 'Status Marked: PUNCHED_TO_PRINCIPAL',
+          order_count: eligibleOrders.length,
+          sku_count: items.length,
+          total_quantity: totalQty,
+          total_value: totalVal,
+          exported_by: currentUser?.name || 'Order Puncher (All-Company Batch PO)',
+          file_name: `PO ${poNumber} -> Status: CONFIRMED`,
         };
         setAuditLogs((prev) => [newLog, ...prev]);
       }
     });
 
-    if (totalPunched === 0) {
-      alert('No pending verified orders found to punch across any principal company.');
+    if (totalConfirmed === 0) {
+      alert('No pending VERIFIED orders found to submit PO across any principal company.');
     } else {
-      alert(`Successfully punched ${totalPunched} compiled order(s) across all Principal Companies to the Principal Portal!\n\nAll Commission Agents and Sub-Distributors will now see their orders marked as "PUNCHED TO PRINCIPAL".`);
+      alert(`Successfully submitted Principal POs for ${totalConfirmed} VERIFIED order(s)!\n\nAll linked orders transitioned to CONFIRMED and auto-published to Dispatch Sheet, Dispatcher App & Invoicing.`);
     }
   };
 
@@ -1060,14 +1162,13 @@ export const OrderCapture: React.FC = () => {
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-white font-semibold"
                 >
                   <option value="ALL">All Statuses</option>
-                  <option value="PENDING_VERIFICATION">PENDING_VERIFICATION (Agent Punched)</option>
-                  <option value="PUNCHED">PUNCHED (Awaiting Review)</option>
-                  <option value="VERIFIED_BY_BILLING">VERIFIED_BY_BILLING</option>
-                  <option value="CLEARED">CLEARED (Sanity Passed)</option>
-                  <option value="FLAGGED">FLAGGED (Sanity Exception)</option>
-                  <option value="APPROVED">APPROVED (Compiled & Exported)</option>
-                  <option value="PUNCHED_TO_PRINCIPAL">PUNCHED TO PRINCIPAL</option>
+                  <option value="PENDING_VERIFICATION">PENDING_VERIFICATION (Awaiting BE)</option>
+                  <option value="VERIFIED">VERIFIED (Awaiting PO / Depot Stock)</option>
+                  <option value="CONFIRMED">CONFIRMED (PO / Depot Stock Ready)</option>
+                  <option value="INVOICED">INVOICED</option>
+                  <option value="DISPATCHED">DISPATCHED</option>
                   <option value="DELIVERED">DELIVERED</option>
+                  <option value="CANCELLED">CANCELLED</option>
                 </select>
               </div>
             </div>
@@ -1255,23 +1356,27 @@ export const OrderCapture: React.FC = () => {
                             <div className="flex flex-col gap-0.5">
                               <span
                                 className={`px-2 py-0.5 rounded-full text-[10px] font-bold inline-block w-max ${
-                                  o.status === 'PUNCHED_TO_PRINCIPAL'
+                                  o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL'
                                     ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
-                                    : o.status === 'VERIFIED_BY_BILLING'
+                                    : o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING'
                                     ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
                                     : o.status === 'CLEARED'
                                     ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                    : o.status === 'FLAGGED'
+                                    : o.status === 'FLAGGED' || o.status === 'CANCELLED'
                                     ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                                    : o.status === 'APPROVED'
+                                    : o.status === 'APPROVED' || o.status === 'INVOICED' || o.status === 'DISPATCHED'
                                     ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
                                     : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                                 }`}
                               >
-                                {o.status === 'PUNCHED_TO_PRINCIPAL'
-                                  ? 'PUNCHED TO PRINCIPAL'
+                                {o.status === 'CONFIRMED'
+                                  ? o.fulfillment_source === 'DEPOT_STOCK'
+                                    ? 'CONFIRMED (DEPOT STOCK)'
+                                    : 'CONFIRMED (PO)'
+                                  : o.status === 'PUNCHED_TO_PRINCIPAL'
+                                  ? 'CONFIRMED (PO)'
                                   : o.status === 'PUNCHED'
-                                  ? 'Awaiting Sanity Check'
+                                  ? 'Awaiting BE Verification'
                                   : o.status}
                               </span>
                               {o.exception_comment && (
@@ -1294,9 +1399,9 @@ export const OrderCapture: React.FC = () => {
                               <span className="px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold text-[10px] inline-flex items-center gap-1">
                                 <CheckCircle2 size={11} className="text-emerald-400" /> Delivered
                               </span>
-                            ) : o.status === 'PENDING_VERIFICATION' || o.status === 'PUNCHED' ? (
+                            ) : o.status === 'PENDING_VERIFICATION' || o.status === 'PUNCHED' || o.status === 'CLEARED' || o.status === 'FLAGGED' ? (
                               <span
-                                title="Delivery Locked: Billing Executive must verify this order before Commission Agent can mark delivered"
+                                title="Delivery Locked: Billing Executive must verify this order before downstream processing"
                                 className="px-2 py-1 rounded bg-slate-800/80 text-slate-500 border border-slate-700 text-[10px] font-semibold cursor-not-allowed inline-flex items-center gap-1"
                               >
                                 <Lock size={10} /> Pending Verification
@@ -1314,9 +1419,9 @@ export const OrderCapture: React.FC = () => {
                               </button>
                             )}
 
-                            {o.status === 'PUNCHED_TO_PRINCIPAL' ? (
+                            {o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL' ? (
                               <span className="px-2 py-1 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-bold text-[10px] inline-flex items-center gap-1">
-                                <CheckCircle2 size={11} className="text-indigo-400" /> Punched in Batch
+                                <CheckCircle2 size={11} className="text-indigo-400" /> Confirmed
                               </span>
                             ) : (
                               <button
@@ -1325,35 +1430,27 @@ export const OrderCapture: React.FC = () => {
                                   setExpandedCompanyId(distinctCompIds[0] || o.company_id);
                                 }}
                                 className="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800/60 text-indigo-200 border border-indigo-700/50 text-[10px] font-bold"
-                                title="Punching is done at the compiled Principal Company level. Click to open Company Batch compilation."
+                                title="Consolidate for Principal PO or confirm from Depot Stock."
                               >
-                                Company Batch Punch →
+                                Compile / Confirm →
                               </button>
                             )}
 
-                            {o.status === 'PUNCHED' && (
-                              <>
-                                <button
-                                  onClick={() => handleMarkCleared(o.id)}
-                                  className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold"
-                                >
-                                  Clear
-                                </button>
-                                <button
-                                  onClick={() => setFlaggingOrder(o)}
-                                  className="px-2 py-1 rounded bg-rose-900/60 hover:bg-rose-800 text-rose-200 border border-rose-700 text-[10px] font-semibold"
-                                >
-                                  Flag
-                                </button>
-                              </>
+                            {(o.status === 'PUNCHED' || o.status === 'PENDING_VERIFICATION') && (
+                              <button
+                                onClick={() => setFlaggingOrder(o)}
+                                className="px-2 py-1 rounded bg-rose-900/60 hover:bg-rose-800 text-rose-200 border border-rose-700 text-[10px] font-semibold"
+                              >
+                                Flag
+                              </button>
                             )}
 
                             {o.status === 'FLAGGED' && (
                               <button
-                                onClick={() => updateOrderStatus(o.id, 'CLEARED')}
+                                onClick={() => updateOrderStatus(o.id, 'PENDING_VERIFICATION')}
                                 className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-bold"
                               >
-                                Resolve
+                                Return to Pending
                               </button>
                             )}
                           </td>
@@ -1471,12 +1568,37 @@ export const OrderCapture: React.FC = () => {
           <div className="space-y-6">
             {companies.map((comp) => {
               const companyOrders = getCompanyCompilationOrders(comp);
+              const verifiedCompanyOrders = companyOrders.filter(
+                (o) => o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING'
+              );
+              const depotEvals = evaluateOrdersAgainstDepotStock(
+                verifiedCompanyOrders,
+                comp.id,
+                stockLedger,
+                orders,
+                skus
+              );
+              const fullStockOrderCount = Object.values(depotEvals).filter((e) => e.status === 'FULL_STOCK').length;
+              const partialStockOrderCount = Object.values(depotEvals).filter((e) => e.status === 'PARTIAL_STOCK').length;
+              const hasAnyDepotStock = fullStockOrderCount > 0 || partialStockOrderCount > 0;
 
               // Build SKU aggregation (strictly filtered for this company's lines)
               const skuAggMap: Record<
                 string,
-                { code: string; name: string; pack: string; quantity: number; unit_price: number; total: number }
+                { skuId: string; code: string; name: string; pack: string; quantity: number; unit_price: number; total: number; depotAvail: number }
               > = {};
+
+              // Pre-compute combined available depot stock across depots represented in companyOrders
+              const representedDepots = Array.from(
+                new Set(companyOrders.map((o) => o.dispatch_point_id || 'dp_sahibabad'))
+              );
+              const skuDepotAvailSum: Record<string, number> = {};
+              representedDepots.forEach((dpId) => {
+                const dpMap = getDepotAvailableStockMap(dpId, stockLedger, orders);
+                Object.entries(dpMap).forEach(([skuId, info]) => {
+                  skuDepotAvailSum[skuId] = (skuDepotAvailSum[skuId] || 0) + info.availableForConfirmation;
+                });
+              });
 
               companyOrders.forEach((o) => {
                 const compLines = (o.lines || []).filter(
@@ -1486,15 +1608,18 @@ export const OrderCapture: React.FC = () => {
                   const skuObj = skus.find((s) => s.id === l.sku_id);
                   if (!skuAggMap[l.sku_id]) {
                     skuAggMap[l.sku_id] = {
+                      skuId: l.sku_id,
                       code: skuObj?.code || 'SKU-00',
                       name: l.sku_name,
                       pack: skuObj?.pack_size || '1x12',
                       quantity: 0,
                       unit_price: l.unit_price,
                       total: 0,
+                      depotAvail: skuDepotAvailSum[l.sku_id] || 0,
                     };
                   }
-                  skuAggMap[l.sku_id].quantity += l.quantity;
+                  const qty = l.verified_quantity ?? l.quantity;
+                  skuAggMap[l.sku_id].quantity += qty;
                   skuAggMap[l.sku_id].total += l.total;
                 });
               });
@@ -1520,7 +1645,12 @@ export const OrderCapture: React.FC = () => {
                           </span>
                         </h3>
                         <p className="text-xs text-slate-400 mt-0.5">
-                          <span className="text-emerald-400 font-bold">{companyOrders.length} Verified Store Orders</span> | {skuList.length} Unique SKUs | Total PO Gross Value: <span className="text-white font-semibold">₹{totalCompanyVal.toLocaleString('en-IN')}</span>
+                          <span className="text-emerald-400 font-bold">{companyOrders.length} Store Orders</span> ({verifiedCompanyOrders.length} Ready for Confirmation) | {skuList.length} Unique SKUs | Total Value: <span className="text-white font-semibold">₹{totalCompanyVal.toLocaleString('en-IN')}</span>
+                          {hasAnyDepotStock && (
+                            <span className="ml-2 text-emerald-300 font-semibold">
+                              • Depot Stock Ready: {fullStockOrderCount} Full{partialStockOrderCount > 0 ? `, ${partialStockOrderCount} Partial` : ''}
+                            </span>
+                          )}
                         </p>
                       </div>
                     </div>
@@ -1545,7 +1675,7 @@ export const OrderCapture: React.FC = () => {
                           });
                           setRateVerifyModal({
                             company: comp,
-                            orders: companyOrders,
+                            orders: verifiedCompanyOrders.length > 0 ? verifiedCompanyOrders : companyOrders,
                             items,
                           });
                         }}
@@ -1554,9 +1684,44 @@ export const OrderCapture: React.FC = () => {
                       >
                         <ShieldCheck size={14} /> Verify Rates & Quantities (Gate)
                       </button>
+
+                      {/* Feature Addition: Fast-Track Confirmation from Existing Depot Stock */}
                       <button
                         onClick={() => {
-                          if (companyOrders.length === 0) {
+                          if (verifiedCompanyOrders.length === 0) {
+                            alert('No VERIFIED orders available to confirm from Depot Stock.');
+                            return;
+                          }
+                          setDepotStockModal({
+                            company: comp,
+                            eligibleOrders: verifiedCompanyOrders,
+                            evaluations: depotEvals,
+                          });
+                        }}
+                        disabled={!hasAnyDepotStock || verifiedCompanyOrders.length === 0}
+                        className={`px-3.5 py-1.5 rounded-xl font-bold text-xs flex items-center gap-1.5 shadow-md transition-all ${
+                          hasAnyDepotStock && verifiedCompanyOrders.length > 0
+                            ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-900/30'
+                            : 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed'
+                        }`}
+                        title={
+                          hasAnyDepotStock
+                            ? 'Fast-track VERIFIED orders to CONFIRMED directly from available depot stock (supports partial split)'
+                            : 'Insufficient live depot stock for verified orders'
+                        }
+                      >
+                        <Warehouse size={14} /> Confirm from Depot Stock
+                        {hasAnyDepotStock && (
+                          <span className="px-1.5 py-0.2 rounded bg-emerald-950/60 text-emerald-200 text-[10px]">
+                            {fullStockOrderCount + partialStockOrderCount}
+                          </span>
+                        )}
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          const targetOrders = verifiedCompanyOrders.length > 0 ? verifiedCompanyOrders : companyOrders;
+                          if (targetOrders.length === 0) {
                             alert('No verified store orders to generate PO.');
                             return;
                           }
@@ -1589,22 +1754,17 @@ export const OrderCapture: React.FC = () => {
                             company_name: comp.name,
                             company_code: comp.code,
                             status: 'SUBMITTED_TO_PRINCIPLE',
-                            gate_verified_by: 'Vikram Singh (Order Puncher)',
+                            gate_verified_by: currentUser?.name || 'Order Puncher',
                             items,
                             total_quantity: totalPOUnits,
                             total_amount: totalPOVal,
                             created_at: new Date().toISOString(),
                             submitted_at: new Date().toISOString(),
-                            linked_order_ids: companyOrders.map((o) => o.id),
-                            notes: `Generated from ${companyOrders.length} verified store orders. Sent to ${comp.name} ERP portal.`,
+                            linked_order_ids: targetOrders.map((o) => o.id),
+                            notes: `Generated from ${targetOrders.length} verified store orders. Sent to ${comp.name} ERP portal.`,
                           });
 
-                          // Update linked store orders
-                          companyOrders.forEach((o) => {
-                            updateOrderStatus(o.id, 'PUNCHED_TO_PRINCIPAL');
-                          });
-
-                          alert(`✅ Principle Purchase Order ${poNumber} submitted to ${comp.name}!\n\n• ${items.length} SKUs\n• ${totalPOUnits.toLocaleString()} units\n• ₹${totalPOVal.toLocaleString('en-IN')} Landing Value\n\nOrders updated to PUNCHED TO PRINCIPAL.`);
+                          alert(`Principle Purchase Order ${poNumber} submitted to ${comp.name}!\n\n• ${items.length} SKUs\n• ${totalPOUnits.toLocaleString()} units\n• ₹${totalPOVal.toLocaleString('en-IN')} Landing Value\n\nAll ${targetOrders.length} linked order(s) updated to CONFIRMED and synced to Dispatch & Invoicing.`);
                         }}
                         className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-blue-900/30"
                         title="Generate and submit PO to Principle Company"
@@ -1613,7 +1773,7 @@ export const OrderCapture: React.FC = () => {
                       </button>
                       <button
                         onClick={() => handleExportCompanyCsv(comp, companyOrders)}
-                        className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center gap-1.5"
+                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-500/30 font-semibold text-xs flex items-center gap-1.5"
                         title="Download primary purchase order CSV aggregated SKU-wise"
                       >
                         <Download size={14} /> Export PO (CSV)
@@ -1650,6 +1810,7 @@ export const OrderCapture: React.FC = () => {
                               <th className="py-2.5 px-3">Product Description</th>
                               <th className="py-2.5 px-3">Pack Size</th>
                               <th className="py-2.5 px-3 text-right">Consolidated Qty (pcs)</th>
+                              <th className="py-2.5 px-3 text-right">Depot Avail (Live)</th>
                               <th className="py-2.5 px-3 text-right">Rate (₹)</th>
                               <th className="py-2.5 px-3 text-right">Total Gross Value (₹)</th>
                             </tr>
@@ -1661,6 +1822,19 @@ export const OrderCapture: React.FC = () => {
                                 <td className="py-2 px-3 font-sans font-semibold text-white">{item.name}</td>
                                 <td className="py-2 px-3 font-sans text-slate-400">{item.pack}</td>
                                 <td className="py-2 px-3 text-right font-bold text-amber-300">{item.quantity.toLocaleString()}</td>
+                                <td className="py-2 px-3 text-right font-bold">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] border ${
+                                      item.depotAvail >= item.quantity
+                                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                        : item.depotAvail > 0
+                                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                        : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                                    }`}
+                                  >
+                                    {item.depotAvail.toLocaleString()} pcs
+                                  </span>
+                                </td>
                                 <td className="py-2 px-3 text-right text-slate-300">₹{item.unit_price}</td>
                                 <td className="py-2 px-3 text-right font-bold text-emerald-400">₹{item.total.toLocaleString('en-IN')}</td>
                               </tr>
@@ -1672,6 +1846,7 @@ export const OrderCapture: React.FC = () => {
                               <td className="py-3 px-3 text-right font-mono text-amber-300 text-sm">
                                 {totalCompanyQty.toLocaleString()} pcs
                               </td>
+                              <td className="py-3 px-3"></td>
                               <td className="py-3 px-3"></td>
                               <td className="py-3 px-3 text-right font-mono text-emerald-400 text-sm">
                                 ₹{totalCompanyVal.toLocaleString('en-IN')}
@@ -1701,6 +1876,8 @@ export const OrderCapture: React.FC = () => {
                               );
                               const compQty = compLines.reduce((s, l) => s + l.quantity, 0);
                               const compVal = compLines.reduce((s, l) => s + l.total, 0);
+                              const stockEval = depotEvals[ord.id];
+                              const isVerStatus = ord.status === 'VERIFIED' || ord.status === 'VERIFIED_BY_BILLING';
 
                               return (
                                 <div
@@ -1708,12 +1885,29 @@ export const OrderCapture: React.FC = () => {
                                   className="bg-slate-900 border border-slate-800 p-3 rounded-lg flex flex-wrap items-center justify-between gap-3 text-xs"
                                 >
                                   <div>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
                                       <span className="font-mono font-bold text-blue-400">{ord.order_number}</span>
                                       <span className="text-slate-400">({ord.order_date})</span>
                                       <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-bold text-[10px]">
-                                        {ord.status === 'VERIFIED_BY_BILLING' ? 'VERIFIED BY BILLING' : ord.status}
+                                        {ord.status}
                                       </span>
+                                      {isVerStatus && stockEval && (
+                                        <span
+                                          className={`px-2 py-0.5 rounded font-bold text-[10px] border ${
+                                            stockEval.status === 'FULL_STOCK'
+                                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                              : stockEval.status === 'PARTIAL_STOCK'
+                                              ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                              : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                                          }`}
+                                        >
+                                          {stockEval.status === 'FULL_STOCK'
+                                            ? 'Depot: Full Stock'
+                                            : stockEval.status === 'PARTIAL_STOCK'
+                                            ? `Depot: Partial (${stockEval.totalFulfillableQty}/${stockEval.totalOrderedQty})`
+                                            : 'Depot: No Stock (PO Needed)'}
+                                        </span>
+                                      )}
                                       {ord.commission_agent_name && (
                                         <span className="text-[10px] text-slate-400">
                                           Agent: {ord.commission_agent_name}
@@ -1734,13 +1928,33 @@ export const OrderCapture: React.FC = () => {
                                         ₹{compVal.toLocaleString('en-IN')}
                                       </div>
                                     </div>
-                                    <button
-                                      onClick={() => updateOrderStatus(ord.id, 'PUNCHED_TO_PRINCIPAL')}
-                                      className="px-2 py-1 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/30 text-[10px] font-bold"
-                                      title="Mark order as Punched to Principal Company"
-                                    >
-                                      Mark Punched
-                                    </button>
+                                    {isVerStatus && stockEval?.status === 'FULL_STOCK' && !stockEval.isMultiCompanyOrder && (
+                                      <button
+                                        onClick={() => {
+                                          const res = confirmOrdersFromDepotStock([ord.id], currentUser?.name || 'Order Puncher');
+                                          alert(res.message);
+                                        }}
+                                        className="px-2 py-1 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-200 border border-emerald-500/40 text-[10px] font-bold flex items-center gap-1"
+                                        title="Confirm directly from Depot Stock without Principal PO"
+                                      >
+                                        <Warehouse size={11} /> Confirm Stock
+                                      </button>
+                                    )}
+                                    {isVerStatus && stockEval?.status === 'PARTIAL_STOCK' && (
+                                      <button
+                                        onClick={() => {
+                                          setDepotStockModal({
+                                            company: comp,
+                                            eligibleOrders: [ord],
+                                            evaluations: { [ord.id]: stockEval },
+                                          });
+                                        }}
+                                        className="px-2 py-1 rounded-lg bg-amber-600/30 hover:bg-amber-600/50 text-amber-200 border border-amber-500/40 text-[10px] font-bold flex items-center gap-1"
+                                        title="Split available depot stock & route shortage to Principal PO"
+                                      >
+                                        <GitBranch size={11} /> Split Stock / PO
+                                      </button>
+                                    )}
                                     <button
                                       onClick={() => handleOpenOrderDetail(ord)}
                                       className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
@@ -2357,10 +2571,12 @@ export const OrderCapture: React.FC = () => {
                   const isVerifiedByBilling = [
                     'VERIFIED',
                     'VERIFIED_BY_BILLING',
+                    'CONFIRMED',
                     'INVOICED',
                     'DELIVERED',
+                    'PO_GENERATED',
                     'PUNCHED_TO_PRINCIPAL',
-                    'CLEARED',
+                    'PRINCIPAL_DISPATCHED',
                     'APPROVED',
                   ].includes(selectedOrderForDetail.status);
                   const isDelivered = selectedOrderForDetail.status === 'DELIVERED';
@@ -2394,6 +2610,8 @@ export const OrderCapture: React.FC = () => {
                 <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
                   {(selectedOrderForDetail.lines || []).map((l, idx) => {
                     const comp = getCompanyForSku(l.sku_id);
+                    const matchedSku = skus.find((s) => s.id === l.sku_id);
+                    const taxRate = matchedSku?.tax_rate !== undefined ? Number(matchedSku.tax_rate) : 18;
 
                     return (
                       <div
@@ -2401,8 +2619,11 @@ export const OrderCapture: React.FC = () => {
                         className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between"
                       >
                         <div>
-                          <div className="font-bold text-white flex items-center gap-2">
-                            {l.sku_name}
+                          <div className="font-bold text-white flex items-center gap-2 flex-wrap">
+                            <span>{l.sku_name}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono font-bold">
+                              GST {taxRate}%
+                            </span>
                             {comp && (
                               <span className="text-[10px] px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 font-mono font-bold">
                                 {comp.code}
@@ -2423,7 +2644,7 @@ export const OrderCapture: React.FC = () => {
                 </div>
 
                 {(() => {
-                  const fin = getOrderFinancialSummary(selectedOrderForDetail);
+                  const fin = getOrderFinancialSummary(selectedOrderForDetail, skus);
                   return (
                     <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl space-y-2 text-xs">
                       <div className="flex justify-between text-slate-400">
@@ -2433,7 +2654,7 @@ export const OrderCapture: React.FC = () => {
                         </span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Applicable GST (18%):</span>
+                        <span>Applicable GST (Itemized):</span>
                         <span className="font-mono text-amber-300 font-semibold">
                           + ₹{fin.gstAmount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                         </span>
@@ -2458,15 +2679,19 @@ export const OrderCapture: React.FC = () => {
                   const isVerifiedByBilling = [
                     'VERIFIED',
                     'VERIFIED_BY_BILLING',
+                    'CONFIRMED',
                     'INVOICED',
                     'DELIVERED',
+                    'PO_GENERATED',
                     'PUNCHED_TO_PRINCIPAL',
-                    'CLEARED',
+                    'PRINCIPAL_DISPATCHED',
                     'APPROVED',
                   ].includes(selectedOrderForDetail.status);
                   const isPendingVerification =
                     selectedOrderForDetail.status === 'PENDING_VERIFICATION' ||
-                    selectedOrderForDetail.status === 'PUNCHED';
+                    selectedOrderForDetail.status === 'PUNCHED' ||
+                    selectedOrderForDetail.status === 'CLEARED' ||
+                    selectedOrderForDetail.status === 'FLAGGED';
                   const isDelivered = selectedOrderForDetail.status === 'DELIVERED';
 
                   if (isDelivered) {
@@ -2881,7 +3106,7 @@ export const OrderCapture: React.FC = () => {
                     company_name: rateVerifyModal.company.name,
                     company_code: rateVerifyModal.company.code,
                     status: 'SUBMITTED_TO_PRINCIPLE',
-                    gate_verified_by: 'Vikram Singh (Order Puncher)',
+                    gate_verified_by: currentUser?.name || 'Order Puncher',
                     items,
                     total_quantity: totalUnits,
                     total_amount: totalVal,
@@ -2891,11 +3116,7 @@ export const OrderCapture: React.FC = () => {
                     notes: `Verified by Order Puncher Rate Gate. Submitted to ${rateVerifyModal.company.name}.`,
                   });
 
-                  rateVerifyModal.orders.forEach((o) => {
-                    updateOrderStatus(o.id, 'PUNCHED_TO_PRINCIPAL');
-                  });
-
-                  alert(`✅ Rates & Quantities verified! Principle PO ${poNumber} successfully generated and submitted.\n\nAll ${rateVerifyModal.orders.length} store orders updated to PUNCHED TO PRINCIPAL.`);
+                  alert(`Rates & Quantities verified! Principle PO ${poNumber} submitted.\n\nAll ${rateVerifyModal.orders.length} store order(s) updated to CONFIRMED and synced to Dispatch & Invoicing.`);
                   setRateVerifyModal(null);
                   setActiveTab('PRINCIPLE_POS');
                 }}
@@ -2903,6 +3124,165 @@ export const OrderCapture: React.FC = () => {
               >
                 <CheckCircle2 size={15} /> Lock Gate & Submit Principle PO
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FAST-TRACK CONFIRMATION FROM EXISTING DEPOT STOCK & PARTIAL SPLIT MODAL */}
+      {depotStockModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-emerald-500/40 rounded-2xl w-full max-w-3xl p-6 text-slate-200 space-y-4 shadow-2xl my-8">
+            <div className="flex items-start justify-between gap-3 pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-xl bg-emerald-600/20 text-emerald-400 border border-emerald-500/30">
+                  <Warehouse size={20} />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">
+                    Fast-Track Confirmation from Existing Depot Stock ({depotStockModal.company.code})
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Live Stock Check deducts un-dispatched CONFIRMED/INVOICED reservations. Confirm full orders directly or split partial stock & route shortages to Principal PO.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDepotStockModal(null)}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-3 max-h-[55vh] overflow-y-auto pr-1 text-xs">
+              {depotStockModal.eligibleOrders.map((ord) => {
+                const ev = depotStockModal.evaluations[ord.id];
+                if (!ev) return null;
+                const dp = dispatchPoints.find((d) => d.id === ev.dispatchPointId);
+
+                return (
+                  <div
+                    key={ord.id}
+                    className={`p-3.5 rounded-xl border space-y-2.5 bg-slate-950 ${
+                      ev.status === 'FULL_STOCK'
+                        ? 'border-emerald-500/40'
+                        : ev.status === 'PARTIAL_STOCK'
+                        ? 'border-amber-500/40'
+                        : 'border-slate-800 opacity-70'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-white">{ord.order_number}</span>
+                          <span className="text-slate-400">| {ord.retailer_name_raw}</span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                            {dp?.name || ev.dispatchPointId}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-400 mt-0.5">
+                          Total Value: <strong className="text-emerald-400">₹{(ord.total_amount || 0).toLocaleString('en-IN')}</strong>
+                          {' • '}Fulfillable: <strong className="text-white">{ev.totalFulfillableQty} / {ev.totalOrderedQty} pcs</strong>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {ev.status === 'FULL_STOCK' && !ev.isMultiCompanyOrder && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const res = confirmOrdersFromDepotStock([ord.id], currentUser?.name || 'Order Puncher');
+                              alert(res.message);
+                              setDepotStockModal(null);
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5"
+                          >
+                            <CheckCircle2 size={13} /> Confirm Full from Depot Stock
+                          </button>
+                        )}
+                        {(ev.status === 'PARTIAL_STOCK' || (ev.status === 'FULL_STOCK' && ev.isMultiCompanyOrder && ev.totalFulfillableQty > 0)) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const allocMap: Record<string, number> = {};
+                              ev.lines.forEach((l) => {
+                                allocMap[l.lineId] = l.fulfillableQty;
+                              });
+                              const res = splitAndConfirmOrderFromDepotStock(
+                                ord.id,
+                                allocMap,
+                                currentUser?.name || 'Order Puncher'
+                              );
+                              alert(res.message);
+                              setDepotStockModal(null);
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs flex items-center gap-1.5"
+                          >
+                            <GitBranch size={13} /> Split Available ({ev.totalFulfillableQty} pcs) & Route Shortage ({ev.totalShortageQty} pcs) to PO
+                          </button>
+                        )}
+                        {ev.status === 'NO_STOCK' && (
+                          <span className="px-2.5 py-1 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[11px] font-semibold">
+                            No Depot Stock — Use Principal PO
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-2 border-t border-slate-800/80">
+                      {ev.lines.map((l) => (
+                        <div
+                          key={l.lineId}
+                          className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between text-[11px]"
+                        >
+                          <span className="text-slate-200 font-medium truncate pr-2">{l.skuName}</span>
+                          <span className="font-mono shrink-0">
+                            <span className="text-emerald-400 font-bold">{l.fulfillableQty}</span>
+                            <span className="text-slate-500"> / {l.orderedQty} pcs</span>
+                            {l.shortageQty > 0 && (
+                              <span className="ml-1.5 text-amber-400">(-{l.shortageQty} PO)</span>
+                            )}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setDepotStockModal(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl"
+              >
+                Close
+              </button>
+              {(() => {
+                const fullIds = depotStockModal.eligibleOrders
+                  .filter((o) => {
+                    const ev = depotStockModal.evaluations[o.id];
+                    return ev && ev.status === 'FULL_STOCK' && !ev.isMultiCompanyOrder;
+                  })
+                  .map((o) => o.id);
+                if (fullIds.length === 0) return null;
+                return (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const res = confirmOrdersFromDepotStock(fullIds, currentUser?.name || 'Order Puncher');
+                      alert(res.message);
+                      setDepotStockModal(null);
+                    }}
+                    className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl shadow-lg shadow-emerald-900/40 flex items-center gap-2"
+                  >
+                    <Warehouse size={14} /> Confirm All Full-Stock Orders ({fullIds.length})
+                  </button>
+                );
+              })()}
             </div>
           </div>
         </div>

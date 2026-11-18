@@ -53,6 +53,7 @@ import {
   AlertOctagon,
 } from 'lucide-react';
 import { CrateTrackingSection } from './CrateTrackingSection';
+import { resolveDispatchPointSupervisor } from '../../utils/dispatchRouting';
 
 export const InventoryTally: React.FC = () => {
   const {
@@ -254,11 +255,11 @@ export const InventoryTally: React.FC = () => {
       vehicle_number: inwardVehicleNo || 'TRUCK-01',
       timestamp: new Date().toISOString(),
       performed_by_user_id: 'usr_dispatcher',
-      dispatcher_name: currentDepot.supervisor_name,
+      dispatcher_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
       notes: inwardNotes || 'Inward consignment logged at depot dock',
       ack_status: 'RECEIVED',
       ack_type: 'PAPER_PHOTO',
-      ack_by_user_name: currentDepot.supervisor_name,
+      ack_by_user_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
       ack_timestamp: new Date().toISOString(),
     };
 
@@ -327,7 +328,7 @@ export const InventoryTally: React.FC = () => {
       linked_order_id: outwardLinkedOrderId || undefined,
       timestamp: new Date().toISOString(),
       performed_by_user_id: 'usr_dispatcher',
-      dispatcher_name: currentDepot.supervisor_name,
+      dispatcher_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
       notes: outwardNotes || 'Outward stock allocated and handed over.',
       ack_status: 'PENDING', // Receiver must confirm receipt
       ack_type: 'DIGITAL_SIGNATURE',
@@ -369,7 +370,7 @@ export const InventoryTally: React.FC = () => {
         linked_order_id: order.id,
         timestamp: new Date().toISOString(),
         performed_by_user_id: 'usr_dispatcher',
-        dispatcher_name: currentDepot.supervisor_name,
+        dispatcher_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
         notes: `Hard Gate Verified: Order ${order.order_number} loaded & dispatched from ${currentDepot.name}`,
         ack_status: 'PENDING',
         ack_type: 'DIGITAL_SIGNATURE',
@@ -554,7 +555,7 @@ export const InventoryTally: React.FC = () => {
             Depot Boundary: Physical Cartons → Trusted Ledger Entries
           </div>
           <span className="text-[10px] font-mono text-slate-400">
-            Supervisor: <span className="text-white font-bold">{currentDepot.supervisor_name}</span> ({currentDepot.phone})
+            Supervisor: <span className="text-white font-bold">{resolveDispatchPointSupervisor(currentDepot, users).supervisorName}</span> ({resolveDispatchPointSupervisor(currentDepot, users).phone || currentDepot.phone})
           </span>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-[11px] text-slate-300">

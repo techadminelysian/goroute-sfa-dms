@@ -8,8 +8,18 @@ import {
   getOrderFinancialSummary,
   getAgentAssignedBeats,
   getAgentAssignedStores,
-  isOrderInAgentBeats
+  isOrderInAgentBeats,
+  getAllowedCompaniesForUser,
+  getAllowedSkusForUser,
+  isFieldUserAccessLocked
 } from '../../utils/caRoutingLogic';
+import {
+  getDispatchPickupBreakdown,
+  resolveDispatchPointIdForCompany,
+  SplitDispatchBreakdown
+} from '../../utils/dispatchRouting';
+import { computeUserLiveCreditProfile, PartyCreditProfile } from '../../utils/creditLedger';
+import { fetchLivePartyCreditFromFirestore } from '../../firebase/firestoreService';
 import {
   validateGSTIN,
   validatePhoneNumber,
@@ -55,7 +65,8 @@ import {
   Package,
   Boxes,
   RotateCcw,
-  Languages
+  Languages,
+  Warehouse
 } from 'lucide-react';
 
 export const MobileAgentView: React.FC = () => {
@@ -67,7 +78,9 @@ export const MobileAgentView: React.FC = () => {
     skus = [],
     companies = [],
     dispatchPoints = [],
+    distributors = [],
     orders = [],
+    invoices = [],
     payments = [],
     users = [],
     currentUser,
@@ -122,6 +135,88 @@ export const MobileAgentView: React.FC = () => {
 
   const agentName = activeAgent?.name || 'Commission Agent';
 
+  // Live Party Credit Profile from Cloud Firestore for Distributors & CFS Users
+  const isCreditTrackedRole = activeAgent?.role === 'DISTRIBUTOR' || activeAgent?.role === 'COMMISSION_AGENT';
+  const [firestoreCreditProfile, setFirestoreCreditProfile] = useState<PartyCreditProfile | null>(null);
+  const [isCreditLoading, setIsCreditLoading] = useState<boolean>(false);
+
+  const reactiveCreditProfile = useMemo(() => {
+    if (!activeAgent || !isCreditTrackedRole) return null;
+    return computeUserLiveCreditProfile(activeAgent, {
+      distributors,
+      orders,
+      invoices,
+      payments,
+      defaultCreditLimit: activeTenantSettings?.credit_limit_default || 50000,
+    });
+  }, [
+    activeAgent,
+    isCreditTrackedRole,
+    distributors,
+    orders,
+    invoices,
+    payments,
+    activeTenantSettings?.credit_limit_default,
+  ]);
+
+  useEffect(() => {
+    if (!activeAgent?.id || !isCreditTrackedRole) {
+      setFirestoreCreditProfile(null);
+      return;
+    }
+
+    let cancelled = false;
+    const fetchLiveCredit = async () => {
+      setIsCreditLoading(true);
+      try {
+        const remoteProfile = await fetchLivePartyCreditFromFirestore(
+          activeAgent.id,
+          activeAgent,
+          activeTenantSettings?.credit_limit_default || 50000
+        );
+        if (!cancelled && remoteProfile) {
+          setFirestoreCreditProfile(remoteProfile);
+        }
+      } finally {
+        if (!cancelled) setIsCreditLoading(false);
+      }
+    };
+
+    fetchLiveCredit();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeAgent?.id,
+    activeAgent?.role,
+    activeAgent?.credit_limit,
+    activeAgent?.current_outstanding,
+    activeAgent?.utilized_credit,
+    orders.length,
+    invoices.length,
+    payments.length,
+    isCreditTrackedRole,
+    activeTenantSettings?.credit_limit_default,
+  ]);
+
+  const livePartyCredit = useMemo(() => {
+    if (!isCreditTrackedRole) return null;
+    // Keep live store reactive updates synchronized alongside direct Firestore fetch
+    if (reactiveCreditProfile) {
+      if (
+        firestoreCreditProfile &&
+        firestoreCreditProfile.userId === reactiveCreditProfile.userId &&
+        firestoreCreditProfile.credit_limit === reactiveCreditProfile.credit_limit &&
+        (firestoreCreditProfile.total_liability ?? firestoreCreditProfile.current_outstanding) ===
+          (reactiveCreditProfile.total_liability ?? reactiveCreditProfile.current_outstanding)
+      ) {
+        return firestoreCreditProfile;
+      }
+      return reactiveCreditProfile;
+    }
+    return firestoreCreditProfile;
+  }, [isCreditTrackedRole, reactiveCreditProfile, firestoreCreditProfile]);
+
   // Resolve all territory beats assigned to active Commission Agent
   const agentAssignedBeats = useMemo(() => {
     return getAgentAssignedBeats(activeAgent, beats);
@@ -173,6 +268,8 @@ export const MobileAgentView: React.FC = () => {
   const [isMobileSearchOpen, setIsMobileSearchOpen] = useState<boolean>(false);
   const [mobileCreatedOrderSummary, setMobileCreatedOrderSummary] = useState<{
     order: Order;
+    splitOrders?: Order[];
+    pickupLocations?: SplitDispatchBreakdown[];
     retailerName: string;
     companyBreakdowns: {
       company: Company;
@@ -217,31 +314,33 @@ export const MobileAgentView: React.FC = () => {
   const [paymentBankName, setPaymentBankName] = useState<string>('');
   const [paymentNotes, setPaymentNotes] = useState<string>('Beat cash/digital payment collected');
 
-  // Keep selected stores synchronized with assigned stores
+  // Keep selected stores synchronized with assigned stores (primitive key prevents render loops)
+  const agentStoreIdsKey = agentAssignedStores.map((s) => s.id).join('|');
   useEffect(() => {
     if (agentAssignedStores.length > 0) {
-      if (!agentStoreIds.has(selectedRetailerId)) {
-        setSelectedRetailerId(agentAssignedStores[0].id);
-      }
-      if (!agentStoreIds.has(paymentRetailerId)) {
-        setPaymentRetailerId(agentAssignedStores[0].id);
-      }
+      const firstId = agentAssignedStores[0].id;
+      setSelectedRetailerId((prev) => (agentStoreIds.has(prev) ? prev : firstId));
+      setPaymentRetailerId((prev) => (agentStoreIds.has(prev) ? prev : firstId));
     } else {
-      setSelectedRetailerId('');
-      setPaymentRetailerId('');
+      setSelectedRetailerId((prev) => (prev === '' ? prev : ''));
+      setPaymentRetailerId((prev) => (prev === '' ? prev : ''));
     }
-  }, [agentAssignedStores, agentStoreIds, selectedRetailerId, paymentRetailerId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentStoreIdsKey]);
 
-  // Keep onboard beat selection synchronized with assigned beats
+  // Keep onboard beat selection synchronized with assigned beats (primitive key prevents render loops)
+  const agentBeatIdsKey = agentAssignedBeats.map((b) => b.id).join('|');
   useEffect(() => {
     if (agentAssignedBeats.length > 0) {
-      if (!agentAssignedBeats.some((b) => b.id === onboardBeatId)) {
-        setOnboardBeatId(agentAssignedBeats[0].id);
-      }
+      const firstBeatId = agentAssignedBeats[0].id;
+      setOnboardBeatId((prev) =>
+        agentAssignedBeats.some((b) => b.id === prev) ? prev : firstBeatId
+      );
     } else {
-      setOnboardBeatId('');
+      setOnboardBeatId((prev) => (prev === '' ? prev : ''));
     }
-  }, [agentAssignedBeats, onboardBeatId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentBeatIdsKey]);
 
   const handleOnboardStoreSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -348,26 +447,17 @@ export const MobileAgentView: React.FC = () => {
 
   // Business Requirement: Field User Principal Company & SKU Access Restriction (Zero-Trust by Default)
   const allowedCompanies = useMemo(() => {
-    const isFieldRole = activeAgent?.role === 'COMMISSION_AGENT' || activeAgent?.role === 'SALES_EXECUTIVE' || activeAgent?.role === 'DISTRIBUTOR';
-    if (!isFieldRole) return companies;
-
-    const scope = activeAgent?.company_scope || [];
-    return companies.filter((c) => scope.includes(c.id));
+    return getAllowedCompaniesForUser(activeAgent, companies);
   }, [activeAgent, companies]);
 
   const allowedCompanyIds = useMemo(() => new Set(allowedCompanies.map((c) => c.id)), [allowedCompanies]);
 
   const allowedSkus = useMemo(() => {
-    const isFieldRole = activeAgent?.role === 'COMMISSION_AGENT' || activeAgent?.role === 'SALES_EXECUTIVE' || activeAgent?.role === 'DISTRIBUTOR';
-    if (!isFieldRole) return skus;
-
-    return skus.filter((s) => allowedCompanyIds.has(s.company_id));
-  }, [activeAgent, skus, allowedCompanyIds]);
+    return getAllowedSkusForUser(activeAgent, companies, skus);
+  }, [activeAgent, companies, skus]);
 
   const isAccessLocked = useMemo(() => {
-    const isFieldRole = activeAgent?.role === 'COMMISSION_AGENT' || activeAgent?.role === 'SALES_EXECUTIVE' || activeAgent?.role === 'DISTRIBUTOR';
-    if (!isFieldRole) return false;
-    return !activeAgent?.company_scope || activeAgent.company_scope.length === 0;
+    return isFieldUserAccessLocked(activeAgent);
   }, [activeAgent]);
 
   const [mobileCompanyGroups, setMobileCompanyGroups] = useState<MobileCompanyGroup[]>(() => {
@@ -392,18 +482,21 @@ export const MobileAgentView: React.FC = () => {
   });
 
   // Keep mobileCompanyGroups synchronized with allowedCompanies whenever agent or permissions change
+  const allowedCompanyIdsKey = allowedCompanies.map((c) => c.id).join('|');
+  const allowedSkuIdsKey = allowedSkus.map((s) => s.id).join('|');
   useEffect(() => {
     if (isAccessLocked || allowedCompanies.length === 0) {
-      setMobileCompanyGroups([]);
+      setMobileCompanyGroups((prev) => (prev.length === 0 ? prev : []));
     } else {
       setMobileCompanyGroups((prev) => {
         const valid = prev.filter((g) => allowedCompanyIds.has(g.companyId));
+        if (valid.length === prev.length && valid.length > 0) return prev;
         if (valid.length > 0) return valid;
 
         const firstComp = allowedCompanies[0];
         const compSkus = allowedSkus.filter((s) => s.company_id === firstComp.id);
         const firstSku = compSkus[0] || allowedSkus[0];
-        if (!firstComp || !firstSku) return [];
+        if (!firstComp || !firstSku) return prev.length === 0 ? prev : [];
 
         return [
           {
@@ -421,7 +514,8 @@ export const MobileAgentView: React.FC = () => {
         ];
       });
     }
-  }, [activeAgent?.id, activeAgent?.company_scope, allowedCompanies, allowedSkus, allowedCompanyIds, isAccessLocked]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAgent?.id, isAccessLocked, allowedCompanyIdsKey, allowedSkuIdsKey]);
 
   // Historical Order Lookup for Prev. Order calculation in Mobile View
   const getMobilePrevOrderQty = (retId: string, skuId: string): number => {
@@ -682,7 +776,7 @@ export const MobileAgentView: React.FC = () => {
     const targetGroup = mobileCompanyGroups.find((g) => g.groupId === groupId);
     if (!targetGroup) return;
 
-    const compSkus = skus.filter((s) => s.company_id === targetGroup.companyId);
+    const compSkus = allowedSkus.filter((s) => s.company_id === targetGroup.companyId);
 
     // Collect all SKUs currently used across the entire order
     const allUsedSkuIds = new Set<string>();
@@ -695,7 +789,7 @@ export const MobileAgentView: React.FC = () => {
     const availableSkus = compSkus.filter((s) => !allUsedSkuIds.has(s.id));
 
     if (availableSkus.length === 0) {
-      const compObj = companies.find((c) => c.id === targetGroup.companyId);
+      const compObj = allowedCompanies.find((c) => c.id === targetGroup.companyId);
       alert(
         `All products for ${compObj?.name || 'this company'} have already been added to this order.\n\nDuplicate products cannot be added in the same order. Please adjust the quantity on the existing lines.`
       );
@@ -732,21 +826,23 @@ export const MobileAgentView: React.FC = () => {
       if (mobileCompanyGroups.length > 1) {
         handleRemoveMobileCompanyGroup(groupId);
       } else {
-        const compSkus = skus.filter((s) => s.company_id === targetGroup.companyId);
-        const firstSku = compSkus[0] || skus[0];
+        const compSkus = allowedSkus.filter((s) => s.company_id === targetGroup.companyId);
+        const firstSku = compSkus[0] || allowedSkus[0];
         setMobileCompanyGroups((prev) =>
           prev.map((g) =>
             g.groupId === groupId
               ? {
                   ...g,
-                  lines: [
-                    {
-                      id: `mob_line_${Date.now()}_1`,
-                      sku_id: firstSku?.id || '',
-                      current_stock: 0,
-                      quantity: 1,
-                    },
-                  ],
+                  lines: firstSku
+                    ? [
+                        {
+                          id: `mob_line_${Date.now()}_1`,
+                          sku_id: firstSku.id,
+                          current_stock: 0,
+                          quantity: 1,
+                        },
+                      ]
+                    : [],
                 }
               : g
           )
@@ -768,14 +864,18 @@ export const MobileAgentView: React.FC = () => {
     updates: Partial<MobileTempLine>
   ) => {
     if (updates.sku_id) {
+      const authorizedSku = allowedSkus.find((s) => s.id === updates.sku_id);
+      if (!authorizedSku) {
+        alert('Access Restricted: You are not authorized to add SKUs from this Principal Company.');
+        return;
+      }
       const isDuplicate = (mobileCompanyGroups || []).some((g) =>
         (g.lines || []).some((l) => l.id !== lineId && l.sku_id === updates.sku_id)
       );
 
       if (isDuplicate) {
-        const skuObj = skus.find((s) => s.id === updates.sku_id);
         alert(
-          `Cannot select "${skuObj?.name || 'this product'}": It is already added to this order.\n\nDuplicate products should not be selected or added in the same order. Please increase quantity on the existing line instead.`
+          `Cannot select "${authorizedSku.name || 'this product'}": It is already added to this order.\n\nDuplicate products should not be selected or added in the same order. Please increase quantity on the existing line instead.`
         );
         return;
       }
@@ -835,6 +935,32 @@ export const MobileAgentView: React.FC = () => {
     const taxAmount = totalGross * 0.18;
     const grandTotal = totalGross + taxAmount;
 
+    // Live pickup dispatch point breakdown for current draft groups
+    const dpBucketMap = new Map<
+      string,
+      { dpId: string; dpName: string; dpCode: string; address: string; companyNames: string[]; units: number }
+    >();
+    const defaultDpId = dispatchPoints[0]?.id || 'dp_central';
+    (mobileCompanyGroups || []).forEach((g) => {
+      const comp = (companies || []).find((c) => c.id === g.companyId);
+      const dpId = resolveDispatchPointIdForCompany(g.companyId, companies, defaultDpId);
+      const dpObj = dispatchPoints.find((d) => d.id === dpId);
+      const units = (g.lines || []).reduce((s, l) => s + (l.quantity || 0), 0);
+      const existing = dpBucketMap.get(dpId) || {
+        dpId,
+        dpName: dpObj?.name || dpId,
+        dpCode: dpObj?.code || 'DP',
+        address: dpObj?.address || '',
+        companyNames: [],
+        units: 0,
+      };
+      if (comp && !existing.companyNames.includes(comp.name)) {
+        existing.companyNames.push(comp.name);
+      }
+      existing.units += units;
+      dpBucketMap.set(dpId, existing);
+    });
+
     return {
       totalGross,
       totalUnits,
@@ -843,8 +969,9 @@ export const MobileAgentView: React.FC = () => {
       grandTotal,
       companyBreakdowns,
       totalCompaniesCount: (mobileCompanyGroups || []).length,
+      pickupPreviewList: Array.from(dpBucketMap.values()),
     };
-  }, [mobileCompanyGroups, companies, skus]);
+  }, [mobileCompanyGroups, companies, skus, dispatchPoints]);
 
   // Create Order for the Store (Combined Single Order ID with Multi-Principal Line Tags)
   const handlePunchMultiCompanyOrder = (e: React.FormEvent) => {
@@ -872,15 +999,19 @@ export const MobileAgentView: React.FC = () => {
       return;
     }
 
-    // Enforce SKU uniqueness across entire order
+    // Enforce SKU uniqueness and Zero-Trust authorization across entire order
     const seenSkus = new Set<string>();
     const duplicateSkuNames: string[] = [];
     for (const g of mobileCompanyGroups || []) {
       for (const l of g.lines || []) {
         if (!l.sku_id) continue;
+        const authorizedSku = allowedSkus.find((s) => s.id === l.sku_id);
+        if (!authorizedSku || !allowedCompanyIds.has(authorizedSku.company_id)) {
+          alert('Order Punch Blocked: One or more selected products belong to an unauthorized Principal Company.');
+          return;
+        }
         if (seenSkus.has(l.sku_id)) {
-          const skuObj = skus.find((s) => s.id === l.sku_id);
-          duplicateSkuNames.push(skuObj?.name || l.sku_id);
+          duplicateSkuNames.push(authorizedSku.name || l.sku_id);
         } else {
           seenSkus.add(l.sku_id);
         }
@@ -919,17 +1050,18 @@ export const MobileAgentView: React.FC = () => {
     );
 
     const distinctCompanyIds = Array.from(new Set((mobileCompanyGroups || []).map((g) => g.companyId))) as string[];
-    const companyNames = distinctCompanyIds.map((cid) => (companies || []).find((c) => c.id === cid)?.name || cid);
+    const companyNames = distinctCompanyIds.map((cid) => (allowedCompanies || []).find((c) => c.id === cid)?.name || cid);
 
     const allCompiledLines: OrderLine[] = [];
 
     (mobileCompanyGroups || []).forEach((group, gIdx) => {
-      const comp = (companies || []).find((c) => c.id === group.companyId);
+      const comp = (allowedCompanies || []).find((c) => c.id === group.companyId);
 
       (group.lines || []).forEach((l, lIdx) => {
-        const targetSku = (skus || []).find((s) => s.id === l.sku_id) || skus[0];
-        const rate = targetSku?.selling_price || 0;
-        const landing = targetSku?.landing_price || 0;
+        const targetSku = (allowedSkus || []).find((s) => s.id === l.sku_id);
+        if (!targetSku) return;
+        const rate = targetSku.selling_price || 0;
+        const landing = targetSku.landing_price || 0;
         const isBelow = rate < landing;
         const lineQty = l.quantity || 1;
 
@@ -937,8 +1069,8 @@ export const MobileAgentView: React.FC = () => {
           id: `ol_mob_${Date.now()}_${gIdx}_${lIdx}`,
           tenant_id: activeTenant?.id || 't1',
           order_id: orderId,
-          sku_id: targetSku?.id || l.sku_id,
-          sku_name: targetSku?.name || 'SKU',
+          sku_id: targetSku.id,
+          sku_name: targetSku.name || 'SKU',
           quantity: lineQty,
           unit_price: rate,
           landing_price: landing,
@@ -987,26 +1119,33 @@ export const MobileAgentView: React.FC = () => {
       source_type: 'GT_AGENT',
     };
 
-    addOrder(combinedOrder);
+    const createdOrders = addOrder(combinedOrder);
+    const pickupLocations = getDispatchPickupBreakdown(createdOrders, companies, skus, dispatchPoints);
 
-    // Show popup summary of created combined order
+    // Show popup summary of created / dynamically split orders & pickup depots
     setMobileCreatedOrderSummary({
-      order: combinedOrder,
+      order: createdOrders[0] || combinedOrder,
+      splitOrders: createdOrders,
+      pickupLocations,
       retailerName: selectedRetailer?.name || 'Store Outlet',
       companyBreakdowns: mobileOrderStats.companyBreakdowns || [],
     });
 
-    // Reset lines
-    const firstComp = companies[0];
-    const compSkus = firstComp ? skus.filter((s) => s.company_id === firstComp.id) : skus;
-    const firstSku = compSkus[0] || skus[0];
-    setMobileCompanyGroups([
-      {
-        groupId: `mob_grp_${Date.now()}_1`,
-        companyId: firstComp?.id || '',
-        lines: [{ id: `mob_line_${Date.now()}_1`, sku_id: firstSku?.id || '', current_stock: 0, quantity: 10 }],
-      },
-    ]);
+    // Reset lines strictly within allowedCompanies & allowedSkus
+    const firstComp = allowedCompanies[0];
+    const compSkus = firstComp ? allowedSkus.filter((s) => s.company_id === firstComp.id) : allowedSkus;
+    const firstSku = compSkus[0] || allowedSkus[0];
+    setMobileCompanyGroups(
+      firstComp && firstSku
+        ? [
+            {
+              groupId: `mob_grp_${Date.now()}_1`,
+              companyId: firstComp.id,
+              lines: [{ id: `mob_line_${Date.now()}_1`, sku_id: firstSku.id, current_stock: 0, quantity: 10 }],
+            },
+          ]
+        : []
+    );
     setMobileVisitNotes('');
   };
 
@@ -1015,6 +1154,7 @@ export const MobileAgentView: React.FC = () => {
     return (
       ord.status === 'VERIFIED' ||
       ord.status === 'VERIFIED_BY_BILLING' ||
+      ord.status === 'CONFIRMED' ||
       ord.status === 'PO_GENERATED' ||
       ord.status === 'PUNCHED_TO_PRINCIPAL' ||
       ord.status === 'PRINCIPAL_DISPATCHED' ||
@@ -1046,12 +1186,16 @@ export const MobileAgentView: React.FC = () => {
     );
   };
 
-  // Edit Lines Helper
+  // Edit Lines Helper (strictly constrained to Zero-Trust allowedSkus)
   const handleAddEditLine = () => {
+    if (isAccessLocked || allowedSkus.length === 0) {
+      alert('Access Restricted: Zero-Trust Policy blocks adding products because 0 Principal Companies are assigned.');
+      return;
+    }
     const usedSkuIds = new Set(editLines.map((l) => l.sku_id));
-    const availableSkus = skus.filter((s) => !usedSkuIds.has(s.id));
+    const availableSkus = allowedSkus.filter((s) => !usedSkuIds.has(s.id));
     if (availableSkus.length === 0) {
-      alert('All catalog products have already been added to this order.');
+      alert('All authorized catalog products have already been added to this order.');
       return;
     }
     const nextSku = availableSkus[0];
@@ -1062,18 +1206,21 @@ export const MobileAgentView: React.FC = () => {
   };
 
   const handleEditLineSkuChange = (idx: number, skuId: string) => {
-    const isDuplicate = editLines.some((l, i) => i !== idx && l.sku_id === skuId);
-    if (isDuplicate) {
-      const found = skus.find((s) => s.id === skuId);
-      alert(`"${found?.name || 'This product'}" is already in this order.\n\nDuplicate products cannot be selected in the same order.`);
+    const authorizedSku = allowedSkus.find((s) => s.id === skuId);
+    if (!authorizedSku) {
+      alert('Access Restricted: Selected product belongs to an unauthorized Principal Company.');
       return;
     }
-    const targetSku = skus.find((s) => s.id === skuId);
+    const isDuplicate = editLines.some((l, i) => i !== idx && l.sku_id === skuId);
+    if (isDuplicate) {
+      alert(`"${authorizedSku.name || 'This product'}" is already in this order.\n\nDuplicate products cannot be selected in the same order.`);
+      return;
+    }
     const copy = [...editLines];
     copy[idx] = {
       sku_id: skuId,
       quantity: copy[idx].quantity || 10,
-      unit_price: targetSku?.selling_price || 10
+      unit_price: authorizedSku.selling_price || 10
     };
     setEditLines(copy);
   };
@@ -1092,6 +1239,11 @@ export const MobileAgentView: React.FC = () => {
       return;
     }
 
+    if (isAccessLocked || allowedSkus.length === 0) {
+      alert('Save Blocked: Zero-Trust Security enforces that you must have at least one assigned Principal Company to modify orders.');
+      return;
+    }
+
     if (editLines.length === 0) {
       alert('Order must contain at least one line item.');
       return;
@@ -1099,36 +1251,45 @@ export const MobileAgentView: React.FC = () => {
 
     const seenEditSkus = new Set<string>();
     for (const l of editLines) {
+      const authorizedSku = allowedSkus.find((s) => s.id === l.sku_id);
+      if (!authorizedSku) {
+        alert('Save Blocked: Order contains a product from an unauthorized Principal Company.');
+        return;
+      }
       if (seenEditSkus.has(l.sku_id)) {
-        const skuObj = skus.find((s) => s.id === l.sku_id);
-        alert(`Duplicate product detected: "${skuObj?.name || l.sku_id}". Order cannot contain duplicate products.`);
+        alert(`Duplicate product detected: "${authorizedSku.name || l.sku_id}". Order cannot contain duplicate products.`);
         return;
       }
       seenEditSkus.add(l.sku_id);
     }
 
-    const compiledLines: OrderLine[] = editLines.map((l, idx) => {
-      const targetSku = skus.find((s) => s.id === l.sku_id) || skus[0];
-      const qty = Math.max(1, Math.abs(Number(l.quantity)) || 1);
-      // Enforce product-rate protection from the catalog SKU selling price
-      const rate = targetSku.selling_price;
-      const landing = targetSku.landing_price;
-      const isBelow = rate < landing;
+    const compiledLines: OrderLine[] = editLines
+      .map((l, idx) => {
+        const targetSku = allowedSkus.find((s) => s.id === l.sku_id);
+        if (!targetSku) return null;
+        const qty = Math.max(1, Math.abs(Number(l.quantity)) || 1);
+        // Enforce product-rate protection from the catalog SKU selling price
+        const rate = targetSku.selling_price;
+        const landing = targetSku.landing_price;
+        const isBelow = rate < landing;
 
-      return {
-        id: `ol_edit_${Date.now()}_${idx}`,
-        tenant_id: activeTenant.id,
-        order_id: selectedOrderForDetail.id,
-        sku_id: targetSku.id,
-        sku_name: targetSku.name,
-        quantity: qty,
-        unit_price: rate,
-        landing_price: landing,
-        total: qty * rate,
-        is_below_cost: isBelow,
-        expected_claim_total: isBelow ? (landing - rate) * qty : 0
-      };
-    });
+        return {
+          id: `ol_edit_${Date.now()}_${idx}`,
+          tenant_id: activeTenant.id,
+          order_id: selectedOrderForDetail.id,
+          sku_id: targetSku.id,
+          sku_name: targetSku.name,
+          quantity: qty,
+          unit_price: rate,
+          landing_price: landing,
+          total: qty * rate,
+          is_below_cost: isBelow,
+          expected_claim_total: isBelow ? (landing - rate) * qty : 0,
+          company_id: targetSku.company_id,
+          company_name: allowedCompanies.find((c) => c.id === targetSku.company_id)?.name || 'Principal',
+        };
+      })
+      .filter(Boolean) as OrderLine[];
 
     const productSubtotal = compiledLines.reduce((sum, l) => sum + l.total, 0);
     const taxAmount = Math.round(productSubtotal * 0.18 * 100) / 100;
@@ -1277,14 +1438,16 @@ export const MobileAgentView: React.FC = () => {
     : agentRelevantOrders;
 
   const totalAllOrdersCount = searchedOrders.length;
-  const totalPunchedOrdersCount = searchedOrders.filter((o) => o.status === 'PUNCHED' || o.status === 'PUNCHED_TO_PRINCIPAL').length;
+  const totalPunchedOrdersCount = searchedOrders.filter(
+    (o) => o.status === 'CONFIRMED' || o.status === 'PUNCHED' || o.status === 'PUNCHED_TO_PRINCIPAL'
+  ).length;
   const totalPendingOrdersCount = searchedOrders.filter((o) => o.status !== 'DELIVERED' && o.status !== 'CANCELLED').length;
   const totalDeliveredOrdersCount = searchedOrders.filter((o) => o.status === 'DELIVERED').length;
 
   // Filter Agent Orders
   const myAgentOrders = searchedOrders.filter((o) => {
     if (orderStatusFilter === 'PUNCHED_TO_PRINCIPAL') {
-      return o.status === 'PUNCHED_TO_PRINCIPAL' || o.status === 'PUNCHED';
+      return o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL' || o.status === 'PUNCHED';
     }
     if (orderStatusFilter === 'PENDING_DELIVERY') {
       return o.status !== 'DELIVERED' && o.status !== 'CANCELLED';
@@ -1465,6 +1628,136 @@ export const MobileAgentView: React.FC = () => {
 
       {/* Mobile Alerts Banner for real-time BE push notifications */}
       <MobileAlertsBanner />
+
+      {/* Live Firestore Credit Profile Card for Logged-in Distributors & CFS Agents */}
+      {isCreditTrackedRole && livePartyCredit && (
+        <div
+          className={`p-3 rounded-2xl border space-y-2 text-xs ${
+            livePartyCredit.is_credit_blocked
+              ? 'bg-rose-950/40 border-rose-500/40'
+              : 'bg-slate-900 border-emerald-500/30'
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5 font-bold text-white text-[11px]">
+              <CreditCard
+                size={14}
+                className={livePartyCredit.is_credit_blocked ? 'text-rose-400' : 'text-emerald-400'}
+              />
+              <span>
+                {activeAgent?.role === 'DISTRIBUTOR'
+                  ? language === 'hi'
+                    ? 'डिस्ट्रीब्यूटर क्रेडिट गेट (लाइव)'
+                    : 'Distributor Credit Gate'
+                  : language === 'hi'
+                    ? 'CFS क्रेडिट गेट (लाइव)'
+                    : 'CFS Agent Credit Gate'}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase border ${
+                  livePartyCredit.is_credit_blocked
+                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                }`}
+              >
+                {livePartyCredit.is_credit_blocked
+                  ? language === 'hi'
+                    ? 'क्रेडिट होल्ड'
+                    : 'Credit Hold'
+                  : isCreditLoading
+                    ? 'Syncing...'
+                    : language === 'hi'
+                      ? 'Firestore लाइव'
+                      : 'Firestore Live'}
+              </span>
+            </div>
+          </div>
+
+          {(() => {
+            const totalLiability =
+              livePartyCredit.total_liability ??
+              livePartyCredit.utilized_credit ??
+              livePartyCredit.current_outstanding ??
+              0;
+            const remainingCredit =
+              livePartyCredit.remaining_credit ??
+              livePartyCredit.available_credit ??
+              Math.max(0, livePartyCredit.credit_limit - totalLiability);
+            const fundShortage =
+              livePartyCredit.fund_shortage ??
+              livePartyCredit.over_limit_amount ??
+              Math.max(0, totalLiability - livePartyCredit.credit_limit);
+
+            return (
+              <>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center font-mono">
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2">
+                    <span className="text-[9px] font-sans text-slate-400 block">
+                      {language === 'hi' ? 'क्रेडिट लिमिट' : 'Credit Limit'}
+                    </span>
+                    <span className="text-xs font-bold text-white">
+                      ₹{livePartyCredit.credit_limit.toLocaleString('en-IN')}
+                    </span>
+                  </div>
+
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2">
+                    <span className="text-[9px] font-sans text-slate-400 block">
+                      {language === 'hi' ? 'कुल उपयोग (दायित्व)' : 'Utilized Liability'}
+                    </span>
+                    <span
+                      className={`text-xs font-bold ${
+                        livePartyCredit.is_credit_blocked ? 'text-rose-400' : 'text-amber-300'
+                      }`}
+                    >
+                      ₹{totalLiability.toLocaleString('en-IN')}
+                    </span>
+                  </div>
+
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2">
+                    <span className="text-[9px] font-sans text-slate-400 block">
+                      {language === 'hi' ? 'शेष क्रेडिट' : 'Remaining Credit'}
+                    </span>
+                    <span
+                      className={`text-xs font-bold ${
+                        remainingCredit <= 0 ? 'text-rose-400' : 'text-emerald-400'
+                      }`}
+                    >
+                      ₹{remainingCredit.toLocaleString('en-IN')}
+                    </span>
+                  </div>
+
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2">
+                    <span className="text-[9px] font-sans text-slate-400 block">
+                      {language === 'hi' ? 'फंड की कमी' : 'Fund Shortage'}
+                    </span>
+                    <span
+                      className={`text-xs font-bold ${
+                        fundShortage > 0 ? 'text-rose-400' : 'text-slate-400'
+                      }`}
+                    >
+                      ₹{fundShortage.toLocaleString('en-IN')}
+                    </span>
+                  </div>
+                </div>
+
+                {fundShortage > 0 && (
+                  <div className="text-[10px] text-rose-300 flex items-center gap-1.5 pt-0.5">
+                    <AlertTriangle size={12} className="text-rose-400 shrink-0" />
+                    <span>
+                      {language === 'hi'
+                        ? `कुल दायित्व सीमा से ₹${fundShortage.toLocaleString('en-IN')} अधिक है (फंड शॉर्टेज)।`
+                        : `Total liability exceeds approved limit by ₹${fundShortage.toLocaleString('en-IN')} fund shortage.`}
+                    </span>
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      )}
 
       {/* Channel Workflow Callout */}
       <div className="p-2.5 bg-blue-950/40 border border-blue-500/30 rounded-xl text-[11px] text-blue-300 flex items-center gap-2">
@@ -1748,7 +2041,7 @@ export const MobileAgentView: React.FC = () => {
                       <span className="w-5 h-5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center justify-center text-[10px] font-bold">
                         {gIdx + 1}
                       </span>
-                      <div>
+                      <div className="space-y-1">
                         <select
                           id={`select-mobile-company-${group.groupId}`}
                           value={group.companyId}
@@ -1766,6 +2059,20 @@ export const MobileAgentView: React.FC = () => {
                             );
                           })}
                         </select>
+                        {(() => {
+                          const dpId = resolveDispatchPointIdForCompany(
+                            group.companyId,
+                            companies,
+                            dispatchPoints[0]?.id || 'dp_central'
+                          );
+                          const dpObj = dispatchPoints.find((d) => d.id === dpId);
+                          return (
+                            <div className="text-[10px] text-cyan-300 flex items-center gap-1">
+                              <Warehouse size={10} className="text-cyan-400 shrink-0" />
+                              <span>Pickup: {dpObj ? `${dpObj.name} (${dpObj.code})` : dpId}</span>
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
 
@@ -1788,8 +2095,8 @@ export const MobileAgentView: React.FC = () => {
 
                   {/* Product Rows for this company */}
                   <div className="space-y-2.5">
-                    {group.lines.map((line, lIdx) => {
-                      const skuObj = skus.find((s) => s.id === line.sku_id) || compSkus[0] || skus[0];
+                    {group.lines.map((line) => {
+                      const skuObj = allowedSkus.find((s) => s.id === line.sku_id) || compSkus[0];
                       const prevQty = getMobilePrevOrderQty(selectedRetailerId, line.sku_id);
                       const lineTotal = (skuObj?.selling_price || 0) * line.quantity;
 
@@ -1805,16 +2112,20 @@ export const MobileAgentView: React.FC = () => {
                               onChange={(e) => handleUpdateMobileLine(group.groupId, line.id, { sku_id: e.target.value })}
                               className="w-full bg-slate-900 border border-slate-700 rounded-lg p-1.5 text-xs text-white font-semibold focus:border-blue-500 focus:outline-none cursor-pointer"
                             >
-                              {(compSkus.length > 0 ? compSkus : skus).map((s) => {
-                                const isSelectedInOtherLine = mobileCompanyGroups.some((g) =>
-                                  g.lines.some((l) => l.id !== line.id && l.sku_id === s.id)
-                                );
-                                return (
-                                  <option key={s.id} value={s.id} disabled={isSelectedInOtherLine}>
-                                    {s.name} (MRP ₹{s.mrp}){isSelectedInOtherLine ? ' — [Already in Order]' : ''}
-                                  </option>
-                                );
-                              })}
+                              {compSkus.length === 0 ? (
+                                <option value="">No authorized products for this company</option>
+                              ) : (
+                                compSkus.map((s) => {
+                                  const isSelectedInOtherLine = mobileCompanyGroups.some((g) =>
+                                    g.lines.some((l) => l.id !== line.id && l.sku_id === s.id)
+                                  );
+                                  return (
+                                    <option key={s.id} value={s.id} disabled={isSelectedInOtherLine}>
+                                      {s.name} (MRP ₹{s.mrp}){isSelectedInOtherLine ? ' — [Already in Order]' : ''}
+                                    </option>
+                                  );
+                                })
+                              )}
                             </select>
 
                             <button
@@ -1948,6 +2259,37 @@ export const MobileAgentView: React.FC = () => {
                 ₹{mobileOrderStats.grandTotal.toLocaleString('en-IN')}
               </span>
             </div>
+
+            {(mobileOrderStats.pickupPreviewList || []).length > 0 && (
+              <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="font-bold text-cyan-300 flex items-center gap-1">
+                    <Warehouse size={12} /> Pickup Dispatch Point(s) ({mobileOrderStats.pickupPreviewList.length}):
+                  </span>
+                  {mobileOrderStats.pickupPreviewList.length > 1 && (
+                    <span className="text-[10px] font-semibold text-amber-300">
+                      Auto-splits across {mobileOrderStats.pickupPreviewList.length} depots
+                    </span>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  {mobileOrderStats.pickupPreviewList.map((dp) => (
+                    <div
+                      key={dp.dpId}
+                      className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between text-[10px]"
+                    >
+                      <div>
+                        <div className="font-bold text-white">
+                          {dp.dpName} <span className="text-cyan-400 font-mono">({dp.dpCode})</span>
+                        </div>
+                        <div className="text-slate-400">{dp.companyNames.join(', ')}</div>
+                      </div>
+                      <span className="font-mono text-slate-300 font-semibold">{dp.units} pcs</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Submit Button */}
@@ -1982,16 +2324,57 @@ export const MobileAgentView: React.FC = () => {
               </p>
             </div>
 
-            <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-2 text-xs">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="text-slate-400">Order ID:</span>
-                <span className="font-mono font-bold text-blue-400">{mobileCreatedOrderSummary.order.order_number}</span>
-              </div>
+            <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-2.5 text-xs">
+              {(mobileCreatedOrderSummary.splitOrders || []).length > 1 ? (
+                <div className="p-2 rounded-lg bg-cyan-950/50 border border-cyan-500/40 text-[11px] text-cyan-200 space-y-0.5">
+                  <div className="font-bold text-cyan-300 flex items-center gap-1">
+                    <Warehouse size={12} /> Multi-Depot Auto-Split Applied ({mobileCreatedOrderSummary.splitOrders!.length} Pickups)
+                  </div>
+                  <div className="text-[10px] text-cyan-100/90">
+                    SKUs were routed by Principal Company to separate Dispatch Point sheets:
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-slate-400">Order ID:</span>
+                  <span className="font-mono font-bold text-blue-400">{mobileCreatedOrderSummary.order.order_number}</span>
+                </div>
+              )}
+
+              {(mobileCreatedOrderSummary.pickupLocations || []).length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                    Pickup Dispatch Location(s):
+                  </div>
+                  {(mobileCreatedOrderSummary.pickupLocations || []).map((loc) => (
+                    <div
+                      key={`${loc.dispatchPointId}_${loc.orderId}`}
+                      className="p-2 rounded-lg bg-slate-900 border border-cyan-500/30 space-y-1 text-[11px]"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-white flex items-center gap-1">
+                          <MapPin size={11} className="text-cyan-400 shrink-0" />
+                          {loc.dispatchPointName} ({loc.dispatchPointCode})
+                        </span>
+                        <span className="font-mono text-[10px] text-blue-400 font-bold">{loc.orderNumber}</span>
+                      </div>
+                      {loc.address && (
+                        <div className="text-[10px] text-slate-400">{loc.address}</div>
+                      )}
+                      <div className="flex items-center justify-between text-[10px] text-slate-300 pt-0.5">
+                        <span>{loc.companies.map((c) => c.name).join(', ')} • {loc.skuCount} SKUs ({loc.unitsCount} pcs)</span>
+                        <span className="font-mono font-bold text-emerald-400">₹{loc.totalAmount.toLocaleString('en-IN')}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div className="text-[11px] text-slate-300 font-medium pt-1 border-t border-slate-800">
                 Principals Represented (<strong className="text-white">{(mobileCreatedOrderSummary.companyBreakdowns || []).length}</strong>):
               </div>
 
-              <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+              <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
                 {(mobileCreatedOrderSummary.companyBreakdowns || []).map((cb) => (
                   <div
                     key={cb.company.id}
@@ -2012,8 +2395,13 @@ export const MobileAgentView: React.FC = () => {
               </div>
 
               <div className="pt-2 border-t border-slate-800 flex items-center justify-between text-xs font-bold">
-                <span className="text-slate-300">Total Value:</span>
-                <span className="font-mono text-emerald-400">₹{(mobileCreatedOrderSummary.order.total_amount || 0).toLocaleString('en-IN')}</span>
+                <span className="text-slate-300">Combined Total Value:</span>
+                <span className="font-mono text-emerald-400">
+                  ₹{(
+                    (mobileCreatedOrderSummary.splitOrders || [mobileCreatedOrderSummary.order])
+                      .reduce((sum, o) => sum + (o.total_amount || 0), 0)
+                  ).toLocaleString('en-IN')}
+                </span>
               </div>
             </div>
 
@@ -2075,7 +2463,7 @@ export const MobileAgentView: React.FC = () => {
                 orderStatusFilter === 'PUNCHED_TO_PRINCIPAL' ? 'bg-indigo-600 text-white' : 'text-slate-400'
               }`}
             >
-              Punched ({totalPunchedOrdersCount})
+              Confirmed ({totalPunchedOrdersCount})
             </button>
             <button
               onClick={() => setOrderStatusFilter('PENDING_DELIVERY')}
@@ -2133,25 +2521,54 @@ export const MobileAgentView: React.FC = () => {
                         className={`px-2 py-0.5 rounded text-[9px] font-bold ${
                           ord.status === 'DELIVERED'
                             ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                            : ord.status === 'PUNCHED_TO_PRINCIPAL'
+                            : ord.status === 'CONFIRMED' || ord.status === 'PUNCHED_TO_PRINCIPAL'
                             ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
                             : ord.status === 'APPROVED' || ord.status === 'DISPATCHED'
                             ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
                             : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                         }`}
                       >
-                        {ord.status === 'PUNCHED_TO_PRINCIPAL' ? 'PUNCHED TO PRINCIPAL' : ord.status}
+                        {ord.status === 'CONFIRMED'
+                          ? ord.fulfillment_source === 'DEPOT_STOCK'
+                            ? 'CONFIRMED (DEPOT STOCK)'
+                            : 'CONFIRMED (PO)'
+                          : ord.status === 'PUNCHED_TO_PRINCIPAL'
+                          ? 'CONFIRMED (PO)'
+                          : ord.status}
                       </span>
                     </div>
                   </div>
 
-                  {/* Summary of SKUs inside */}
-                  <div
-                    className="text-[10px] text-slate-400 bg-slate-950 p-2 rounded-xl border border-slate-800/80"
-                  >
-                    <span>
-                      {(ord.lines || []).length} Line Items ({(ord.lines || []).map((l) => l.sku_name).slice(0, 2).join(', ')}...)
-                    </span>
+                  {/* Summary of SKUs & Pickup Dispatch Point(s) */}
+                  <div className="text-[10px] text-slate-400 bg-slate-950 p-2 rounded-xl border border-slate-800/80 space-y-1">
+                    <div>
+                      {(ord.lines || []).length} Line Items ({(ord.lines || []).map((l) => l.sku_name).slice(0, 2).join(', ')}{(ord.lines || []).length > 2 ? '...' : ''})
+                    </div>
+                    {(() => {
+                      const relatedOrders = ord.parent_order_id
+                        ? orders.filter((o) => o.parent_order_id === ord.parent_order_id)
+                        : [ord];
+                      const dpPickups = getDispatchPickupBreakdown(relatedOrders, companies, skus, dispatchPoints);
+                      if (dpPickups.length === 0) return null;
+                      return (
+                        <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                          {dpPickups.map((loc) => (
+                            <span
+                              key={`${loc.dispatchPointId}_${loc.orderId}`}
+                              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold border ${
+                                loc.dispatchPointId === ord.dispatch_point_id
+                                  ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
+                                  : 'bg-slate-900 text-slate-300 border-slate-700'
+                              }`}
+                            >
+                              <Warehouse size={9} />
+                              {loc.dispatchPointName} ({loc.dispatchPointCode})
+                              {relatedOrders.length > 1 ? ` • ${loc.orderNumber}` : ''}
+                            </span>
+                          ))}
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   {/* Action Buttons: VIEW DETAILS, EDIT ORDER (if unverified), COLLECT PAYMENT */}
@@ -2962,6 +3379,34 @@ export const MobileAgentView: React.FC = () => {
                 <span className="text-slate-400">Status:</span>
                 <span className="font-bold text-amber-300">{selectedOrderForDetail.status}</span>
               </div>
+              {(() => {
+                const relatedOrders = selectedOrderForDetail.parent_order_id
+                  ? orders.filter((o) => o.parent_order_id === selectedOrderForDetail.parent_order_id)
+                  : [selectedOrderForDetail];
+                const pickups = getDispatchPickupBreakdown(relatedOrders, companies, skus, dispatchPoints);
+                return pickups.length > 0 ? (
+                  <div className="pt-1.5 mt-1 border-t border-slate-800 space-y-1">
+                    <span className="text-slate-400 block">
+                      Pickup Dispatch Point{pickups.length > 1 ? `s (${pickups.length} Split Pickups)` : ''}:
+                    </span>
+                    <div className="space-y-1">
+                      {pickups.map((loc) => (
+                        <div
+                          key={`${loc.dispatchPointId}_${loc.orderId}`}
+                          className="flex items-center justify-between text-[11px] bg-slate-900 px-2 py-1 rounded border border-slate-800"
+                        >
+                          <span className="text-cyan-300 font-semibold flex items-center gap-1">
+                            <Warehouse size={11} />
+                            {loc.dispatchPointName} ({loc.dispatchPointCode})
+                            {loc.address ? ` — ${loc.address}` : ''}
+                          </span>
+                          <span className="font-mono text-[10px] text-slate-400">{loc.orderNumber}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null;
+              })()}
             </div>
 
             {/* Mode Switch: View vs Edit */}
@@ -3158,7 +3603,7 @@ export const MobileAgentView: React.FC = () => {
                             onChange={(e) => handleEditLineSkuChange(idx, e.target.value)}
                             className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-semibold text-white w-full cursor-pointer"
                           >
-                            {skus.map((s) => {
+                            {allowedSkus.map((s) => {
                               const sComp = getCompanyForSku(s.id);
                               const isSelectedInOtherLine = editLines.some(
                                 (otherL, otherIdx) => otherIdx !== idx && otherL.sku_id === s.id

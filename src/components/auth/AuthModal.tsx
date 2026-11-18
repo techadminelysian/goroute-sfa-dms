@@ -14,7 +14,7 @@ import {
   Info,
   Languages
 } from 'lucide-react';
-import { isValidMobileNumber, sanitizeMobileNumber } from '../../utils/authClient';
+import { isValidMobileNumber, sanitizeMobileNumber, isWebPortalAllowedRole } from '../../utils/authClient';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -35,7 +35,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setLanguage
   } = useAppStore();
 
-  const isWebUser = Boolean(currentUser && currentUser.role !== 'COMMISSION_AGENT' && currentUser.role !== 'DISPATCHER');
+  const isWebUser = currentUser ? isWebPortalAllowedRole(currentUser.role) : true;
 
   // Form States
   const [mobileNumber, setMobileNumber] = useState('');
@@ -281,6 +281,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               </>
             )}
           </button>
+          {/* Web Console Role Policy Notice */}
+          <div className="p-2.5 bg-slate-950/70 border border-slate-800/90 rounded-xl text-[11px] text-slate-400 flex items-start gap-2">
+            <Shield size={13} className="text-blue-400 shrink-0 mt-0.5" />
+            <span>
+              Web Portal sign-in is restricted to office console roles (Admin, Sub-Admin, Billing, Order Puncher, Accountant). Field roles & Dispatchers must use the Mobile App.
+            </span>
+          </div>
         </form>
 
         {/* Modal Footer Security Banner */}

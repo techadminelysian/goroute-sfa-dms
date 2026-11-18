@@ -1,6 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useAppStore } from '../../data/store';
-import { Payment, PaymentMode, PaymentAllocation, Retailer, Invoice } from '../../types';
+import { Payment, PaymentMode, PaymentAllocation, Invoice } from '../../types';
+import {
+  buildPartyCreditRecords,
+  CreditPartyCategory,
+  PartyCreditRecord,
+} from '../../utils/creditLedger';
 import { KPICard } from '../common/KPICard';
 import {
   AlertTriangle,
@@ -31,46 +36,106 @@ import {
   FileCheck,
   Shield,
   Send,
-  UserCheck
+  UserCheck,
+  Trash2,
+  Edit2,
+  Users,
+  Database
 } from 'lucide-react';
 
 export const CreditManagement: React.FC = () => {
   const {
     activeTenant,
     activeTenantSettings,
+    currentUser,
     retailers,
+    distributors = [],
+    users = [],
     orders,
     invoices,
     payments,
+    partyLedger = [],
     addPayment,
     verifyPayment,
     flagPayment,
     unflagPayment,
     markCashBanked,
-    updateRetailerCreditLimit
+    issueCreditNoteDiscount,
+    syncCreditGateFromFirestore,
+    updatePartyCreditLimit,
+    removeCreditParty
   } = useAppStore();
 
   // Active Sub-Tab: 'INBOX' | 'MODE_HELPERS' | 'LEDGER_CREDIT'
   const [activeTab, setActiveTab] = useState<'INBOX' | 'MODE_HELPERS' | 'LEDGER_CREDIT'>('INBOX');
+
+  // Non-blocking feedback banner
+  const [statusBanner, setStatusBanner] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [isSyncingFirestore, setIsSyncingFirestore] = useState(false);
+
+  // Sync live party records from Cloud Firestore on mount & tab focus
+  useEffect(() => {
+    let active = true;
+    const runSync = async () => {
+      setIsSyncingFirestore(true);
+      try {
+        await syncCreditGateFromFirestore();
+      } finally {
+        if (active) setIsSyncingFirestore(false);
+      }
+    };
+    runSync();
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Filters
   const [filterMode, setFilterMode] = useState<string>('ALL');
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [filterOverLimit, setFilterOverLimit] = useState<boolean>(false);
+  const [filterPartyCategory, setFilterPartyCategory] = useState<'ALL' | CreditPartyCategory>('ALL');
 
   // Modals & Active Selections
   const [isNewPaymentModalOpen, setIsNewPaymentModalOpen] = useState(false);
   const [selectedPaymentForProof, setSelectedPaymentForProof] = useState<Payment | null>(null);
   const [selectedPaymentForSplit, setSelectedPaymentForSplit] = useState<Payment | null>(null);
-  const [selectedRetailerForLedger, setSelectedRetailerForLedger] = useState<Retailer | null>(null);
+  const [selectedPartyForLedger, setSelectedPartyForLedger] = useState<PartyCreditRecord | null>(null);
+
+  // Adjust Credit Limit & Remove Party Modals
+  const [adjustingParty, setAdjustingParty] = useState<PartyCreditRecord | null>(null);
+  const [adjustLimitInput, setAdjustLimitInput] = useState<string>('50000');
+  const [isSavingCreditLimit, setIsSavingCreditLimit] = useState(false);
+  const [removingParty, setRemovingParty] = useState<PartyCreditRecord | null>(null);
+  const [isRemovingParty, setIsRemovingParty] = useState(false);
 
   // Flag Modal State
   const [flaggingPayment, setFlaggingPayment] = useState<Payment | null>(null);
   const [flagReasonInput, setFlagReasonInput] = useState('');
 
+  // Occasional Credit Note Discount Modal State (explicit-only, never applied by default)
+  const [creditNoteTargetInvoice, setCreditNoteTargetInvoice] = useState<Invoice | null>(null);
+  const [creditNoteAmount, setCreditNoteAmount] = useState<string>('');
+  const [creditNoteNumber, setCreditNoteNumber] = useState<string>('');
+  const [creditNoteReason, setCreditNoteReason] = useState<string>('');
+
+  // Unified Party Credit Gate Records (Retailers + Distributors + Active CFS Users)
+  const partyCreditRecords = useMemo(() => {
+    return buildPartyCreditRecords({
+      retailers,
+      distributors,
+      users,
+      orders,
+      invoices,
+      payments,
+      defaultCreditLimit: activeTenantSettings?.credit_limit_default || 50000,
+    });
+  }, [retailers, distributors, users, orders, invoices, payments, activeTenantSettings?.credit_limit_default]);
+
   // New Payment Form State
-  const [newPayRetailerId, setNewPayRetailerId] = useState<string>(retailers[0]?.id || '');
+  const [newPayRetailerId, setNewPayRetailerId] = useState<string>(partyCreditRecords[0]?.id || retailers[0]?.id || '');
   const [newPayAmount, setNewPayAmount] = useState<number>(10000);
   const [newPayMode, setNewPayMode] = useState<PaymentMode>('NEFT_RTGS');
   const [newPayRef, setNewPayRef] = useState<string>('');
@@ -82,11 +147,18 @@ export const CreditManagement: React.FC = () => {
   // Split Allocation State
   const [splitAllocations, setSplitAllocations] = useState<{ invoice_id: string; amount: number }[]>([]);
 
+  const showToast = (type: 'success' | 'error' | 'info', message: string) => {
+    setStatusBanner({ type, message });
+    setTimeout(() => {
+      setStatusBanner((prev) => (prev?.message === message ? null : prev));
+    }, 5000);
+  };
+
   // Filter Payments Queue
   const filteredPayments = payments.filter((p) => {
     if (filterMode !== 'ALL' && p.payment_mode !== filterMode) return false;
     if (filterStatus !== 'ALL' && p.status !== filterStatus) return false;
-    if (searchQuery) {
+    if (searchQuery && activeTab === 'INBOX') {
       const q = searchQuery.toLowerCase();
       return (
         p.payment_number.toLowerCase().includes(q) ||
@@ -99,35 +171,107 @@ export const CreditManagement: React.FC = () => {
     return true;
   });
 
-  // Filter Retailers for Ledger View
-  const filteredRetailers = retailers.filter((r) => {
-    if (filterOverLimit && r.current_outstanding <= r.credit_limit) return false;
+  // Filter Unified Parties for Party Ledger & Credit Gate View
+  const filteredParties = partyCreditRecords.filter((p) => {
+    if (filterPartyCategory !== 'ALL' && p.category !== filterPartyCategory) return false;
+    if (filterOverLimit && !p.is_credit_blocked) return false;
     if (searchQuery && activeTab === 'LEDGER_CREDIT') {
       const q = searchQuery.toLowerCase();
-      return r.name.toLowerCase().includes(q) || r.code.toLowerCase().includes(q) || r.beat_name.toLowerCase().includes(q);
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.code.toLowerCase().includes(q) ||
+        p.routeOrLocation.toLowerCase().includes(q) ||
+        p.categoryLabel.toLowerCase().includes(q) ||
+        (p.mobileOrPhone && p.mobileOrPhone.toLowerCase().includes(q))
+      );
     }
     return true;
   });
 
-  // KPI Calculations
+  // KPI Calculations across all active credit parties
   const verifiedPayments = payments.filter((p) => p.status === 'VERIFIED');
   const pendingPayments = payments.filter((p) => p.status === 'PENDING');
   const flaggedPayments = payments.filter((p) => p.status === 'FLAGGED');
 
   const totalVerifiedSum = verifiedPayments.reduce((sum, p) => sum + p.amount, 0);
   const totalPendingSum = pendingPayments.reduce((sum, p) => sum + p.amount, 0);
-  const totalOutstanding = retailers.reduce((sum, r) => sum + r.current_outstanding, 0);
-  const totalCreditLimit = retailers.reduce((sum, r) => sum + r.credit_limit, 0);
-  const overLimitCount = retailers.filter((r) => r.current_outstanding > r.credit_limit).length;
+  const totalOutstanding = partyCreditRecords.reduce((sum, p) => sum + p.total_liability, 0);
+  const totalCreditLimit = partyCreditRecords.reduce((sum, p) => sum + p.credit_limit, 0);
+  const totalFundShortage = partyCreditRecords.reduce((sum, p) => sum + p.fund_shortage, 0);
+  const overLimitCount = partyCreditRecords.filter((p) => p.is_credit_blocked).length;
+
+  const retailerPartyCount = partyCreditRecords.filter((p) => p.category === 'RETAILER').length;
+  const distributorPartyCount = partyCreditRecords.filter((p) => p.category === 'DISTRIBUTOR').length;
+  const cfsPartyCount = partyCreditRecords.filter((p) => p.category === 'CFS').length;
 
   // Handlers
+  const handleManualFirestoreRefresh = async () => {
+    setIsSyncingFirestore(true);
+    const ok = await syncCreditGateFromFirestore();
+    setIsSyncingFirestore(false);
+    showToast(
+      ok ? 'success' : 'info',
+      ok
+        ? 'Party Ledger & Credit Gate synced directly from Cloud Firestore.'
+        : 'Showing live synced store records.'
+    );
+  };
+
+  const handleOpenAdjustModal = (party: PartyCreditRecord) => {
+    setAdjustingParty(party);
+    setAdjustLimitInput(String(party.credit_limit));
+  };
+
+  const handleConfirmAdjustLimit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adjustingParty) return;
+    const numericLimit = Number(adjustLimitInput);
+    if (isNaN(numericLimit) || numericLimit < 0) {
+      showToast('error', 'Please enter a valid non-negative credit limit.');
+      return;
+    }
+
+    setIsSavingCreditLimit(true);
+    try {
+      await updatePartyCreditLimit(adjustingParty.partyKind, adjustingParty.id, numericLimit, {
+        linkedUserId: adjustingParty.linkedUserId,
+        linkedDistributorId: adjustingParty.linkedDistributorId,
+      });
+      showToast(
+        'success',
+        `Credit limit for ${adjustingParty.name} (${adjustingParty.categoryLabel}) updated to ₹${numericLimit.toLocaleString('en-IN')} and persisted to Cloud Firestore.`
+      );
+      setAdjustingParty(null);
+    } finally {
+      setIsSavingCreditLimit(false);
+    }
+  };
+
+  const handleConfirmRemoveParty = async () => {
+    if (!removingParty) return;
+    setIsRemovingParty(true);
+    try {
+      await removeCreditParty(removingParty.partyKind, removingParty.id, {
+        linkedUserId: removingParty.linkedUserId,
+        linkedDistributorId: removingParty.linkedDistributorId,
+      });
+      showToast(
+        'success',
+        `${removingParty.name} (${removingParty.categoryLabel}) removed from active Party Ledger & Credit Gate in Cloud Firestore.`
+      );
+      setRemovingParty(null);
+    } finally {
+      setIsRemovingParty(false);
+    }
+  };
+
   const handleVerify = (paymentId: string) => {
     verifyPayment(paymentId);
   };
 
   const handleUnflag = (paymentId: string) => {
     unflagPayment(paymentId);
-    alert('Payment collection flag removed. Status reset to Pending AE Check.');
+    showToast('info', 'Payment collection flag removed. Status reset to Pending AE Check.');
   };
 
   const handleOpenFlagModal = (pay: Payment) => {
@@ -145,8 +289,8 @@ export const CreditManagement: React.FC = () => {
 
   const handleCreateNewPayment = (e: React.FormEvent) => {
     e.preventDefault();
-    const ret = retailers.find((r) => r.id === newPayRetailerId);
-    const retailerName = ret ? ret.name : 'Direct Institutional Buyer';
+    const matchedParty = partyCreditRecords.find((p) => p.id === newPayRetailerId);
+    const partyName = matchedParty ? matchedParty.name : 'Direct Institutional Buyer';
 
     const inv = invoices.find((i) => i.id === newPayInvoiceId);
 
@@ -155,7 +299,7 @@ export const CreditManagement: React.FC = () => {
       tenant_id: activeTenant.id,
       payment_number: `PAY-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`,
       retailer_id: newPayRetailerId || null,
-      retailer_name: retailerName,
+      retailer_name: partyName,
       amount: Number(newPayAmount) || 0,
       payment_mode: newPayMode,
       reference_number: newPayRef || `REF-${Math.floor(100000 + Math.random() * 900000)}`,
@@ -164,7 +308,7 @@ export const CreditManagement: React.FC = () => {
       allocations: inv
         ? [{ invoice_id: inv.id, invoice_number: inv.invoice_number, amount: Number(newPayAmount) || 0 }]
         : [],
-      status: 'VERIFIED', // Account Executive directly logs and verifies
+      status: 'VERIFIED',
       collector_name: newPayCollector || 'Office Account Executive',
       bank_name: newPayBank || 'HDFC Bank',
       notes: newPayNotes || 'Direct Bank Transfer / NEFT entry by Collections Controller',
@@ -172,7 +316,7 @@ export const CreditManagement: React.FC = () => {
 
     addPayment(newPaymentObj);
     setIsNewPaymentModalOpen(false);
-    alert(`Payment ${newPaymentObj.payment_number} for ₹${newPaymentObj.amount.toLocaleString('en-IN')} logged and verified in ledger!`);
+    showToast('success', `Payment ${newPaymentObj.payment_number} for ₹${newPaymentObj.amount.toLocaleString('en-IN')} logged and verified in ledger!`);
   };
 
   const handleOpenSplitModal = (pay: Payment) => {
@@ -213,11 +357,31 @@ export const CreditManagement: React.FC = () => {
 
     verifyPayment(selectedPaymentForSplit.id, formattedAllocations);
     setSelectedPaymentForSplit(null);
-    alert(`Payment ${selectedPaymentForSplit.payment_number} verified and allocated across ${formattedAllocations.length} invoices!`);
+    showToast('success', `Payment ${selectedPaymentForSplit.payment_number} verified and allocated across ${formattedAllocations.length} invoices!`);
   };
 
   return (
     <div className="space-y-6">
+      {statusBanner && (
+        <div
+          className={`px-4 py-3 rounded-xl border text-xs font-semibold flex items-center justify-between gap-3 ${
+            statusBanner.type === 'success'
+              ? 'bg-emerald-950/70 border-emerald-500/40 text-emerald-200'
+              : statusBanner.type === 'error'
+                ? 'bg-rose-950/70 border-rose-500/40 text-rose-200'
+                : 'bg-blue-950/70 border-blue-500/40 text-blue-200'
+          }`}
+        >
+          <span>{statusBanner.message}</span>
+          <button
+            type="button"
+            onClick={() => setStatusBanner(null)}
+            className="text-xs font-bold opacity-80 hover:opacity-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* Executive Role Header & Boundary Callout */}
       <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
         <div>
@@ -296,11 +460,15 @@ export const CreditManagement: React.FC = () => {
           accentColor="#f43f5e"
         />
         <KPICard
-          title="Total Retailer Outstanding"
+          title="Total Party Liability"
           value={`₹${totalOutstanding.toLocaleString('en-IN')}`}
-          delta={{ value: `${overLimitCount} Over Limit`, isPositive: false, label: 'credit gate active' }}
+          delta={{
+            value: `${overLimitCount} Over Limit`,
+            isPositive: overLimitCount === 0,
+            label: totalFundShortage > 0 ? `Shortage ₹${totalFundShortage.toLocaleString('en-IN')}` : 'credit gate active',
+          }}
           icon={Building}
-          subtext={`Limit pool: ₹${totalCreditLimit.toLocaleString('en-IN')}`}
+          subtext={`Pool: ₹${totalCreditLimit.toLocaleString('en-IN')} (${partyCreditRecords.length} parties)`}
         />
       </div>
 
@@ -339,7 +507,7 @@ export const CreditManagement: React.FC = () => {
           }`}
         >
           <FileText size={15} />
-          3. Retailer & Sub-Distributor Ledger & Credit Gate ({retailers.length})
+          3. Party Ledger & Credit Gate ({partyCreditRecords.length})
         </button>
       </div>
 
@@ -723,7 +891,7 @@ export const CreditManagement: React.FC = () => {
                             <button
                               onClick={() => {
                                 markCashBanked(p.id);
-                                alert(`Marked cash receipt ${p.payment_number} as banked in branch!`);
+                                showToast('success', `Marked cash receipt ${p.payment_number} as banked in branch.`);
                               }}
                               className="px-2 py-1 rounded bg-blue-900/60 text-blue-200 border border-blue-700 font-semibold text-[10px]"
                             >
@@ -789,13 +957,65 @@ export const CreditManagement: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 3: RETAILER LEDGER & CREDIT GATE */}
+      {/* TAB 3: PARTY LEDGER & CREDIT GATE */}
       {activeTab === 'LEDGER_CREDIT' && (
         <div className="space-y-4">
+          {/* Renamed Section Header + Live Firestore Sync Bar */}
+          <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-base font-bold text-white flex items-center gap-2">
+                  <Shield size={18} className="text-emerald-400" /> Party Ledger & Credit Gate
+                </h2>
+                <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-semibold inline-flex items-center gap-1">
+                  <Database size={10} /> Firestore Synced
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Unified credit control across {distributorPartyCount} Distributors, {cfsPartyCount} active CFS Agents, and {retailerPartyCount} Retail Outlets. Limit updates and party removals sync live to the Mobile App.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleManualFirestoreRefresh}
+              disabled={isSyncingFirestore}
+              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 inline-flex items-center gap-1.5 disabled:opacity-60"
+            >
+              <RefreshCw size={13} className={isSyncingFirestore ? 'animate-spin text-emerald-400' : 'text-emerald-400'} />
+              {isSyncingFirestore ? 'Syncing Firestore...' : 'Refresh from Firestore'}
+            </button>
+          </div>
+
           {/* Controls Bar */}
           <div className="bg-slate-900 border border-slate-800 p-3 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                {(
+                  [
+                    { key: 'ALL', label: `All Parties (${partyCreditRecords.length})` },
+                    { key: 'DISTRIBUTOR', label: `Distributors (${distributorPartyCount})` },
+                    { key: 'CFS', label: `CFS Users (${cfsPartyCount})` },
+                    { key: 'RETAILER', label: `Retailers (${retailerPartyCount})` },
+                  ] as const
+                ).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setFilterPartyCategory(item.key)}
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors ${
+                      filterPartyCategory === item.key
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+
               <button
+                type="button"
                 onClick={() => setFilterOverLimit(!filterOverLimit)}
                 className={`px-3 py-1.5 rounded-lg font-semibold flex items-center gap-1.5 border transition-all ${
                   filterOverLimit
@@ -803,15 +1023,15 @@ export const CreditManagement: React.FC = () => {
                     : 'bg-slate-950 text-slate-400 border-slate-700 hover:text-white'
                 }`}
               >
-                <AlertTriangle size={14} /> Filter Credit Gate Holds Only ({overLimitCount})
+                <AlertTriangle size={14} /> Over Limit Only ({overLimitCount})
               </button>
             </div>
 
-            <div className="relative w-full sm:w-64">
+            <div className="relative w-full sm:w-72">
               <Search size={14} className="absolute left-2.5 top-2.5 text-slate-500" />
               <input
                 type="text"
-                placeholder="Search retailer name, beat, code..."
+                placeholder="Search party name, role, mobile, beat..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white"
@@ -819,90 +1039,142 @@ export const CreditManagement: React.FC = () => {
             </div>
           </div>
 
-          {/* Retailers Table */}
+          {/* Unified Party Ledger Table */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
-                  <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 uppercase tracking-wider font-semibold">
-                    <th className="py-3 px-4">Retailer Store & Code</th>
-                    <th className="py-3 px-4">Beat Route</th>
+                    <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 uppercase tracking-wider font-semibold">
+                    <th className="py-3 px-4">Party Name, Code & Type</th>
+                    <th className="py-3 px-4">Territory / Contact</th>
                     <th className="py-3 px-4 text-right">Credit Limit (₹)</th>
-                    <th className="py-3 px-4 text-right">Current Outstanding (₹)</th>
-                    <th className="py-3 px-4 text-center">Credit Exposure %</th>
-                    <th className="py-3 px-4 text-center">Credit Gate Status</th>
-                    <th className="py-3 px-4 text-right">Ledger Actions</th>
+                    <th className="py-3 px-4 text-right">Total Liability (₹)</th>
+                    <th className="py-3 px-4 text-right">Remaining Credit (₹)</th>
+                    <th className="py-3 px-4 text-right">Fund Shortage (₹)</th>
+                    <th className="py-3 px-4 text-center">Exposure %</th>
+                    <th className="py-3 px-4 text-center">Credit Gate</th>
+                    <th className="py-3 px-4 text-right">Party Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/80 text-slate-200">
-                  {filteredRetailers.map((r) => {
-                    const isExceeded = r.current_outstanding > r.credit_limit;
-                    const pct = Math.min(100, Math.round((r.current_outstanding / (r.credit_limit || 1)) * 100));
+                  {filteredParties.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-8 text-center text-slate-500">
+                        No active parties match your selected filter criteria.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredParties.map((party) => {
+                      const isExceeded = party.is_credit_blocked;
+                      const pct = party.credit_limit > 0
+                        ? Math.min(100, Math.round((party.total_liability / party.credit_limit) * 100))
+                        : party.total_liability > 0
+                          ? 100
+                          : 0;
 
-                    return (
-                      <tr key={r.id} className="hover:bg-slate-800/40 transition-colors">
-                        <td className="py-3 px-4 font-semibold text-white">
-                          {r.name}
-                          <div className="text-[10px] text-slate-500 font-mono">{r.code}</div>
-                        </td>
-                        <td className="py-3 px-4 text-slate-300">{r.beat_name}</td>
-                        <td className="py-3 px-4 text-right font-mono font-bold text-white">
-                          ₹{r.credit_limit.toLocaleString('en-IN')}
-                        </td>
-                        <td
-                          className={`py-3 px-4 text-right font-mono font-bold text-sm ${
-                            isExceeded ? 'text-rose-400' : 'text-emerald-400'
-                          }`}
-                        >
-                          ₹{r.current_outstanding.toLocaleString('en-IN')}
-                        </td>
+                      const badgeClass =
+                        party.category === 'DISTRIBUTOR'
+                          ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
+                          : party.category === 'CFS'
+                            ? 'bg-purple-500/20 text-purple-300 border-purple-500/30'
+                            : 'bg-slate-800 text-slate-300 border-slate-700';
 
-                        <td className="py-3 px-4 text-center">
-                          <div className="w-24 mx-auto bg-slate-950 rounded-full h-2 border border-slate-800 overflow-hidden mb-1">
-                            <div
-                              className={`h-full ${isExceeded ? 'bg-rose-500' : 'bg-emerald-500'}`}
-                              style={{ width: `${pct}%` }}
-                            />
-                          </div>
-                          <span className="text-[10px] font-mono font-bold text-slate-400">{pct}%</span>
-                        </td>
-
-                        <td className="py-3 px-4 text-center">
-                          {isExceeded ? (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 inline-flex items-center gap-1">
-                              <Lock size={12} /> Credit Blocked
-                            </span>
-                          ) : (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 inline-flex items-center gap-1">
-                              <Unlock size={12} /> Clear
-                            </span>
-                          )}
-                        </td>
-
-                        <td className="py-3 px-4 text-right space-x-1">
-                          <button
-                            onClick={() => setSelectedRetailerForLedger(r)}
-                            className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-bold shadow-sm"
+                      return (
+                        <tr key={`${party.partyKind}_${party.id}`} className="hover:bg-slate-800/40 transition-colors">
+                          <td className="py-3 px-4 font-semibold text-white">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span>{party.name}</span>
+                              <span className={`px-1.5 py-0.5 rounded border text-[9px] font-bold uppercase ${badgeClass}`}>
+                                {party.categoryLabel}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-slate-500 font-mono mt-0.5">{party.code}</div>
+                          </td>
+                          <td className="py-3 px-4 text-slate-300">
+                            <div>{party.routeOrLocation}</div>
+                            {party.mobileOrPhone && (
+                              <div className="text-[10px] text-slate-500 font-mono">{party.mobileOrPhone}</div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono font-bold text-white">
+                            ₹{party.credit_limit.toLocaleString('en-IN')}
+                          </td>
+                          <td
+                            className={`py-3 px-4 text-right font-mono font-bold text-sm ${
+                              isExceeded ? 'text-rose-400' : 'text-amber-300'
+                            }`}
                           >
-                            View Ledger Statement
-                          </button>
-
-                          <button
-                            onClick={() => {
-                              const newLim = prompt(`Adjust credit limit for ${r.name}:`, String(r.credit_limit));
-                              if (newLim !== null && !isNaN(Number(newLim))) {
-                                updateRetailerCreditLimit(r.id, Number(newLim));
-                                alert(`Credit limit updated for ${r.name}!`);
-                              }
-                            }}
-                            className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[10px] font-semibold"
+                            ₹{party.total_liability.toLocaleString('en-IN')}
+                          </td>
+                          <td
+                            className={`py-3 px-4 text-right font-mono font-bold text-sm ${
+                              party.remaining_credit === 0 && party.total_liability > 0 ? 'text-amber-400' : 'text-emerald-400'
+                            }`}
                           >
-                            Adjust Limit
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                            ₹{party.remaining_credit.toLocaleString('en-IN')}
+                          </td>
+                          <td
+                            className={`py-3 px-4 text-right font-mono font-bold text-sm ${
+                              party.fund_shortage > 0 ? 'text-rose-400' : 'text-slate-500'
+                            }`}
+                          >
+                            {party.fund_shortage > 0 ? `₹${party.fund_shortage.toLocaleString('en-IN')}` : '₹0'}
+                          </td>
+
+                          <td className="py-3 px-4 text-center">
+                            <div className="w-24 mx-auto bg-slate-950 rounded-full h-2 border border-slate-800 overflow-hidden mb-1">
+                              <div
+                                className={`h-full ${isExceeded ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                            <span className="text-[10px] font-mono font-bold text-slate-400">{pct}%</span>
+                          </td>
+
+                          <td className="py-3 px-4 text-center">
+                            {isExceeded ? (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 inline-flex items-center gap-1">
+                                <Lock size={12} /> Shortage Hold
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 inline-flex items-center gap-1">
+                                <Unlock size={12} /> Clear
+                              </span>
+                            )}
+                          </td>
+
+                          <td className="py-3 px-4 text-right">
+                            <div className="inline-flex items-center justify-end gap-1.5 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => setSelectedPartyForLedger(party)}
+                                className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-bold shadow-sm"
+                              >
+                                Statement
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => handleOpenAdjustModal(party)}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[10px] font-semibold inline-flex items-center gap-1"
+                              >
+                                <Edit2 size={11} /> Adjust Limit
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => setRemovingParty(party)}
+                                className="px-2 py-1 rounded bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-500/40 text-[10px] font-semibold inline-flex items-center gap-1"
+                                title="Remove party from Credit Gate in Cloud Firestore"
+                              >
+                                <Trash2 size={11} /> Remove
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
@@ -933,15 +1205,15 @@ export const CreditManagement: React.FC = () => {
 
             <form onSubmit={handleCreateNewPayment} className="space-y-4 text-xs">
               <div>
-                <label className="block text-[11px] text-slate-400 mb-1 font-medium">Select Retailer / Institution</label>
+                <label className="block text-[11px] text-slate-400 mb-1 font-medium">Select Party (Retailer / Distributor / CFS)</label>
                 <select
                   value={newPayRetailerId}
                   onChange={(e) => setNewPayRetailerId(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white"
                 >
-                  {retailers.map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.name} ({r.code}) [Bal: ₹{r.current_outstanding.toLocaleString('en-IN')}]
+                  {partyCreditRecords.map((p) => (
+                    <option key={`${p.partyKind}_${p.id}`} value={p.id}>
+                      [{p.categoryLabel}] {p.name} ({p.code}) [Bal: ₹{p.current_outstanding.toLocaleString('en-IN')}]
                     </option>
                   ))}
                 </select>
@@ -1208,13 +1480,13 @@ export const CreditManagement: React.FC = () => {
                 <div className="flex justify-between"><span className="text-slate-400">Submitted By:</span> <span className="text-slate-200">{selectedPaymentForProof.collector_name || 'Agent'}</span></div>
               </div>
 
-              {/* Simulated Screenshot Asset Box */}
+              {/* Attached Digital Payment Proof Box */}
               <div className="bg-slate-950 border border-dashed border-purple-500/40 rounded-xl p-6 text-center space-y-2">
                 <div className="w-12 h-12 rounded-full bg-purple-500/20 text-purple-300 mx-auto flex items-center justify-center font-bold">
                   UPI
                 </div>
                 <div className="font-mono text-xs font-bold text-purple-300">{selectedPaymentForProof.proof_url}</div>
-                <p className="text-[10px] text-slate-400">Verified digital payment receipt attached by field commission agent.</p>
+                <p className="text-[10px] text-slate-400">Digital payment receipt reference submitted by field collector.</p>
               </div>
 
               <div className="pt-2 flex justify-end">
@@ -1230,51 +1502,163 @@ export const CreditManagement: React.FC = () => {
         </div>
       )}
 
-      {/* MODAL 5: RETAILER LEDGER STATEMENT */}
-      {selectedRetailerForLedger && (() => {
-        const liveRetailer = retailers.find((r) => r.id === selectedRetailerForLedger.id) || selectedRetailerForLedger;
-        const unInvoicedDeliveredOrders = orders.filter(
-          (o) => o.retailer_id === liveRetailer.id && o.status === 'DELIVERED' && !invoices.some((i) => i.order_id === o.id)
+      {/* MODAL 5: PARTY LEDGER STATEMENT */}
+      {selectedPartyForLedger && (() => {
+        const liveParty =
+          partyCreditRecords.find(
+            (p) => p.id === selectedPartyForLedger.id && p.partyKind === selectedPartyForLedger.partyKind
+          ) || selectedPartyForLedger;
+        const matchIdSet = new Set(liveParty.matchIds);
+        const matchNameSet = new Set(liveParty.matchNames.map((n) => n.trim().toLowerCase()));
+
+        const matchesParty = (entityId?: string | null, entityName?: string | null) =>
+          (entityId && matchIdSet.has(entityId)) ||
+          (entityName && matchNameSet.has(entityName.trim().toLowerCase()));
+
+        const matchedInvoices = invoices.filter((i) => matchesParty(i.retailer_id, i.retailer_name));
+        const matchedAllOrders = orders.filter(
+          (o) =>
+            matchesParty(o.retailer_id, o.retailer_name_raw) ||
+            (liveParty.role === 'DISTRIBUTOR' &&
+              o.created_by_user_id === liveParty.linkedUserId &&
+              (o.channel === 'DISTRIBUTOR' || o.order_source_role === 'DISTRIBUTOR'))
         );
+        const matchedNonCancelledOrders = matchedAllOrders.filter((o) => o.status !== 'CANCELLED');
+        const matchedCancelledOrders = matchedAllOrders.filter((o) => o.status === 'CANCELLED');
+        const matchedPayments = payments.filter(
+          (p) => p.status === 'VERIFIED' && matchesParty(p.retailer_id, p.retailer_name)
+        );
+        const matchedLedgerEntries = (partyLedger || [])
+          .filter((le) => matchesParty(le.party_id, le.party_name))
+          .slice(0, 25);
 
         return (
           <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl p-6 text-slate-200 space-y-4 shadow-2xl">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl p-6 text-slate-200 space-y-4 shadow-2xl my-6 max-h-[90vh] overflow-y-auto">
               <div className="flex items-center justify-between pb-3 border-b border-slate-800">
                 <div>
                   <span className="text-[10px] font-mono text-blue-400 uppercase font-bold">
-                    Verified Ledger Audit
+                    Live Cloud Firestore Party Ledger ({liveParty.categoryLabel})
                   </span>
                   <h3 className="text-base font-bold text-white">
-                    Statement of Account: {liveRetailer.name} ({liveRetailer.code})
+                    Statement of Account: {liveParty.name} ({liveParty.code})
                   </h3>
                 </div>
-                <button onClick={() => setSelectedRetailerForLedger(null)} className="text-slate-400 hover:text-white font-bold text-xs">
+                <button onClick={() => setSelectedPartyForLedger(null)} className="text-slate-400 hover:text-white font-bold text-xs">
                   ✕ Close
                 </button>
               </div>
 
               {/* Account Summary Strip */}
-              <div className="grid grid-cols-3 gap-3 p-3 bg-slate-950 border border-slate-800 rounded-xl text-xs text-center font-mono">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 p-3 bg-slate-950 border border-slate-800 rounded-xl text-xs text-center font-mono">
                 <div>
                   <span className="text-slate-400 text-[10px] block font-sans">Credit Limit</span>
-                  <span className="font-bold text-white text-sm">₹{liveRetailer.credit_limit.toLocaleString('en-IN')}</span>
+                  <span className="font-bold text-white text-sm">₹{liveParty.credit_limit.toLocaleString('en-IN')}</span>
                 </div>
                 <div>
-                  <span className="text-slate-400 text-[10px] block font-sans">Net Outstanding</span>
-                  <span className="font-bold text-rose-400 text-sm">₹{liveRetailer.current_outstanding.toLocaleString('en-IN')}</span>
+                  <span className="text-slate-400 text-[10px] block font-sans">Total Liability (Utilized)</span>
+                  <span className="font-bold text-amber-300 text-sm">₹{liveParty.total_liability.toLocaleString('en-IN')}</span>
                 </div>
                 <div>
-                  <span className="text-slate-400 text-[10px] block font-sans">Credit Status</span>
-                  <span className="font-bold text-emerald-400 text-xs">
-                    {liveRetailer.current_outstanding > liveRetailer.credit_limit ? 'HOLD' : 'ACTIVE'}
+                  <span className="text-slate-400 text-[10px] block font-sans">Remaining Credit</span>
+                  <span className="font-bold text-emerald-400 text-sm">₹{liveParty.remaining_credit.toLocaleString('en-IN')}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 text-[10px] block font-sans">Fund Shortage</span>
+                  <span className={`font-bold text-sm ${liveParty.fund_shortage > 0 ? 'text-rose-400' : 'text-slate-400'}`}>
+                    ₹{liveParty.fund_shortage.toLocaleString('en-IN')}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-400 text-[10px] block font-sans">Credit Gate</span>
+                  <span className={`font-bold text-xs ${liveParty.is_credit_blocked ? 'text-rose-400' : 'text-emerald-400'}`}>
+                    {liveParty.is_credit_blocked ? 'OVER-LIMIT HOLD' : 'ACTIVE'}
                   </span>
                 </div>
               </div>
 
-              {/* Invoices & Payments Timeline */}
+              {/* Formula Breakdown Banner */}
+              <div className="px-3 py-2 rounded-xl bg-slate-950/70 border border-slate-800 text-[11px] font-mono flex flex-wrap items-center justify-between gap-2 text-slate-300">
+                <span>
+                  Non-Cancelled Orders: <strong className="text-rose-300">₹{liveParty.non_cancelled_orders_total.toLocaleString('en-IN')}</strong>
+                </span>
+                <span>
+                  Verified Payments: <strong className="text-emerald-300">-₹{liveParty.verified_payments_total.toLocaleString('en-IN')}</strong>
+                </span>
+                <span>
+                  Explicit Credit Notes: <strong className="text-purple-300">-₹{liveParty.credit_note_discounts_total.toLocaleString('en-IN')}</strong>
+                </span>
+              </div>
+
+              {/* Firestore Audit Ledger Entries */}
+              {matchedLedgerEntries.length > 0 && (
+                <div className="space-y-2">
+                  <span className="font-bold text-emerald-300 text-xs block">
+                    Live Cloud Firestore Ledger Stream (Real-Time Debits, Reversals &amp; Credits)
+                  </span>
+                  <div className="border border-slate-800 rounded-xl overflow-hidden text-xs">
+                    <table className="w-full text-left">
+                      <thead>
+                        <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 uppercase text-[10px] font-semibold">
+                          <th className="py-2 px-3">Date</th>
+                          <th className="py-2 px-3">Event Type</th>
+                          <th className="py-2 px-3">Ref # &amp; Notes</th>
+                          <th className="py-2 px-3 text-right">Debit (+)</th>
+                          <th className="py-2 px-3 text-right">Credit (-)</th>
+                          <th className="py-2 px-3 text-right">Liability After</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/80 font-mono text-[11px]">
+                        {matchedLedgerEntries.map((entry) => (
+                          <tr key={entry.id} className="hover:bg-slate-800/30">
+                            <td className="py-2 px-3 text-slate-400">{(entry.created_at || '').split('T')[0]}</td>
+                            <td className="py-2 px-3 font-sans">
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                                  entry.entry_type === 'ORDER_CANCELLATION_REVERSAL'
+                                    ? 'bg-emerald-500/20 text-emerald-300'
+                                    : entry.entry_type === 'PAYMENT_CREDIT'
+                                      ? 'bg-emerald-500/20 text-emerald-300'
+                                      : entry.entry_type === 'CREDIT_NOTE_DISCOUNT'
+                                        ? 'bg-purple-500/20 text-purple-300'
+                                        : entry.entry_type === 'ORDER_AMEND_ADJUSTMENT'
+                                          ? 'bg-amber-500/20 text-amber-300'
+                                          : 'bg-rose-500/20 text-rose-300'
+                                }`}
+                              >
+                                {entry.entry_type}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 font-sans text-slate-200 max-w-xs truncate">
+                              {(entry.order_number || entry.invoice_number || entry.credit_note_number) && (
+                                <span className="font-mono font-bold mr-1.5">
+                                  {entry.order_number || entry.invoice_number || entry.credit_note_number}
+                                </span>
+                              )}
+                              <span className="text-slate-400">{entry.notes}</span>
+                            </td>
+                            <td className="py-2 px-3 text-right text-rose-400 font-bold">
+                              {entry.debit_amount > 0 ? `+₹${entry.debit_amount.toLocaleString('en-IN')}` : '-'}
+                            </td>
+                            <td className="py-2 px-3 text-right text-emerald-400 font-bold">
+                              {entry.credit_amount > 0 ? `-₹${entry.credit_amount.toLocaleString('en-IN')}` : '-'}
+                            </td>
+                            <td className="py-2 px-3 text-right text-white font-bold">
+                              ₹{(entry.balance_after || 0).toLocaleString('en-IN')}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Orders, Invoices & Payments Timeline */}
               <div className="space-y-2">
-                <span className="font-bold text-white text-xs block">Chronological Invoices, Delivered Orders & Verified Payments</span>
+                <span className="font-bold text-white text-xs block">
+                  All Orders (Active Reservations &amp; Cancelled Reversals), Invoices &amp; Verified Payments
+                </span>
                 <div className="border border-slate-800 rounded-xl overflow-hidden text-xs">
                   <table className="w-full text-left">
                     <thead>
@@ -1282,59 +1666,121 @@ export const CreditManagement: React.FC = () => {
                         <th className="py-2.5 px-3">Date</th>
                         <th className="py-2.5 px-3">Type</th>
                         <th className="py-2.5 px-3">Doc / Reference #</th>
-                        <th className="py-2.5 px-3 text-right">Debit (+ Inv / Delivery)</th>
-                        <th className="py-2.5 px-3 text-right">Credit (- Paid)</th>
-                        <th className="py-2.5 px-3 text-center">Status</th>
+                        <th className="py-2.5 px-3 text-right">Debit (Liability +)</th>
+                        <th className="py-2.5 px-3 text-right">Credit (Cleared -)</th>
+                        <th className="py-2.5 px-3 text-center">Status / Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/80 font-mono text-[11px]">
-                      {/* Invoices */}
-                      {invoices
-                        .filter((i) => i.retailer_id === liveRetailer.id)
-                        .map((inv) => (
-                          <tr key={inv.id} className="hover:bg-slate-800/30">
-                            <td className="py-2 px-3 text-slate-400">{inv.invoice_date}</td>
-                            <td className="py-2 px-3 font-sans text-blue-300">INVOICE</td>
-                            <td className="py-2 px-3 font-bold text-white">{inv.invoice_number}</td>
-                            <td className="py-2 px-3 text-right text-rose-400 font-bold">₹{inv.total_amount.toLocaleString('en-IN')}</td>
-                            <td className="py-2 px-3 text-right text-slate-500">-</td>
-                            <td className="py-2 px-3 text-center">
-                              <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-bold text-[9px]">{inv.status}</span>
+                      {matchedAllOrders.length === 0 &&
+                        matchedInvoices.length === 0 &&
+                        matchedPayments.length === 0 && (
+                          <tr>
+                            <td colSpan={6} className="py-6 text-center text-slate-500 font-sans">
+                              No orders, invoices, or payment entries recorded yet for {liveParty.name}.
                             </td>
                           </tr>
-                        ))}
+                        )}
 
-                      {/* Uninvoiced Delivered Orders */}
-                      {unInvoicedDeliveredOrders.map((ord, idx) => (
-                        <tr key={`${ord.id || ord.order_number}_${idx}`} className="hover:bg-slate-800/30 bg-amber-950/20">
-                          <td className="py-2 px-3 text-slate-400">{ord.delivery_date || ord.order_date}</td>
-                          <td className="py-2 px-3 font-sans text-amber-300 font-bold">DELIVERED ORDER</td>
-                          <td className="py-2 px-3 font-bold text-amber-200">{ord.order_number}</td>
-                          <td className="py-2 px-3 text-right text-rose-400 font-bold">₹{ord.total_amount.toLocaleString('en-IN')}</td>
+                      {/* Active Non-Cancelled Orders (reserves credit immediately from PENDING_VERIFICATION onward) */}
+                      {matchedNonCancelledOrders.map((ord, idx) => (
+                        <tr key={`${ord.id || ord.order_number}_${idx}`} className="hover:bg-slate-800/30">
+                          <td className="py-2 px-3 text-slate-400">{ord.order_date}</td>
+                          <td className="py-2 px-3 font-sans text-amber-300 font-semibold">
+                            ORDER ({ord.status})
+                          </td>
+                          <td className="py-2 px-3 font-bold text-white">{ord.order_number}</td>
+                          <td className="py-2 px-3 text-right text-rose-400 font-bold">
+                            ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                          </td>
                           <td className="py-2 px-3 text-right text-slate-500">-</td>
-                          <td className="py-2 px-3 text-center">
-                            <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-bold text-[9px]">
-                              DELIVERED (PENDING INVOICE)
+                          <td className="py-2 px-3 text-center font-sans">
+                            <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-bold text-[9px]">
+                              RESERVED ({ord.status})
                             </span>
                           </td>
                         </tr>
                       ))}
 
-                      {/* Payments */}
-                      {payments
-                        .filter((p) => p.retailer_id === liveRetailer.id && p.status === 'VERIFIED')
-                        .map((pay) => (
-                          <tr key={pay.id} className="hover:bg-slate-800/30 bg-emerald-950/10">
-                            <td className="py-2 px-3 text-slate-400">{pay.payment_date}</td>
-                            <td className="py-2 px-3 font-sans text-emerald-300">PAYMENT ({pay.payment_mode})</td>
-                            <td className="py-2 px-3 font-bold text-emerald-300">{pay.payment_number}</td>
-                            <td className="py-2 px-3 text-right text-slate-500">-</td>
-                            <td className="py-2 px-3 text-right text-emerald-400 font-bold">₹{pay.amount.toLocaleString('en-IN')}</td>
-                            <td className="py-2 px-3 text-center">
-                              <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[9px]">VERIFIED</span>
+                      {/* Cancelled Orders (Released Credit) */}
+                      {matchedCancelledOrders.map((ord, idx) => (
+                        <tr key={`cancel_${ord.id || ord.order_number}_${idx}`} className="hover:bg-slate-800/30 opacity-65">
+                          <td className="py-2 px-3 text-slate-500">{ord.order_date}</td>
+                          <td className="py-2 px-3 font-sans text-slate-400">ORDER CANCELLED</td>
+                          <td className="py-2 px-3 line-through text-slate-400">{ord.order_number}</td>
+                          <td className="py-2 px-3 text-right text-slate-500 line-through">
+                            ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                          </td>
+                          <td className="py-2 px-3 text-right text-emerald-400">Released</td>
+                          <td className="py-2 px-3 text-center font-sans">
+                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-bold text-[9px]">
+                              CANCELLED (RESTORED)
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+
+                      {/* Invoices + Explicit Occasional Credit Note Discount Button */}
+                      {matchedInvoices.map((inv) => {
+                        const alreadyHasOrder = matchedAllOrders.some((o) => o.id === inv.order_id);
+                        return (
+                          <tr key={inv.id} className="hover:bg-slate-800/30">
+                            <td className="py-2 px-3 text-slate-400">{inv.invoice_date}</td>
+                            <td className="py-2 px-3 font-sans text-blue-300">
+                              INVOICE
+                              {inv.is_credit_note_discount && (
+                                <span className="ml-1.5 px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[9px] font-bold">
+                                  Credit Note {inv.credit_note_number || ''} (-₹{(inv.credit_note_discount_amount || 0).toLocaleString('en-IN')})
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 font-bold text-white">{inv.invoice_number}</td>
+                            <td className="py-2 px-3 text-right text-slate-300">
+                              {alreadyHasOrder ? (
+                                <span className="text-[10px] text-slate-500 font-sans">Included via Order</span>
+                              ) : (
+                                <span className="text-rose-400 font-bold">₹{inv.total_amount.toLocaleString('en-IN')}</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-right text-purple-300">
+                              {inv.is_credit_note_discount && inv.credit_note_discount_amount
+                                ? `-₹${inv.credit_note_discount_amount.toLocaleString('en-IN')}`
+                                : '-'}
+                            </td>
+                            <td className="py-2 px-3 text-center font-sans space-x-1">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-bold text-[9px]">{inv.status}</span>
+                              {inv.status !== 'PAID' && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCreditNoteTargetInvoice(inv);
+                                    setCreditNoteAmount('');
+                                    setCreditNoteNumber(`CN-${Date.now().toString().slice(-5)}`);
+                                    setCreditNoteReason('');
+                                  }}
+                                  className="px-1.5 py-0.5 rounded bg-purple-600/30 hover:bg-purple-600/50 border border-purple-500/40 text-purple-200 text-[9px] font-bold"
+                                >
+                                  + Credit Note
+                                </button>
+                              )}
                             </td>
                           </tr>
-                        ))}
+                        );
+                      })}
+
+                      {/* Verified Payments */}
+                      {matchedPayments.map((pay) => (
+                        <tr key={pay.id} className="hover:bg-slate-800/30 bg-emerald-950/10">
+                          <td className="py-2 px-3 text-slate-400">{pay.payment_date}</td>
+                          <td className="py-2 px-3 font-sans text-emerald-300">PAYMENT ({pay.payment_mode})</td>
+                          <td className="py-2 px-3 font-bold text-emerald-300">{pay.payment_number}</td>
+                          <td className="py-2 px-3 text-right text-slate-500">-</td>
+                          <td className="py-2 px-3 text-right text-emerald-400 font-bold">-₹{pay.amount.toLocaleString('en-IN')}</td>
+                          <td className="py-2 px-3 text-center">
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[9px]">VERIFIED</span>
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>
@@ -1342,7 +1788,7 @@ export const CreditManagement: React.FC = () => {
 
               <div className="pt-2 flex justify-end">
                 <button
-                  onClick={() => setSelectedRetailerForLedger(null)}
+                  onClick={() => setSelectedPartyForLedger(null)}
                   className="px-4 py-2 rounded-xl bg-slate-800 text-slate-200 font-bold text-xs"
                 >
                   Close Statement
@@ -1352,6 +1798,267 @@ export const CreditManagement: React.FC = () => {
           </div>
         );
       })()}
+
+      {/* MODAL 6: ADJUST PARTY CREDIT LIMIT (FIRESTORE SYNCED) */}
+      {adjustingParty && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 text-slate-200 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div>
+                <span className="text-[10px] font-mono text-emerald-400 uppercase font-bold">
+                  Cloud Firestore Credit Control
+                </span>
+                <h3 className="text-base font-bold text-white">Adjust Credit Limit</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAdjustingParty(null)}
+                className="text-slate-400 hover:text-white font-bold text-xs"
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmAdjustLimit} className="space-y-4 text-xs">
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-white text-sm">{adjustingParty.name}</span>
+                  <span className="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 text-[10px] font-bold uppercase">
+                    {adjustingParty.categoryLabel}
+                  </span>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>Current Limit:</span>
+                  <span className="font-mono font-bold text-white">₹{adjustingParty.credit_limit.toLocaleString('en-IN')}</span>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>Current Outstanding:</span>
+                  <span className="font-mono font-bold text-amber-300">₹{adjustingParty.current_outstanding.toLocaleString('en-IN')}</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-300 mb-1 font-semibold">
+                  New Approved Credit Limit (₹)
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={500}
+                  required
+                  value={adjustLimitInput}
+                  onChange={(e) => setAdjustLimitInput(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono font-bold text-emerald-400 focus:outline-none focus:border-emerald-500"
+                />
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Updates immediately in Cloud Firestore and syncs live to the Mobile App.
+                </p>
+              </div>
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAdjustingParty(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingCreditLimit}
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold shadow-md shadow-emerald-900/30 disabled:opacity-60"
+                >
+                  {isSavingCreditLimit ? 'Saving to Firestore...' : 'Save Credit Limit'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 7: CONFIRM REMOVE PARTY FROM CREDIT GATE */}
+      {removingParty && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-rose-500/40 rounded-2xl w-full max-w-md p-6 text-slate-200 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="text-base font-bold text-rose-400 flex items-center gap-2">
+                <Trash2 size={18} /> Remove Party from Credit Gate
+              </h3>
+              <button
+                type="button"
+                onClick={() => setRemovingParty(null)}
+                className="text-slate-400 hover:text-white font-bold text-xs"
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <p className="text-slate-300 leading-relaxed">
+                Are you sure you want to remove <strong className="text-white">{removingParty.name}</strong> ({removingParty.categoryLabel}) from the active Party Ledger &amp; Credit Gate?
+              </p>
+
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1 text-[11px]">
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Credit Limit:</span>
+                  <span className="font-mono text-white">₹{removingParty.credit_limit.toLocaleString('en-IN')}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Current Outstanding:</span>
+                  <span className="font-mono font-bold text-amber-300">₹{removingParty.current_outstanding.toLocaleString('en-IN')}</span>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-slate-400">
+                {removingParty.partyKind === 'USER'
+                  ? 'This updates credit_gate_enabled = false directly on their Cloud Firestore user profile.'
+                  : 'This permanently deletes the party record from Cloud Firestore.'}
+              </p>
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRemovingParty(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isRemovingParty}
+                  onClick={handleConfirmRemoveParty}
+                  className="px-5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold shadow-md shadow-rose-900/30 disabled:opacity-60"
+                >
+                  {isRemovingParty ? 'Removing from Firestore...' : 'Confirm Remove'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 8: EXPLICIT CREDIT NOTE / DISCOUNT ISSUANCE */}
+      {creditNoteTargetInvoice && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-purple-500/40 rounded-2xl w-full max-w-md p-6 text-slate-200 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div>
+                <span className="text-[10px] font-mono text-purple-400 uppercase font-bold">
+                  Occasional BE Credit Adjustment
+                </span>
+                <h3 className="text-base font-bold text-white">
+                  Issue Credit Note Discount ({creditNoteTargetInvoice.invoice_number})
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCreditNoteTargetInvoice(null)}
+                className="text-slate-400 hover:text-white font-bold text-xs"
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const amt = Number(creditNoteAmount);
+                if (!amt || amt <= 0) {
+                  showToast('error', 'Enter a valid credit note discount amount greater than zero.');
+                  return;
+                }
+                const res = issueCreditNoteDiscount({
+                  invoiceId: creditNoteTargetInvoice.id,
+                  discountAmount: amt,
+                  creditNoteNumber: creditNoteNumber,
+                  reason: creditNoteReason || 'Occasional Credit Note Discount',
+                  issuedByUserId: currentUser?.id,
+                  issuedByName: currentUser?.name || 'Billing Executive',
+                });
+                if (!res.success) {
+                  showToast('error', res.error || 'Unable to issue credit note.');
+                  return;
+                }
+                showToast(
+                  'success',
+                  `Credit Note ${creditNoteNumber} (-₹${amt.toLocaleString('en-IN')}) applied to ${creditNoteTargetInvoice.invoice_number} and synced to Firestore Party Ledger.`
+                );
+                setCreditNoteTargetInvoice(null);
+              }}
+              className="space-y-3 text-xs"
+            >
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1 font-mono text-[11px]">
+                <div className="flex justify-between">
+                  <span className="text-slate-400 font-sans">Party:</span>
+                  <strong className="text-white font-sans">{creditNoteTargetInvoice.retailer_name}</strong>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400 font-sans">Invoice Total:</span>
+                  <strong>₹{creditNoteTargetInvoice.total_amount.toLocaleString('en-IN')}</strong>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400 font-sans">Remaining Unpaid Due:</span>
+                  <strong className="text-amber-300">
+                    ₹{Math.max(0, creditNoteTargetInvoice.total_amount - creditNoteTargetInvoice.paid_amount).toLocaleString('en-IN')}
+                  </strong>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Credit Note Number *</label>
+                <input
+                  type="text"
+                  required
+                  value={creditNoteNumber}
+                  onChange={(e) => setCreditNoteNumber(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Credit Discount Amount (₹) *</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={Math.max(1, creditNoteTargetInvoice.total_amount - creditNoteTargetInvoice.paid_amount)}
+                  required
+                  value={creditNoteAmount}
+                  onChange={(e) => setCreditNoteAmount(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Discount Reason *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Damaged stock credit note / promotional trade scheme"
+                  value={creditNoteReason}
+                  onChange={(e) => setCreditNoteReason(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
+                />
+              </div>
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCreditNoteTargetInvoice(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold"
+                >
+                  Apply Credit Note Discount
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

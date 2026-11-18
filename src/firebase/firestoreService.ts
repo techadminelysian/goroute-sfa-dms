@@ -21,12 +21,16 @@ import {
   Beat,
   Order,
   OrderLine,
+  OrderStatus,
   StockLedgerEntry,
   Invoice,
   Claim,
   Payment,
+  PartyLedgerEntry,
   User
 } from '../types';
+import { getPlatformForRole } from '../utils/authClient';
+import { computeUserLiveCreditProfile, PartyCreditProfile } from '../utils/creditLedger';
 
 
 export enum OperationType {
@@ -92,6 +96,7 @@ export interface FirestoreStoreData {
   invoices: Invoice[];
   claims: Claim[];
   payments: Payment[];
+  partyLedger: PartyLedgerEntry[];
   users: User[];
 }
 
@@ -109,6 +114,7 @@ export const COLLECTIONS = {
   INVOICES: 'invoices',
   CLAIMS: 'claims',
   PAYMENTS: 'payments',
+  PARTY_LEDGER: 'party_ledger',
   USERS: 'users',
   METADATA: '_metadata'
 } as const;
@@ -220,7 +226,7 @@ export const seedInitialFirestoreData = async (
         for (const item of chunk) {
           const docId = (item as any).id || `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
           const ref = doc(db, col.name, docId);
-          batch.set(ref, item);
+          batch.set(ref, stripUndefined(item));
           totalRecords++;
         }
         await batch.commit();
@@ -277,6 +283,26 @@ export interface FetchFirestoreResult {
   data: FirestoreStoreData | null;
   isPermissionDenied: boolean;
   errorMessage?: string;
+}
+
+/**
+ * Recursively strips `undefined` properties from objects and array items
+ * because Cloud Firestore rejects any `undefined` field values on writes.
+ */
+export function stripUndefined<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefined(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
+    const cleaned: Record<string, any> = {};
+    for (const [k, v] of Object.entries(value as Record<string, any>)) {
+      if (v !== undefined) {
+        cleaned[k] = stripUndefined(v);
+      }
+    }
+    return cleaned as T;
+  }
+  return value;
 }
 
 /**
@@ -337,7 +363,35 @@ export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
     }));
   }
 
-  return {
+  // Status normalization: Every incoming order that has not been explicitly verified by a BE must enter PENDING_VERIFICATION
+  const postVerificationStatuses: OrderStatus[] = [
+    'VERIFIED',
+    'VERIFIED_BY_BILLING',
+    'CONFIRMED',
+    'PO_GENERATED',
+    'PUNCHED_TO_PRINCIPAL',
+    'PRINCIPAL_DISPATCHED',
+    'APPROVED',
+    'DISPATCHED',
+    'DELIVERED',
+    'INVOICED',
+  ];
+  const rawStatus = String(raw.status || '') as OrderStatus;
+  let resolvedStatus: OrderStatus = 'PENDING_VERIFICATION';
+  const isPostVerificationStatus = postVerificationStatuses.includes(rawStatus);
+  const isExplicitlyVerified = isPostVerificationStatus || Boolean(raw.verified_at || raw.verified_by_user_id);
+
+  if (rawStatus === 'CANCELLED') {
+    resolvedStatus = 'CANCELLED';
+  } else if (isPostVerificationStatus) {
+    resolvedStatus = rawStatus;
+  } else if (isExplicitlyVerified) {
+    resolvedStatus = 'VERIFIED';
+  } else {
+    resolvedStatus = 'PENDING_VERIFICATION';
+  }
+
+  return stripUndefined({
     ...raw,
     id: orderId,
     tenant_id: tenantId,
@@ -356,7 +410,7 @@ export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
     commission_agent_name: raw.commission_agent_name || undefined,
     order_date: raw.order_date || new Date().toISOString(),
     delivery_date: raw.delivery_date || '',
-    status: raw.status || 'PENDING_VERIFICATION',
+    status: resolvedStatus,
     total_amount: Number(raw.total_amount) || lines.reduce((s, l) => s + (Number(l.total) || 0), 0),
     original_total_amount: Number(raw.original_total_amount) || Number(raw.total_amount) || 0,
     tax_amount: Number(raw.tax_amount) || 0,
@@ -373,23 +427,55 @@ export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
     order_invoicing_type: raw.order_invoicing_type || null,
     crates_issued: Number(raw.crates_issued) || 0,
     crates_returned: Number(raw.crates_returned) || 0,
-  };
+    fulfillment_source: raw.fulfillment_source || null,
+    parent_order_id: raw.parent_order_id || null,
+    split_sequence: raw.split_sequence != null ? Number(raw.split_sequence) : undefined,
+    dispatched_at: raw.dispatched_at || null,
+    invoiced_at: raw.invoiced_at || null,
+    firestore_doc_id: docId,
+  });
 };
 
+export const ORDER_STATUS_PRIORITY: Record<string, number> = {
+  PENDING_VERIFICATION: 1,
+  PUNCHED: 1,
+  FLAGGED: 1,
+  CLEARED: 1,
+  VERIFIED: 5,
+  VERIFIED_BY_BILLING: 5,
+  APPROVED: 6,
+  PO_GENERATED: 7,
+  CONFIRMED: 8,
+  PUNCHED_TO_PRINCIPAL: 8,
+  PRINCIPAL_DISPATCHED: 9,
+  DISPATCHED: 10,
+  INVOICED: 11,
+  DELIVERED: 12,
+  CANCELLED: 99,
+};
+
+function getOrderPrecedenceScore(o: Order): number {
+  const statusScore = (ORDER_STATUS_PRIORITY[o.status] || 0) * 100;
+  const verifiedScore = o.verified_at ? 20 : 0;
+  const lockedScore = o.is_locked ? 10 : 0;
+  const mobileDocScore = o.firestore_doc_id?.startsWith('#') ? 1 : 0;
+  return statusScore + verifiedScore + lockedScore + mobileDocScore;
+}
+
 /**
- * Deduplicates orders by unique ID to prevent any duplicate key errors.
+ * Deduplicates orders by unique ID while preferring the highest workflow state.
  */
 export const deduplicateOrders = (orders: Order[]): Order[] => {
-  const seen = new Set<string>();
-  const result: Order[] = [];
+  const byKey = new Map<string, Order>();
   for (const o of orders) {
     const key = o.id || o.order_number;
-    if (key && !seen.has(key)) {
-      seen.add(key);
-      result.push(o);
+    if (!key) continue;
+    const existing = byKey.get(key);
+    if (!existing || getOrderPrecedenceScore(o) > getOrderPrecedenceScore(existing)) {
+      byKey.set(key, o);
     }
   }
-  return result;
+  return Array.from(byKey.values());
 };
 
 /**
@@ -421,6 +507,7 @@ export const fetchAllFromFirestore = async (): Promise<FetchFirestoreResult> => 
       invoicesSnap,
       claimsSnap,
       paymentsSnap,
+      partyLedgerSnap,
       usersSnap,
     ] = await Promise.all([
       getDocs(collection(db, COLLECTIONS.TENANTS)),
@@ -436,6 +523,7 @@ export const fetchAllFromFirestore = async (): Promise<FetchFirestoreResult> => 
       getDocs(collection(db, COLLECTIONS.INVOICES)),
       getDocs(collection(db, COLLECTIONS.CLAIMS)),
       getDocs(collection(db, COLLECTIONS.PAYMENTS)),
+      getDocs(collection(db, COLLECTIONS.PARTY_LEDGER)),
       getDocs(collection(db, COLLECTIONS.USERS)),
     ]);
 
@@ -459,7 +547,8 @@ export const fetchAllFromFirestore = async (): Promise<FetchFirestoreResult> => 
       invoices: invoicesSnap.docs.map((d) => d.data() as Invoice),
       claims: claimsSnap.docs.map((d) => d.data() as Claim),
       payments: paymentsSnap.docs.map((d) => d.data() as Payment),
-      users: usersSnap.docs.map((d) => d.data() as User),
+      partyLedger: partyLedgerSnap.docs.map((d) => ({ ...(d.data() as PartyLedgerEntry), id: (d.data() as any).id || d.id })),
+      users: usersSnap.docs.map((d) => normalizeFirestoreUser(d.id, d.data())),
     };
 
     return {
@@ -490,12 +579,18 @@ export const saveRecordToFirestore = async (collectionName: string, docId: strin
   const db = getDb();
   if (!db) return false;
 
+  const targetDocId =
+    (collectionName === COLLECTIONS.ORDERS || collectionName === COLLECTIONS.USERS) && data?.firestore_doc_id
+      ? data.firestore_doc_id
+      : docId;
+
   try {
-    const docRef = doc(db, collectionName, docId);
-    await setDoc(docRef, data, { merge: true });
+    const docRef = doc(db, collectionName, targetDocId);
+    const sanitizedData = stripUndefined(data);
+    await setDoc(docRef, sanitizedData, { merge: true });
     return true;
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `${collectionName}/${docId}`);
+    handleFirestoreError(error, OperationType.WRITE, `${collectionName}/${targetDocId}`);
     return false;
   }
 };
@@ -514,6 +609,41 @@ export const deleteRecordFromFirestore = async (collectionName: string, docId: s
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `${collectionName}/${docId}`);
     return false;
+  }
+};
+
+/**
+ * Deletes a user record from Firestore across canonical docId, payload userId,
+ * and any duplicate documents referencing data.id === userId.
+ */
+export const deleteUserFromFirestore = async (
+  userId: string,
+  firestoreDocId?: string
+): Promise<{ success: boolean; error?: string }> => {
+  const db = getDb();
+  if (!db) return { success: true };
+
+  try {
+    const docIdsToDelete = new Set<string>();
+    if (firestoreDocId) docIdsToDelete.add(firestoreDocId);
+    if (userId) docIdsToDelete.add(userId);
+
+    const usersSnap = await getDocs(collection(db, COLLECTIONS.USERS));
+    usersSnap.docs.forEach((d) => {
+      const data = d.data() as Partial<User>;
+      if (d.id === userId || d.id === firestoreDocId || data?.id === userId) {
+        docIdsToDelete.add(d.id);
+      }
+    });
+
+    for (const targetId of docIdsToDelete) {
+      await deleteDoc(doc(db, COLLECTIONS.USERS, targetId));
+    }
+
+    return { success: true };
+  } catch (error: any) {
+    const errInfo = handleFirestoreError(error, OperationType.DELETE, `${COLLECTIONS.USERS}/${firestoreDocId || userId}`);
+    return { success: false, error: errInfo.error };
   }
 };
 
@@ -553,6 +683,21 @@ export const subscribeToAllCollections = (onDataUpdate: (data: Partial<Firestore
         },
         (error) => {
           handleFirestoreError(error, OperationType.GET, COLLECTIONS.COMPANIES);
+        }
+      )
+    );
+
+    // Dispatch Points / Hubs
+    unsubscribes.push(
+      onSnapshot(
+        collection(db, COLLECTIONS.DISPATCH_POINTS),
+        (snapshot) => {
+          if (!snapshot.empty) {
+            onDataUpdate({ dispatchPoints: snapshot.docs.map((d) => d.data() as DispatchPoint) });
+          }
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.GET, COLLECTIONS.DISPATCH_POINTS);
         }
       )
     );
@@ -692,14 +837,32 @@ export const subscribeToAllCollections = (onDataUpdate: (data: Partial<Firestore
       )
     );
 
+    // Party Ledger
+    unsubscribes.push(
+      onSnapshot(
+        collection(db, COLLECTIONS.PARTY_LEDGER),
+        (snapshot) => {
+          if (!snapshot.empty) {
+            onDataUpdate({
+              partyLedger: snapshot.docs.map((d) => ({
+                ...(d.data() as PartyLedgerEntry),
+                id: (d.data() as any).id || d.id,
+              })),
+            });
+          }
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.GET, COLLECTIONS.PARTY_LEDGER);
+        }
+      )
+    );
+
     // Users
     unsubscribes.push(
       onSnapshot(
         collection(db, COLLECTIONS.USERS),
         (snapshot) => {
-          if (!snapshot.empty) {
-            onDataUpdate({ users: snapshot.docs.map((d) => d.data() as User) });
-          }
+          onDataUpdate({ users: snapshot.docs.map((d) => normalizeFirestoreUser(d.id, d.data())) });
         },
         (error) => {
           handleFirestoreError(error, OperationType.GET, COLLECTIONS.USERS);
@@ -830,12 +993,146 @@ export const findFirestoreUserByMobile = async (sanitizedMobile: string): Promis
     for (const docSnap of usersSnap.docs) {
       const u = docSnap.data() as User;
       if (u.mobile_number && sanitize(u.mobile_number) === target) {
-        return { ...u, id: docSnap.id };
+        return normalizeFirestoreUser(docSnap.id, u);
       }
     }
     return null;
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, COLLECTIONS.USERS);
+    return null;
+  }
+};
+
+export const normalizeFirestoreUser = (docId: string, rawData: any): User => {
+  const data = (rawData || {}) as User;
+  return {
+    ...data,
+    id: data.id || docId,
+    firestore_doc_id: docId,
+    platform: getPlatformForRole(data.role),
+    company_scope: Array.isArray(data.company_scope) ? data.company_scope : [],
+    credit_limit: data.credit_limit !== undefined && data.credit_limit !== null ? Number(data.credit_limit) : undefined,
+    current_outstanding:
+      data.current_outstanding !== undefined && data.current_outstanding !== null
+        ? Number(data.current_outstanding)
+        : undefined,
+    credit_gate_enabled: data.credit_gate_enabled === false ? false : true,
+    distributor_id: data.distributor_id ?? null,
+  };
+};
+
+/**
+ * Fetches all credit-relevant collections directly from Cloud Firestore for Admin Credit Gate sync.
+ */
+export const fetchCreditGateCollectionsFromFirestore = async (): Promise<{
+  success: boolean;
+  users?: User[];
+  distributors?: DistributorInstitution[];
+  retailers?: Retailer[];
+  orders?: Order[];
+  invoices?: Invoice[];
+  payments?: Payment[];
+  partyLedger?: PartyLedgerEntry[];
+}> => {
+  const db = getDb();
+  if (!db) return { success: false };
+
+  try {
+    const [usersSnap, distSnap, retSnap, ordersSnap, invSnap, paySnap, ledgerSnap] = await Promise.all([
+      getDocs(collection(db, COLLECTIONS.USERS)),
+      getDocs(collection(db, COLLECTIONS.DISTRIBUTORS)),
+      getDocs(collection(db, COLLECTIONS.RETAILERS)),
+      getDocs(collection(db, COLLECTIONS.ORDERS)),
+      getDocs(collection(db, COLLECTIONS.INVOICES)),
+      getDocs(collection(db, COLLECTIONS.PAYMENTS)),
+      getDocs(collection(db, COLLECTIONS.PARTY_LEDGER)),
+    ]);
+
+    return {
+      success: true,
+      users: usersSnap.docs.map((d) => normalizeFirestoreUser(d.id, d.data())),
+      distributors: distSnap.docs.map((d) => d.data() as DistributorInstitution),
+      retailers: retSnap.docs.map((d) => d.data() as Retailer),
+      orders: deduplicateOrders(ordersSnap.docs.map((d) => normalizeFirestoreOrder(d.id, d.data()))),
+      invoices: invSnap.docs.map((d) => d.data() as Invoice),
+      payments: paySnap.docs.map((d) => d.data() as Payment),
+      partyLedger: ledgerSnap.docs.map((d) => ({
+        ...(d.data() as PartyLedgerEntry),
+        id: (d.data() as any).id || d.id,
+      })),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, COLLECTIONS.USERS);
+    return { success: false };
+  }
+};
+
+/**
+ * Dynamically fetches live credit_limit, current_outstanding, and available_credit
+ * directly from Cloud Firestore for a logged-in Distributor or CFS user on mobile.
+ */
+export const fetchLivePartyCreditFromFirestore = async (
+  userId: string,
+  fallbackUser?: Partial<User>,
+  defaultCreditLimit: number = 50000
+): Promise<PartyCreditProfile | null> => {
+  const db = getDb();
+  if (!db || !userId) return null;
+
+  try {
+    const [usersSnap, distSnap, ordersSnap, invSnap, paySnap] = await Promise.all([
+      getDocs(collection(db, COLLECTIONS.USERS)),
+      getDocs(collection(db, COLLECTIONS.DISTRIBUTORS)),
+      getDocs(collection(db, COLLECTIONS.ORDERS)),
+      getDocs(collection(db, COLLECTIONS.INVOICES)),
+      getDocs(collection(db, COLLECTIONS.PAYMENTS)),
+    ]);
+
+    const sanitize = (m?: string) => (m ? m.replace(/[\s\-\(\)\+]/g, '').slice(-10) : '');
+    const targetMobile = sanitize(fallbackUser?.mobile_number);
+
+    const allUsers = usersSnap.docs.map((d) => normalizeFirestoreUser(d.id, d.data()));
+    const liveUser =
+      allUsers.find((u) => u.id === userId || u.firestore_doc_id === userId) ||
+      (targetMobile ? allUsers.find((u) => sanitize(u.mobile_number) === targetMobile) : undefined) ||
+      (fallbackUser?.role
+        ? ({
+            id: userId,
+            tenant_id: fallbackUser.tenant_id || 'tenant_ms_enterprises',
+            name: fallbackUser.name || 'Field Partner',
+            role: fallbackUser.role,
+            company_scope: fallbackUser.company_scope || [],
+            dispatch_point_id: fallbackUser.dispatch_point_id || null,
+            platform: getPlatformForRole(fallbackUser.role),
+            ...fallbackUser,
+          } as User)
+        : undefined);
+
+    if (!liveUser) return null;
+
+    const tenantId = liveUser.tenant_id;
+    const distributors = distSnap.docs
+      .map((d) => d.data() as DistributorInstitution)
+      .filter((d) => !tenantId || d.tenant_id === tenantId);
+    const orders = deduplicateOrders(
+      ordersSnap.docs.map((d) => normalizeFirestoreOrder(d.id, d.data()))
+    ).filter((o) => !tenantId || o.tenant_id === tenantId);
+    const invoices = invSnap.docs
+      .map((d) => d.data() as Invoice)
+      .filter((i) => !tenantId || i.tenant_id === tenantId);
+    const payments = paySnap.docs
+      .map((d) => d.data() as Payment)
+      .filter((p) => !tenantId || p.tenant_id === tenantId);
+
+    return computeUserLiveCreditProfile(liveUser, {
+      distributors,
+      orders,
+      invoices,
+      payments,
+      defaultCreditLimit,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, `${COLLECTIONS.USERS}/${userId}`);
     return null;
   }
 };

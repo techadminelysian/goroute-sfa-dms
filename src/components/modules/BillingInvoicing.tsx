@@ -1,7 +1,17 @@
 import React, { useState } from 'react';
 import { useAppStore } from '../../data/store';
 import { Invoice, InvoiceType, Payment, PaymentMode, Order, Retailer } from '../../types';
-import { isOrderAssignedToBE } from '../../utils/caRoutingLogic';
+import { isOrderAssignedToBE, getOrderFinancialSummary } from '../../utils/caRoutingLogic';
+import { isOrderAwaitingPhysicalDispatch } from '../../utils/stockAvailability';
+import {
+  buildDispatchSkuPartyMatrix,
+  doesOrderBelongToDispatchPoint,
+  doesOrderLineBelongToDispatchPoint,
+  getEffectiveLineCompanyId,
+  resolveDispatchPointIdForCompany,
+  serializeDispatchMatrixToCsv
+} from '../../utils/dispatchRouting';
+import { buildPartyCreditRecords, PartyCreditRecord } from '../../utils/creditLedger';
 import { KPICard } from '../common/KPICard';
 import { BEVerificationDashboard } from './BEVerificationDashboard';
 import {
@@ -37,7 +47,9 @@ import {
   ChevronDown,
   ChevronUp,
   Share2,
-  Layers
+  Layers,
+  Warehouse,
+  Table2
 } from 'lucide-react';
 
 export const BillingInvoicing: React.FC = () => {
@@ -50,8 +62,11 @@ export const BillingInvoicing: React.FC = () => {
     orders,
     payments,
     retailers,
+    distributors = [],
     skus,
     companies,
+    dispatchPoints = [],
+    stockLedger,
     users,
     currentUser,
     addInvoice,
@@ -60,11 +75,13 @@ export const BillingInvoicing: React.FC = () => {
     updateOrderStatus,
     verifyOrderWithParallelAlert,
     updateOrder,
-    //verifyPayment,
+    verifyPayment,
     flagPayment,
     updateRetailerCreditLimit,
+    updatePartyCreditLimit,
     updatePaymentDetails,
     updateInvoicePaidAmount,
+    issueCreditNoteDiscount,
     toggleLockInvoice,
     updateInvoiceMetadata,
   } = useAppStore();
@@ -73,8 +90,11 @@ export const BillingInvoicing: React.FC = () => {
   
   // Morning Dispatcher Sheet State
   const [dispatchGroupBy, setDispatchGroupBy] = useState<'PARTY' | 'AGENT' | 'BEAT'>('PARTY');
+  const [dispatchPointFilter, setDispatchPointFilter] = useState<string>('ALL');
   const [dispatchCompanyFilter, setDispatchCompanyFilter] = useState<string>('ALL');
-  const [dispatchStatusScope, setDispatchStatusScope] = useState<'PUNCHED_TO_PRINCIPAL' | 'ALL_APPROVED'>('PUNCHED_TO_PRINCIPAL');
+  const [dispatchStatusScope, setDispatchStatusScope] = useState<'CONFIRMED_ONLY' | 'ALL_POST_PO'>('CONFIRMED_ONLY');
+  const [dispatchViewMode, setDispatchViewMode] = useState<'MATRIX' | 'GROUPED'>('MATRIX');
+  const [dispatchFeedback, setDispatchFeedback] = useState<string | null>(null);
   const [expandedGroupKey, setExpandedGroupKey] = useState<string | null>(null);
 
   // Filter States
@@ -127,9 +147,23 @@ export const BillingInvoicing: React.FC = () => {
   const [payNotes, setPayNotes] = useState<string>('');
   const [payAutoVerify, setPayAutoVerify] = useState<boolean>(true);
 
-  // Credit Limit Edit State
-  const [editingCreditRetailer, setEditingCreditRetailer] = useState<Retailer | null>(null);
+  // Credit Limit Edit State (Unified Party Credit Gate)
+  const [editingCreditParty, setEditingCreditParty] = useState<PartyCreditRecord | null>(null);
   const [newCreditLimitVal, setNewCreditLimitVal] = useState<number>(50000);
+
+  // Non-blocking notification banner & Occasional Credit Note Modal State
+  const [billingBanner, setBillingBanner] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [creditNoteInvoice, setCreditNoteInvoice] = useState<Invoice | null>(null);
+  const [creditNoteAmt, setCreditNoteAmt] = useState<string>('');
+  const [creditNoteNum, setCreditNoteNum] = useState<string>('');
+  const [creditNoteReason, setCreditNoteReason] = useState<string>('');
+
+  const showBillingBanner = (type: 'success' | 'error' | 'info', message: string) => {
+    setBillingBanner({ type, message });
+    setTimeout(() => {
+      setBillingBanner((prev) => (prev?.message === message ? null : prev));
+    }, 5500);
+  };
 
   // Checks for Role Rights
   const isAccountant = activeRole === 'ACCOUNTANT' || activeRole === 'ADMIN';
@@ -143,47 +177,139 @@ export const BillingInvoicing: React.FC = () => {
         users.find((u) => u.role === 'BILLING')?.id ||
         'usr_billing_1';
 
-  // Orders taken by Commission Agents needing Billing Executive Verification (scoped to assigned CAs if in BILLING role)
+  // Orders taken by Commission Agents, Sales Reps & Distributors needing Billing Executive Verification
   const pendingVerificationOrders = orders.filter((o) => {
-    const isPending = o.status === 'PENDING_VERIFICATION' || o.status === 'PUNCHED' || o.status === 'FLAGGED';
-    if (!isPending) return false;
+    const isVerified = ['VERIFIED', 'VERIFIED_BY_BILLING', 'CONFIRMED', 'APPROVED', 'PO_GENERATED', 'PUNCHED_TO_PRINCIPAL', 'PRINCIPAL_DISPATCHED'].includes(o.status) || Boolean(o.verified_at);
+    const isTerminated = ['CANCELLED', 'INVOICED', 'DISPATCHED', 'DELIVERED'].includes(o.status);
+    if (isVerified || isTerminated) return false;
     if (activeRole === 'BILLING' || currentUser?.role === 'BILLING') {
-      return isOrderAssignedToBE(o, effectiveBEId, users);
+      return isOrderAssignedToBE(o, effectiveBEId, users, distributors);
     }
     return true;
   });
 
-  // Orders explicitly marked as Punched to Principal Company
-  const punchedToPrincipalOrders = orders.filter((o) => o.status === 'PUNCHED_TO_PRINCIPAL');
-
-  // Verified & Approved orders ready for invoice generation
-  const readyToInvoiceOrders = orders.filter(
-    (o) => o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING' || o.status === 'APPROVED' || o.status === 'DISPATCHED' || o.status === 'PUNCHED_TO_PRINCIPAL'
+  // Orders confirmed via Principal PO or Depot Stock Fast-Track
+  const confirmedOrders = orders.filter(
+    (o) => o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL'
   );
 
-  // Morning Dispatcher Sheet Orders Filtering
-  const dispatchManifestOrders = orders.filter((o) => {
-    if (dispatchCompanyFilter !== 'ALL' && o.company_id !== dispatchCompanyFilter) return false;
-    if (dispatchStatusScope === 'PUNCHED_TO_PRINCIPAL') {
-      return o.status === 'PUNCHED_TO_PRINCIPAL';
-    } else {
-      return (
-        o.status === 'PUNCHED_TO_PRINCIPAL' ||
-        o.status === 'VERIFIED_BY_BILLING' ||
-        o.status === 'APPROVED' ||
-        o.status === 'CLEARED'
-      );
+  // Orders ready for Tax / Cash Invoicing (Strictly locked until CONFIRMED via Principal PO or Depot Stock)
+  const readyToInvoiceOrders = orders.filter((o) => {
+    const isPostConfirmed =
+      o.status === 'CONFIRMED' ||
+      o.status === 'DISPATCHED' ||
+      o.status === 'APPROVED' ||
+      o.status === 'PUNCHED_TO_PRINCIPAL';
+    if (!isPostConfirmed) return false;
+    if (activeRole === 'BILLING' || currentUser?.role === 'BILLING') {
+      return isOrderAssignedToBE(o, effectiveBEId, users, distributors);
     }
+    return true;
   });
 
-  // Handler: Export Morning Dispatcher Sheet CSV
+  // Morning Dispatcher Sheet Orders Filtering (Strictly post-PO / Depot Stock CONFIRMED+; pre-PO VERIFIED is blocked)
+  const dispatchManifestOrders = orders.filter((o) => {
+    if (dispatchPointFilter !== 'ALL' && !doesOrderBelongToDispatchPoint(o, dispatchPointFilter, companies, skus)) {
+      return false;
+    }
+    if (dispatchCompanyFilter !== 'ALL') {
+      const matchesOrderCompany =
+        o.company_id === dispatchCompanyFilter ||
+        (o.company_ids || []).includes(dispatchCompanyFilter) ||
+        (o.lines || []).some((l) => getEffectiveLineCompanyId(l, o, skus) === dispatchCompanyFilter);
+      if (!matchesOrderCompany) return false;
+    }
+    const isConfirmedReady =
+      o.status === 'CONFIRMED' ||
+      o.status === 'PUNCHED_TO_PRINCIPAL' ||
+      (o.status === 'INVOICED' && !o.dispatched_at && isOrderAwaitingPhysicalDispatch(o, stockLedger));
+    if (dispatchStatusScope === 'CONFIRMED_ONLY') {
+      return isConfirmedReady;
+    }
+    return isConfirmedReady || o.status === 'APPROVED' || o.status === 'DISPATCHED';
+  });
+
+  // Compute DP-segregated SKU-vs-Party Matrices (each DP strictly pulls only SKUs from its mapped Principal Companies)
+  const activeMatrixDispatchPointIds = dispatchPointFilter !== 'ALL'
+    ? [dispatchPointFilter]
+    : dispatchPoints.map((dp) => dp.id);
+
+  const scopedCompaniesForMatrix = dispatchCompanyFilter === 'ALL'
+    ? companies
+    : companies.filter((c) => c.id === dispatchCompanyFilter);
+
+  const dispatchPointMatrices = activeMatrixDispatchPointIds
+    .map((dpId) =>
+      buildDispatchSkuPartyMatrix(
+        dispatchManifestOrders,
+        dpId,
+        scopedCompaniesForMatrix,
+        skus,
+        users,
+        dispatchPoints
+      )
+    )
+    .filter((m) => m.rows.length > 0 || dispatchPointFilter !== 'ALL');
+
+  const downloadCsvFile = (csvContent: string, filename: string) => {
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // Handler: Export SKU-vs-Party Dispatch Sheet CSV (Strictly per Dispatch Point -> Principal Company mapping)
+  const handleExportSkuPartyMatrixCsv = (targetDpId?: string) => {
+    const dpIdsToExport = targetDpId
+      ? [targetDpId]
+      : dispatchPointMatrices.filter((m) => m.rows.length > 0).map((m) => m.dispatchPointId);
+
+    if (dpIdsToExport.length === 0) {
+      setDispatchFeedback('No confirmed orders match the selected Dispatch Point and Principal Company mapping.');
+      return;
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const exportedNames: string[] = [];
+
+    dpIdsToExport.forEach((dpId) => {
+      const matrix = buildDispatchSkuPartyMatrix(
+        dispatchManifestOrders,
+        dpId,
+        scopedCompaniesForMatrix,
+        skus,
+        users,
+        dispatchPoints
+      );
+      if (matrix.rows.length === 0) return;
+      const csvContent = serializeDispatchMatrixToCsv(matrix);
+      const safeCode = (matrix.dispatchPointCode || dpId).replace(/[^A-Za-z0-9_-]/g, '_');
+      const filename = `Dispatch_Matrix_${safeCode}_${today}.csv`;
+      downloadCsvFile(csvContent, filename);
+      exportedNames.push(`${matrix.dispatchPointName} (${filename})`);
+    });
+
+    if (exportedNames.length > 0) {
+      setDispatchFeedback(`Exported SKU-vs-Party Dispatch Matrix: ${exportedNames.join(', ')}`);
+    } else {
+      setDispatchFeedback('No SKU rows available for the selected Dispatch Point.');
+    }
+  };
+
+  // Handler: Export Morning Dispatcher Sheet CSV (Detailed flat log)
   const handleExportMorningDispatcherSheetCsv = () => {
     if (dispatchManifestOrders.length === 0) {
-      alert('No orders available in current morning dispatch selection.');
+      setDispatchFeedback('No orders available in current morning dispatch selection.');
       return;
     }
 
     const headers = [
+      'Dispatch Point',
       'Commission Agent / Rep',
       'Sub-Distributor / Retail Outlet',
       'Beat / Delivery Route',
@@ -202,18 +328,27 @@ export const BillingInvoicing: React.FC = () => {
     const rows: string[] = [];
 
     dispatchManifestOrders.forEach((o) => {
-      const comp = companies.find((c) => c.id === o.company_id);
       const agentName = o.commission_agent_name || users.find((u) => u.id === o.commission_agent_id)?.name || o.commission_agent_id || 'GT Field Rep';
-      const compName = comp?.name || 'Company';
 
       (o.lines || []).forEach((l) => {
+        if (dispatchPointFilter !== 'ALL' && !doesOrderLineBelongToDispatchPoint(l, o, dispatchPointFilter, companies, skus)) {
+          return;
+        }
+        const compId = getEffectiveLineCompanyId(l, o, skus);
+        if (dispatchCompanyFilter !== 'ALL' && compId !== dispatchCompanyFilter) {
+          return;
+        }
+        const comp = companies.find((c) => c.id === compId);
+        const dpId = resolveDispatchPointIdForCompany(compId, companies, o.dispatch_point_id);
+        const dpObj = dispatchPoints.find((d) => d.id === dpId);
         const skuObj = skus.find((s) => s.id === l.sku_id);
         rows.push(
           [
-            `"${agentName}"`,
+            `"${(dpObj?.name || dpId).replace(/"/g, '""')}"`,
+            `"${agentName.replace(/"/g, '""')}"`,
             `"${o.retailer_name_raw.replace(/"/g, '""')}"`,
             `"${o.beat_name.replace(/"/g, '""')}"`,
-            `"${compName.replace(/"/g, '""')}"`,
+            `"${(comp?.name || 'Company').replace(/"/g, '""')}"`,
             `"${o.order_number}"`,
             `"${o.order_date}"`,
             `"${o.status}"`,
@@ -229,35 +364,17 @@ export const BillingInvoicing: React.FC = () => {
     });
 
     const csvContent = [headers.join(','), ...rows].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
     const today = new Date().toISOString().split('T')[0];
     const filename = `Morning_Dispatcher_Consignment_Sheet_${today}.csv`;
-
-    link.setAttribute('href', url);
-    link.setAttribute('download', filename);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-
-    alert(`Successfully generated Morning Dispatcher Sheet (${filename}) for ${dispatchManifestOrders.length} orders!`);
+    downloadCsvFile(csvContent, filename);
+    setDispatchFeedback(`Generated detailed load sheet (${filename}) with ${rows.length} line items.`);
   };
 
-  // Handler: Send All Consignments to Dispatcher Ledger
+  // Automated Dispatch Sync Info (CONFIRMED orders auto-populate MobileDispatcherApp)
   const handleSendManifestToDispatcher = () => {
-    if (dispatchManifestOrders.length === 0) {
-      alert('No orders available to send to dispatcher.');
-      return;
-    }
-
-    dispatchManifestOrders.forEach((o) => {
-      if (o.status === 'PUNCHED_TO_PRINCIPAL' || o.status === 'VERIFIED_BY_BILLING' || o.status === 'CLEARED') {
-        updateOrderStatus(o.id, 'APPROVED');
-      }
-    });
-
-    alert(`Successfully sent ${dispatchManifestOrders.length} orders to Dispatcher Ledger!\nStatus updated to APPROVED for morning vehicle loading and gate outward release.`);
+    setDispatchFeedback(
+      `Morning Dispatch Sheet is auto-synced with Mobile Dispatcher App for ${dispatchManifestOrders.length} CONFIRMED order(s). No manual push required.`
+    );
   };
 
   // Helper: Copy party-wise summary to clipboard
@@ -293,7 +410,7 @@ export const BillingInvoicing: React.FC = () => {
     const fullText = `=== MORNING DISPATCH CONSIGNMENT MANIFEST ===\nParty / Retailer: ${partyName}\nOrders Included: ${partyOrders.map((o) => o.order_number).join(', ')}\nBeat: ${partyOrders[0]?.beat_name || 'N/A'}\n------------------------------------------------\n${linesText}\n------------------------------------------------\nTOTAL CONSIGNMENT QUANTITY: ${totalQty} pcs\nTOTAL CONSIGNMENT GROSS VALUE: ₹${(totalVal || 0).toLocaleString('en-IN')}\n================================================`;
 
     navigator.clipboard.writeText(fullText);
-    alert(`Copied morning consignment manifest for ${partyName} to clipboard!`);
+    showBillingBanner('success', `Copied morning consignment manifest for ${partyName} to clipboard.`);
   };
 
   // Helper: Categorize Invoice Settlement Payment Mode (Cash vs Online vs Mixed)
@@ -355,10 +472,21 @@ export const BillingInvoicing: React.FC = () => {
     return true;
   });
 
+  // Live Party Credit Gate records across Retailers, Distributors & CFS
+  const partyCreditRecords = buildPartyCreditRecords({
+    retailers,
+    distributors,
+    users,
+    orders,
+    invoices,
+    payments,
+    defaultCreditLimit: activeTenantSettings?.credit_limit_default || 50000,
+  });
+
   // Calculate Metrics
   const totalInvoicedValue = invoices.reduce((sum, i) => sum + (i.total_amount || 0), 0);
   const totalCollectedValue = invoices.reduce((sum, i) => sum + (i.paid_amount || 0), 0);
-  const totalOutstandingValue = retailers.reduce((sum, r) => sum + (r.current_outstanding || 0), 0);
+  const totalOutstandingValue = partyCreditRecords.reduce((sum, p) => sum + p.total_liability, 0);
 
   const gstInvoicesCount = invoices.filter((i) => i.invoice_type === 'REGISTERED_GST').length;
   const cashInvoicesCount = invoices.filter((i) => i.invoice_type === 'CASH_NON_GST').length;
@@ -380,20 +508,21 @@ export const BillingInvoicing: React.FC = () => {
   const generateZohoInvoicesJsonPayload = (targetInv?: Invoice | null) => {
     const list = targetInv ? [targetInv] : invoices;
     const payload = {
-      organization_id: 'ZOHO_BOOKS_FMCG_2026',
-      environment: 'PRODUCTION_SYNC',
+      organization_id: activeTenant?.id || 'ORGANIZATION',
       generated_at: new Date().toISOString(),
       total_records: list.length,
       invoices: list.map((inv) => {
         const payInfo = getInvoicePaymentInfo(inv);
         const ord = orders.find((o) => o.id === inv.order_id);
         const ret = retailers.find((r) => r.id === inv.retailer_id);
+        const dist = distributors.find((d) => d.id === inv.retailer_id);
+        const partyGstin = ret?.gstin || dist?.gstin || '';
         return {
           invoice_number: inv.invoice_number,
           invoice_type: inv.invoice_type,
-          customer_id: inv.retailer_id || 'GUEST_OUTLET',
+          customer_id: inv.retailer_id || '',
           customer_name: inv.retailer_name,
-          customer_gstin: ret?.gstin || (inv.invoice_type === 'REGISTERED_GST' ? '27AABCS1429P1Z8' : 'URP_UNREGISTERED'),
+          customer_gstin: partyGstin || (inv.invoice_type === 'REGISTERED_GST' ? 'PENDING_GSTIN' : 'URP_UNREGISTERED'),
           invoice_date: inv.invoice_date,
           due_date: inv.due_date,
           settlement_payment_mode: payInfo.category,
@@ -406,7 +535,8 @@ export const BillingInvoicing: React.FC = () => {
             igst_inr: inv.igst,
             total_amount_inr: inv.total_amount,
             paid_amount_inr: inv.paid_amount,
-            outstanding_balance_inr: inv.total_amount - inv.paid_amount,
+            credit_note_discount_inr: inv.is_credit_note_discount ? inv.credit_note_discount_amount || 0 : 0,
+            outstanding_balance_inr: Math.max(0, inv.total_amount - inv.paid_amount - (inv.is_credit_note_discount ? inv.credit_note_discount_amount || 0 : 0)),
             is_locked_and_reconciled: !!inv.is_locked,
           },
           compliance: {
@@ -455,7 +585,7 @@ export const BillingInvoicing: React.FC = () => {
           }
         });
         setIsSyncingZoho(false);
-        alert(`Zoho Books Batch Sync Complete! All ${invoices.length} invoices and linked customer payments pushed successfully.`);
+        showBillingBanner('success', `Zoho Books Batch Sync Complete! Marked ${invoices.length} invoice(s) as synced.`);
       }
     }, 200);
   };
@@ -463,21 +593,27 @@ export const BillingInvoicing: React.FC = () => {
   // Push Single Invoice to Zoho Books
   const handlePushSingleInvoiceToZoho = (inv: Invoice) => {
     updateInvoiceMetadata(inv.id, { zoho_synced: true });
-    alert(`Invoice ${inv.invoice_number} successfully pushed & synced with Zoho Books API!`);
+    showBillingBanner('success', `Invoice ${inv.invoice_number} pushed & synced with Zoho Books.`);
   };
 
-  // Credit Limit Exceeded Retailers
-  const creditExceededRetailers = retailers.filter((r) => {
-    const limit = r.credit_limit || activeTenantSettings?.credit_limit_default || 50000;
-    const defaultLimit = activeTenantSettings?.credit_limit_default || 50000;
-    const outstanding = r.current_outstanding || 0;
-    return outstanding > limit || outstanding > defaultLimit;
-  });
+  // Parties Exceeding Approved Credit Limit (Fund Shortage > 0)
+  const creditExceededParties = partyCreditRecords.filter((p) => p.fund_shortage > 0);
 
-  // Generate Invoice Handler
+  // Generate Invoice Handler (Strictly gated to post-PO / Depot Stock CONFIRMED orders)
   const handleCreateInvoiceFromOrder = (ord: Order, type: InvoiceType) => {
-    const subtotal = Math.round(ord.total_amount / 1.18);
-    const tax = ord.total_amount - subtotal;
+    const allowedStatuses: Order['status'][] = ['CONFIRMED', 'DISPATCHED', 'APPROVED', 'PUNCHED_TO_PRINCIPAL', 'DELIVERED'];
+    if (!allowedStatuses.includes(ord.status)) {
+      showBillingBanner(
+        'error',
+        `Invoicing Blocked: Order ${ord.order_number} is in "${ord.status}" status. Move to CONFIRMED first.`
+      );
+      return;
+    }
+
+    const fin = getOrderFinancialSummary(ord, skus);
+    const subtotal = fin.productValue || Math.round(ord.total_amount);
+    const tax = type === 'REGISTERED_GST' ? fin.gstAmount : 0;
+    const grandTotal = type === 'REGISTERED_GST' ? fin.totalAmountWithGst : subtotal;
 
     const newInv: Invoice = {
       id: `inv_${Date.now()}`,
@@ -486,14 +622,14 @@ export const BillingInvoicing: React.FC = () => {
       invoice_type: type,
       order_id: ord.id,
       company_id: ord.company_id,
-      retailer_id: ord.retailer_id || retailers[0]?.id || 'ret_01',
+      retailer_id: ord.retailer_id || '',
       retailer_name: ord.retailer_name_raw,
       dispatch_point_id: ord.dispatch_point_id,
       subtotal,
-      cgst: type === 'REGISTERED_GST' ? Math.round(tax / 2) : 0,
-      sgst: type === 'REGISTERED_GST' ? Math.round(tax / 2) : 0,
+      cgst: type === 'REGISTERED_GST' ? Math.round((tax / 2) * 100) / 100 : 0,
+      sgst: type === 'REGISTERED_GST' ? Math.round((tax / 2) * 100) / 100 : 0,
       igst: 0,
-      total_amount: ord.total_amount,
+      total_amount: grandTotal,
       paid_amount: 0,
       status: 'UNPAID',
       invoice_date: new Date().toISOString().split('T')[0],
@@ -504,7 +640,7 @@ export const BillingInvoicing: React.FC = () => {
     };
 
     addInvoice(newInv);
-    alert(`Invoice ${newInv.invoice_number} (${type === 'REGISTERED_GST' ? 'GST Tax Invoice with E-Way Bill' : 'Cash Non-GST Invoice'}) generated successfully!\nOrder status updated to INVOICED.`);
+    showBillingBanner('success', `Invoice ${newInv.invoice_number} generated. Order updated to INVOICED.`);
   };
 
   // Open Edit Order Modal
@@ -524,11 +660,12 @@ export const BillingInvoicing: React.FC = () => {
     if (!selectedOrderForEdit) return;
 
     if (editLines.length === 0) {
-      alert('Order must contain at least one SKU line.');
+      showBillingBanner('error', 'Order must contain at least one SKU line.');
       return;
     }
 
     let newTotal = 0;
+    let calculatedTax = 0;
     let hasBelowCost = false;
 
     const existingLines = selectedOrderForEdit.lines || [];
@@ -536,6 +673,8 @@ export const BillingInvoicing: React.FC = () => {
       const skuObj = skus.find((s) => s.id === line.sku_id) || skus[0];
       const lineTot = line.quantity * line.unit_price;
       newTotal += lineTot;
+      const taxRate = skuObj?.tax_rate !== undefined ? Number(skuObj.tax_rate) : 18;
+      calculatedTax += lineTot * (taxRate / 100);
       const isBelow = line.unit_price < skuObj.landing_price;
       if (isBelow) hasBelowCost = true;
 
@@ -554,18 +693,18 @@ export const BillingInvoicing: React.FC = () => {
       };
     });
 
+    const computedTax = Math.round(calculatedTax * 100) / 100;
     const updatedOrder: Order = {
       ...selectedOrderForEdit,
-      total_amount: newTotal,
-      tax_amount: Math.round(newTotal * 0.18),
+      total_amount: Math.round((newTotal + computedTax) * 100) / 100,
+      tax_amount: computedTax,
       lines: updatedOrderLines,
       has_below_cost_lines: hasBelowCost,
-      status: 'VERIFIED_BY_BILLING',
     };
 
     updateOrder(selectedOrderForEdit.id, updatedOrder);
     setSelectedOrderForEdit(null);
-    alert(`Order ${updatedOrder.order_number} verified and price/lines updated successfully! Ready for billing.`);
+    showBillingBanner('success', `Order ${updatedOrder.order_number} line items and live credit liability updated.`);
   };
 
   // Record Payment Submit Handler (Billing / Agent Field Collection)
@@ -601,20 +740,20 @@ export const BillingInvoicing: React.FC = () => {
     setPayRef('');
 
     if (isAutoSettle) {
-      alert(`Payment ${newPayment.payment_number} (₹${(payAmount || 0).toLocaleString('en-IN')}) successfully recorded & VERIFIED into Bank Ledger!\nMatched invoice status & retailer balance updated.`);
+      showBillingBanner('success', `Payment ${newPayment.payment_number} (₹${(payAmount || 0).toLocaleString('en-IN')}) recorded & VERIFIED. Party credit updated.`);
     } else {
-      alert(`Collection Entry ${newPayment.payment_number} recorded as PENDING!\nSubmitted to Accounts Executive queue for Maker-Checker bank reconciliation.`);
+      showBillingBanner('info', `Collection Entry ${newPayment.payment_number} recorded as PENDING for Accounts Executive reconciliation.`);
     }
   };
 
   // Maker-Checker Verify Payment Handler (Accounts Executive)
   const handleVerifyPayment = (pmt: Payment) => {
     if (!isAccountant) {
-      alert('Maker-Checker Security Control: Collection entries recorded by Billing Executives require Accounts Executive approval to settle into bank accounts.');
+      showBillingBanner('error', 'Maker-Checker Control: Accounts Executive approval is required to settle collection entries.');
       return;
     }
-    //verifyPayment(pmt.id);
-    //alert(`Payment ${pmt.payment_number} (₹${(pmt.amount || 0).toLocaleString('en-IN')}) verified & reconciled into Bank Ledger!\nMatched invoice and retailer balance updated.`);
+    verifyPayment(pmt.id);
+    showBillingBanner('success', `Payment ${pmt.payment_number} (₹${(pmt.amount || 0).toLocaleString('en-IN')}) verified & credited in live Party Ledger.`);
   };
 
   // Flag Payment Handler
@@ -622,29 +761,29 @@ export const BillingInvoicing: React.FC = () => {
     e.preventDefault();
     if (!flaggingPayment) return;
     if (!flagReasonText.trim()) {
-      alert('Please specify a valid reason for flagging this payment.');
+      showBillingBanner('error', 'Please specify a valid reason for flagging this payment.');
       return;
     }
     flagPayment(flaggingPayment.id, flagReasonText);
     setFlaggingPayment(null);
     setFlagReasonText('');
-    alert(`Payment ${flaggingPayment.payment_number} flagged for audit investigation.`);
+    showBillingBanner('info', `Payment ${flaggingPayment.payment_number} flagged for audit investigation.`);
   };
 
   // Open Edit Existing Payment
   const handleOpenEditPayment = (pmt: Payment) => {
     if (pmt.status === 'VERIFIED') {
-      alert('🔒 Payment Locked: Once a payment is VERIFIED and credited into the bank ledger, no one can edit its details to maintain audit integrity.');
+      showBillingBanner('error', 'Verified payments are permanently locked to preserve bank ledger integrity.');
       return;
     }
 
     if (pmt.status === 'FLAGGED' && activeRole !== 'ADMIN') {
-      alert('🔒 Admin Access Required: This payment has been FLAGGED for discrepancy. Only an Admin can edit flagged payment details to resolve it.');
+      showBillingBanner('error', 'Admin Access Required: Only an Admin can edit flagged payment entries.');
       return;
     }
 
     if (pmt.status === 'PENDING' && activeRole !== 'ADMIN') {
-      alert('🔒 Account Executive Guard: Account Executives cannot edit payment details directly to prevent manipulation. You can only "Reconcile" (Verify) or "Flag" discrepancies. Contact Admin if payment details need modification.');
+      showBillingBanner('error', 'Accounts Executive cannot edit payment figures directly; Reconcile or Flag mismatch.');
       return;
     }
 
@@ -661,18 +800,18 @@ export const BillingInvoicing: React.FC = () => {
     if (!editingPayment) return;
 
     if (editingPayment.status === 'VERIFIED') {
-      alert('🔒 Verified Payment Locked: This payment has already been verified and credited in the bank ledger. Verified records cannot be edited by anyone.');
+      showBillingBanner('error', 'Verified payments are permanently locked and cannot be edited.');
       return;
     }
 
     if (activeRole !== 'ADMIN') {
-      alert('🔒 Admin Access Required: Account Executives cannot edit payment details. Only Admin can edit payment details.');
+      showBillingBanner('error', 'Admin Access Required to modify pending or flagged payment entries.');
       return;
     }
 
     const amt = Number(editPaymentAmount) || 0;
     if (amt <= 0) {
-      alert('Please enter a valid payment amount.');
+      showBillingBanner('error', 'Please enter a valid payment amount greater than zero.');
       return;
     }
 
@@ -687,10 +826,9 @@ export const BillingInvoicing: React.FC = () => {
     });
 
     if (isFlagged) {
-      //verifyPayment(editingPayment.id);
-      alert(`Admin Discrepancy Resolution: Payment ${editingPayment.payment_number} updated to ₹${amt.toLocaleString('en-IN')} (${editPaymentMode}) and VERIFIED into Bank Ledger!\nFlagged discrepancy resolved successfully.`);
+      showBillingBanner('success', `Admin Resolution: Payment ${editingPayment.payment_number} updated to ₹${amt.toLocaleString('en-IN')} and VERIFIED.`);
     } else {
-      alert(`Payment ${editingPayment.payment_number} updated to ₹${amt.toLocaleString('en-IN')} (${editPaymentMode}) by Admin!\nMatched invoice and retailer balance updated.`);
+      showBillingBanner('success', `Payment ${editingPayment.payment_number} updated to ₹${amt.toLocaleString('en-IN')}.`);
     }
 
     setEditingPayment(null);
@@ -715,19 +853,22 @@ export const BillingInvoicing: React.FC = () => {
     const remaining = Math.max(0, editingInvoicePartial.total_amount - amt);
     const newStatus = amt >= editingInvoicePartial.total_amount ? 'PAID' : amt > 0 ? 'PARTIAL' : 'UNPAID';
 
-    alert(`Invoice ${editingInvoicePartial.invoice_number} updated successfully!\n- Accumulated Paid Amount: ₹${amt.toLocaleString('en-IN')}\n- Status: ${newStatus}\n- Remaining Balance: ₹${(remaining || 0).toLocaleString('en-IN')}\nPayment collection record created and linked to ledger.`);
+    showBillingBanner(
+      'success',
+      `Invoice ${editingInvoicePartial.invoice_number} updated (${newStatus}). Remaining Balance: ₹${remaining.toLocaleString('en-IN')}.`
+    );
     setEditingInvoicePartial(null);
   };
 
   // Toggle Lock Invoice (Accountant Only)
   const handleToggleLockInvoice = (inv: Invoice) => {
     if (!isAccountant) {
-      alert('Only Accounts Executive or Admin can lock/unlock reconciled invoices.');
+      showBillingBanner('error', 'Only Accounts Executive or Admin can lock/unlock reconciled invoices.');
       return;
     }
     toggleLockInvoice(inv.id, isBillingExec ? 'Billing Exec' : 'Accounts Exec');
     const newState = !inv.is_locked;
-    alert(`Invoice ${inv.invoice_number} is now ${newState ? 'LOCKED & RECONCILED 🔒' : 'UNLOCKED for editing 🔓'}.`);
+    showBillingBanner('info', `Invoice ${inv.invoice_number} is now ${newState ? 'LOCKED & RECONCILED' : 'UNLOCKED for editing'}.`);
   };
 
   // Export Payments formatted for Zoho Books / Zoho Finance
@@ -797,7 +938,9 @@ export const BillingInvoicing: React.FC = () => {
 
     const rows = invoices.map((inv) => {
       const ret = retailers.find((r) => r.id === inv.retailer_id);
-      const gstin = ret?.gstin || (inv.invoice_type === 'REGISTERED_GST' ? '27AABCT8923P1ZX' : 'URP (Unregistered)');
+      const dist = distributors.find((d) => d.id === inv.retailer_id);
+      const partyGstin = ret?.gstin || dist?.gstin || '';
+      const gstin = partyGstin || (inv.invoice_type === 'REGISTERED_GST' ? 'PENDING_GSTIN' : 'URP (Unregistered)');
       const remaining = inv.total_amount - inv.paid_amount;
 
       return [
@@ -867,7 +1010,7 @@ export const BillingInvoicing: React.FC = () => {
       retailer_id: ret.id,
       retailer_name_raw: ret.name,
       beat_name: ret.beat_name || 'Central Beat',
-      dispatch_point_id: 'dp_central',
+      dispatch_point_id: resolveDispatchPointIdForCompany(targetSku.company_id, companies, dispatchPoints[0]?.id || 'dp_central'),
       created_by_user_id: currentUser?.id || 'usr_billing_1',
       commission_agent_id: (ret as any).commission_agent_id || users?.find((u) => u.role === 'COMMISSION_AGENT')?.id || 'usr_agent_1',
       commission_agent_name: (ret as any).commission_agent_id
@@ -898,11 +1041,31 @@ export const BillingInvoicing: React.FC = () => {
 
     addOrder(newOrder);
     setIsPunchOrderOpen(false);
-    alert(`New Store Order ${newOrder.order_number} punched successfully for ${ret.name}!\nAdded to Billing Order Queue.`);
+    showBillingBanner('success', `New Store Order ${newOrder.order_number} punched for ${ret.name} & added to Billing Queue.`);
   };
 
   return (
     <div className="space-y-6">
+      {billingBanner && (
+        <div
+          className={`px-4 py-3 rounded-xl border text-xs font-semibold flex items-center justify-between gap-3 ${
+            billingBanner.type === 'success'
+              ? 'bg-emerald-950/70 border-emerald-500/40 text-emerald-200'
+              : billingBanner.type === 'error'
+                ? 'bg-rose-950/70 border-rose-500/40 text-rose-200'
+                : 'bg-blue-950/70 border-blue-500/40 text-blue-200'
+          }`}
+        >
+          <span>{billingBanner.message}</span>
+          <button
+            type="button"
+            onClick={() => setBillingBanner(null)}
+            className="text-xs font-bold opacity-80 hover:opacity-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* Module Title Header */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
@@ -953,7 +1116,7 @@ export const BillingInvoicing: React.FC = () => {
         <KPICard
           title="Accounts Receivable (Outstanding)"
           value={`₹${(totalOutstandingValue || 0).toLocaleString('en-IN')}`}
-          subtitle={`${creditExceededRetailers.length} Outlets Exceeding Credit Threshold`}
+          subtitle={`${creditExceededParties.length} Parties with Fund Shortage`}
           icon={DollarSign}
           status={totalOutstandingValue > 100000 ? 'warning' : 'neutral'}
         />
@@ -986,10 +1149,10 @@ export const BillingInvoicing: React.FC = () => {
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <Truck size={15} /> Morning Dispatcher Consignments ({punchedToPrincipalOrders.length})
-          {punchedToPrincipalOrders.length > 0 && (
+          <Truck size={15} /> Morning Dispatcher Consignments ({confirmedOrders.length})
+          {confirmedOrders.length > 0 && (
             <span className="bg-indigo-500 text-white text-[10px] px-1.5 py-0.2 rounded-full font-extrabold">
-              {punchedToPrincipalOrders.length}
+              {confirmedOrders.length}
             </span>
           )}
         </button>
@@ -1026,7 +1189,7 @@ export const BillingInvoicing: React.FC = () => {
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <ShieldAlert size={15} /> Credit Limit & Overdue Debt Audit ({creditExceededRetailers.length})
+          <ShieldAlert size={15} /> Credit Limit & Overdue Debt Audit ({creditExceededParties.length})
         </button>
       </div>
 
@@ -1035,30 +1198,51 @@ export const BillingInvoicing: React.FC = () => {
         <div className="space-y-6">
           <BEVerificationDashboard />
 
-          {/* Section: Ready for Direct Invoice Generation */}
+          {/* Section: Confirmed Orders Ready for Direct Invoice Generation */}
           {readyToInvoiceOrders.length > 0 && (
             <div className="pt-4 border-t border-slate-800 space-y-3">
               <h2 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <FileText size={14} className="text-blue-400" />
-                Verified Depot Dispatch Orders Ready for GST Tax Invoicing ({readyToInvoiceOrders.length})
+                Confirmed Orders Ready for Tax / Cash Invoicing ({readyToInvoiceOrders.length})
               </h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                 {readyToInvoiceOrders.map((ord, idx) => (
                   <div key={`${ord.id || ord.order_number}_${idx}`} className="p-3 bg-slate-900 border border-slate-800 rounded-xl space-y-2 text-xs">
                     <div className="flex justify-between items-start">
                       <div>
-                        <div className="font-bold text-white">{ord.order_number}</div>
+                        <div className="font-bold text-white flex items-center gap-1.5">
+                          {ord.order_number}
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+                            ord.fulfillment_source === 'DEPOT_STOCK'
+                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                          }`}>
+                            {ord.fulfillment_source === 'DEPOT_STOCK' ? 'DEPOT STOCK' : 'PRINCIPAL PO'}
+                          </span>
+                        </div>
                         <div className="text-slate-400">{ord.retailer_name_raw}</div>
                       </div>
                       <span className="font-mono font-bold text-emerald-400">₹{(ord.total_amount || 0).toLocaleString('en-IN')}</span>
                     </div>
-                    <div className="flex justify-end gap-1.5 pt-2 border-t border-slate-800">
-                      <button
-                        onClick={() => handleCreateInvoiceFromOrder(ord, 'REGISTERED_GST')}
-                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded text-[11px]"
-                      >
-                        Issue GST Tax Invoice
-                      </button>
+                    <div className="flex justify-between items-center gap-1.5 pt-2 border-t border-slate-800">
+                      <span className="text-[10px] font-mono text-slate-400">{ord.status}</span>
+                      <div className="flex items-center gap-1.5">
+                        {ord.order_invoicing_type === 'UNREGISTERED_CASH' ? (
+                          <button
+                            onClick={() => handleCreateInvoiceFromOrder(ord, 'CASH_NON_GST')}
+                            className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded text-[11px]"
+                          >
+                            Issue Cash Invoice
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => handleCreateInvoiceFromOrder(ord, 'REGISTERED_GST')}
+                            className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded text-[11px]"
+                          >
+                            Issue GST Tax Invoice
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -1068,7 +1252,7 @@ export const BillingInvoicing: React.FC = () => {
         </div>
       )}
 
-      {/* TAB: MORNING DISPATCHER CONSIGNMENTS & PARTY-WISE LOAD SHEET */}
+      {/* TAB: MORNING DISPATCHER CONSIGNMENTS & SKU-vs-PARTY MATRIX */}
       {activeTab === 'DISPATCH_SHEET' && (
         <div className="space-y-6">
           {/* Header Banner */}
@@ -1082,70 +1266,144 @@ export const BillingInvoicing: React.FC = () => {
                   Morning Dispatch & Consignment Manifest
                 </div>
                 <h3 className="text-sm font-bold text-white mt-0.5">
-                  Party-Wise, Sub-Distributor-Wise & Agent-Wise Consolidated Load Sheet
+                  Dispatch Point Segregated SKU-vs-Party Matrix & Consolidated Load Sheet
                 </h3>
               </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <button
-                onClick={handleExportMorningDispatcherSheetCsv}
-                className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-indigo-900/30"
-                title="Download complete morning dispatcher load sheet as CSV"
+                type="button"
+                onClick={() => handleExportSkuPartyMatrixCsv()}
+                className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-900/30"
+                title="Export SKU-vs-Party Dispatch Sheet Matrix CSV (strictly scoped per Dispatch Point -> Principal Company mapping)"
               >
-                <Download size={14} /> Export Morning Dispatcher Sheet (CSV)
+                <FileSpreadsheet size={14} /> Export SKU-vs-Party Matrix (CSV)
               </button>
               <button
-                onClick={handleSendManifestToDispatcher}
-                className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-900/30"
-                title="Send all consolidated consignments to Dispatcher stock ledger"
+                type="button"
+                onClick={handleExportMorningDispatcherSheetCsv}
+                className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-indigo-900/30"
+                title="Download flat order-line morning dispatcher load sheet as CSV"
               >
-                <CheckCircle2 size={14} /> Send to Dispatcher Ledger
+                <Download size={14} /> Export Flat Load Sheet (CSV)
+              </button>
+              <button
+                type="button"
+                onClick={handleSendManifestToDispatcher}
+                className="px-3.5 py-2 rounded-xl bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 font-bold text-xs flex items-center gap-1.5"
+                title="CONFIRMED orders are automatically live in the Dispatcher Mobile App"
+              >
+                <CheckCircle2 size={14} /> Auto-Synced ({dispatchManifestOrders.length})
               </button>
             </div>
           </div>
 
-          {/* Grouping & Filter Controls Bar */}
+          {dispatchFeedback && (
+            <div className="p-3 bg-emerald-950/60 border border-emerald-500/40 rounded-xl text-xs text-emerald-200 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-2">
+                <CheckCircle2 size={14} className="text-emerald-400 shrink-0" />
+                {dispatchFeedback}
+              </span>
+              <button
+                type="button"
+                onClick={() => setDispatchFeedback(null)}
+                className="text-emerald-400 hover:text-white p-0.5"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
+          {/* View Mode, Dispatch Point & Filter Controls Bar */}
           <div className="bg-slate-900 border border-slate-800 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-3 flex-wrap">
-              <span className="text-slate-400 font-semibold flex items-center gap-1">
-                <Layers size={13} className="text-indigo-400" /> Group Manifest By:
-              </span>
               <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
                 <button
-                  onClick={() => setDispatchGroupBy('PARTY')}
+                  type="button"
+                  onClick={() => setDispatchViewMode('MATRIX')}
                   className={`px-3 py-1.5 rounded-md font-semibold text-xs flex items-center gap-1.5 transition-colors ${
-                    dispatchGroupBy === 'PARTY'
-                      ? 'bg-indigo-600 text-white font-bold shadow-sm'
+                    dispatchViewMode === 'MATRIX'
+                      ? 'bg-emerald-600 text-white font-bold shadow-sm'
                       : 'text-slate-400 hover:text-white'
                   }`}
                 >
-                  <Building size={13} /> Sub-Distributor / Retailer Party
+                  <Table2 size={13} /> SKU-vs-Party Matrix
                 </button>
                 <button
-                  onClick={() => setDispatchGroupBy('AGENT')}
+                  type="button"
+                  onClick={() => setDispatchViewMode('GROUPED')}
                   className={`px-3 py-1.5 rounded-md font-semibold text-xs flex items-center gap-1.5 transition-colors ${
-                    dispatchGroupBy === 'AGENT'
+                    dispatchViewMode === 'GROUPED'
                       ? 'bg-indigo-600 text-white font-bold shadow-sm'
                       : 'text-slate-400 hover:text-white'
                   }`}
                 >
-                  <Users size={13} /> Commission Agent / Sales Rep
-                </button>
-                <button
-                  onClick={() => setDispatchGroupBy('BEAT')}
-                  className={`px-3 py-1.5 rounded-md font-semibold text-xs flex items-center gap-1.5 transition-colors ${
-                    dispatchGroupBy === 'BEAT'
-                      ? 'bg-indigo-600 text-white font-bold shadow-sm'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Truck size={13} /> Beat / Delivery Route
+                  <Layers size={13} /> Grouped Load Cards
                 </button>
               </div>
+
+              {dispatchViewMode === 'GROUPED' && (
+                <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setDispatchGroupBy('PARTY')}
+                    className={`px-2.5 py-1 rounded-md font-semibold text-xs flex items-center gap-1 transition-colors ${
+                      dispatchGroupBy === 'PARTY'
+                        ? 'bg-indigo-600 text-white font-bold shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Building size={12} /> Party
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDispatchGroupBy('AGENT')}
+                    className={`px-2.5 py-1 rounded-md font-semibold text-xs flex items-center gap-1 transition-colors ${
+                      dispatchGroupBy === 'AGENT'
+                        ? 'bg-indigo-600 text-white font-bold shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Users size={12} /> Agent
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDispatchGroupBy('BEAT')}
+                    className={`px-2.5 py-1 rounded-md font-semibold text-xs flex items-center gap-1 transition-colors ${
+                      dispatchGroupBy === 'BEAT'
+                        ? 'bg-indigo-600 text-white font-bold shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Truck size={12} /> Beat
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400 font-medium flex items-center gap-1">
+                  <Warehouse size={13} className="text-cyan-400" /> Dispatch Point:
+                </span>
+                <select
+                  value={dispatchPointFilter}
+                  onChange={(e) => setDispatchPointFilter(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                >
+                  <option value="ALL">All Dispatch Points (Segregated Sheets)</option>
+                  {dispatchPoints.map((dp) => {
+                    const mappedCount = companies.filter((c) => c.dispatch_point_id === dp.id).length;
+                    return (
+                      <option key={dp.id} value={dp.id}>
+                        {dp.name} ({dp.code}) — {mappedCount} Co.
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
               <div className="flex items-center gap-2">
                 <span className="text-slate-400 font-medium">Order Scope:</span>
                 <select
@@ -1153,8 +1411,8 @@ export const BillingInvoicing: React.FC = () => {
                   onChange={(e) => setDispatchStatusScope(e.target.value as any)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white"
                 >
-                  <option value="PUNCHED_TO_PRINCIPAL">Punched to Principal Only ({punchedToPrincipalOrders.length})</option>
-                  <option value="ALL_APPROVED">All Approved & Verified ({orders.filter(o => o.status === 'VERIFIED_BY_BILLING' || o.status === 'APPROVED' || o.status === 'CLEARED' || o.status === 'PUNCHED_TO_PRINCIPAL').length})</option>
+                  <option value="CONFIRMED_ONLY">Confirmed Post-PO / Depot Stock ({confirmedOrders.length})</option>
+                  <option value="ALL_POST_PO">All Confirmed & Dispatched ({orders.filter(o => o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL' || o.status === 'APPROVED' || o.status === 'DISPATCHED' || (o.status === 'INVOICED' && !o.dispatched_at)).length})</option>
                 </select>
               </div>
 
@@ -1165,22 +1423,158 @@ export const BillingInvoicing: React.FC = () => {
                   onChange={(e) => setDispatchCompanyFilter(e.target.value)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white"
                 >
-                  <option value="ALL">All Principal Companies</option>
-                  {companies.map((c) => (
-                    <option key={c.id} value={c.id}>{c.name} ({c.code})</option>
-                  ))}
+                  <option value="ALL">All Mapped Companies</option>
+                  {companies
+                    .filter((c) => dispatchPointFilter === 'ALL' || c.dispatch_point_id === dispatchPointFilter)
+                    .map((c) => (
+                      <option key={c.id} value={c.id}>{c.name} ({c.code})</option>
+                    ))}
                 </select>
               </div>
             </div>
           </div>
 
-          {/* Grouped Consignment Manifest Cards */}
-          {dispatchManifestOrders.length === 0 ? (
+          {/* VIEW 1: SKU-vs-PARTY MATRIX PER DISPATCH POINT */}
+          {dispatchViewMode === 'MATRIX' ? (
+            dispatchPointMatrices.length === 0 ? (
+              <div className="p-8 text-center text-slate-500 bg-slate-900 border border-dashed border-slate-800 rounded-2xl text-xs space-y-2">
+                <Table2 size={28} className="mx-auto text-emerald-500/50" />
+                <div className="text-slate-300 font-semibold text-sm">No SKU-vs-Party matrix entries found</div>
+                <p className="text-slate-400">
+                  Submit a Principal PO or fast-track confirm from existing Depot Stock in Order Capture to transition VERIFIED orders to CONFIRMED.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {dispatchPointMatrices.map((matrix) => (
+                  <div
+                    key={matrix.dispatchPointId}
+                    className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow-sm"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <Warehouse size={16} className="text-cyan-400" />
+                          <h4 className="text-sm font-bold text-white">
+                            {matrix.dispatchPointName}{' '}
+                            <span className="font-mono text-xs text-cyan-400">({matrix.dispatchPointCode})</span>
+                          </h4>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-bold">
+                            {matrix.rows.length} SKUs × {matrix.parties.length} Parties
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-mono font-bold">
+                            {matrix.grandTotalQuantity.toLocaleString()} Total Pcs
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-400">
+                          Mapped Principal Companies:{' '}
+                          <span className="text-slate-200 font-semibold">
+                            {matrix.mappedCompanyNames.length > 0
+                              ? matrix.mappedCompanyNames.join(', ')
+                              : 'None mapped'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => handleExportSkuPartyMatrixCsv(matrix.dispatchPointId)}
+                        disabled={matrix.rows.length === 0}
+                        className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-bold text-xs flex items-center gap-1.5"
+                      >
+                        <Download size={13} /> Export {matrix.dispatchPointCode} Matrix CSV
+                      </button>
+                    </div>
+
+                    {matrix.rows.length === 0 ? (
+                      <div className="p-4 text-center text-xs text-slate-500 bg-slate-950 rounded-xl border border-slate-800">
+                        No confirmed order lines for companies mapped to {matrix.dispatchPointName}.
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="bg-slate-950 border-b border-slate-800 text-slate-300 font-semibold">
+                              <th className="py-2.5 px-3 sticky left-0 bg-slate-950 z-10 border-r border-slate-800 min-w-[220px]">
+                                SKU Name (Column A)
+                              </th>
+                              {matrix.parties.map((party) => (
+                                <th
+                                  key={party.partyKey}
+                                  className="py-2.5 px-3 text-right border-r border-slate-800/60 min-w-[140px]"
+                                  title={`Beat: ${party.beatName || 'N/A'} | Orders: ${party.orderNumbers.join(', ')}`}
+                                >
+                                  <div className="text-white font-bold leading-tight">{party.partyName}</div>
+                                  <div className="text-[10px] text-cyan-400 font-normal">
+                                    {party.raiserRoleLabel}
+                                    {party.raiserName && party.raiserName !== party.partyName ? `: ${party.raiserName}` : ''}
+                                  </div>
+                                </th>
+                              ))}
+                              <th className="py-2.5 px-3 text-right bg-slate-950 font-bold text-amber-300 min-w-[100px]">
+                                Total Qty
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60 text-slate-200">
+                            {matrix.rows.map((row) => (
+                              <tr key={row.skuId || row.skuName} className="hover:bg-slate-800/40">
+                                <td className="py-2 px-3 sticky left-0 bg-slate-900 border-r border-slate-800">
+                                  <div className="font-semibold text-white">{row.skuName}</div>
+                                  <div className="text-[10px] text-slate-400 font-mono">
+                                    {row.companyCode} • {row.skuCode} • {row.packSize}
+                                  </div>
+                                </td>
+                                {matrix.parties.map((party) => {
+                                  const cellQty = row.quantitiesByPartyKey[party.partyKey] || 0;
+                                  return (
+                                    <td
+                                      key={party.partyKey}
+                                      className={`py-2 px-3 text-right font-mono border-r border-slate-800/60 ${
+                                        cellQty > 0 ? 'text-white font-bold' : 'text-slate-600'
+                                      }`}
+                                    >
+                                      {cellQty > 0 ? cellQty : '—'}
+                                    </td>
+                                  );
+                                })}
+                                <td className="py-2 px-3 text-right font-mono font-bold text-emerald-400">
+                                  {row.totalQuantity.toLocaleString()}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                          <tfoot>
+                            <tr className="bg-slate-950 border-t-2 border-slate-700 font-mono font-bold text-xs">
+                              <td className="py-2.5 px-3 sticky left-0 bg-slate-950 border-r border-slate-800 text-amber-300">
+                                TOTAL QTY
+                              </td>
+                              {matrix.parties.map((party) => (
+                                <td
+                                  key={party.partyKey}
+                                  className="py-2.5 px-3 text-right border-r border-slate-800/60 text-cyan-300"
+                                >
+                                  {party.totalQuantity.toLocaleString()}
+                                </td>
+                              ))}
+                              <td className="py-2.5 px-3 text-right text-emerald-400">
+                                {matrix.grandTotalQuantity.toLocaleString()}
+                              </td>
+                            </tr>
+                          </tfoot>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )
+          ) : dispatchManifestOrders.length === 0 ? (
             <div className="p-8 text-center text-slate-500 bg-slate-900 border border-dashed border-slate-800 rounded-2xl text-xs space-y-2">
               <Truck size={28} className="mx-auto text-indigo-500/50" />
               <div className="text-slate-300 font-semibold text-sm">No morning dispatch orders found</div>
               <p className="text-slate-400">
-                Mark store orders as "PUNCHED TO PRINCIPAL COMPANY" in the Order Capture portal to populate this dispatcher manifest queue.
+                Submit a Principal PO or fast-track confirm from existing Depot Stock in Order Capture to transition VERIFIED orders to CONFIRMED for next-day dispatch.
               </p>
             </div>
           ) : (
@@ -1227,7 +1621,7 @@ export const BillingInvoicing: React.FC = () => {
                 const groupList = Object.values(groups);
 
                 return groupList.map((grp) => {
-                  // Build SKU line items aggregation for this group
+                  // Build SKU line items aggregation for this group (strictly filtered by DP & Company)
                   const skuMap: Record<
                     string,
                     { code: string; name: string; pack: string; quantity: number; unit_price: number; total: number }
@@ -1235,6 +1629,12 @@ export const BillingInvoicing: React.FC = () => {
 
                   grp.orders.forEach((ord) => {
                     (ord.lines || []).forEach((l) => {
+                      if (dispatchPointFilter !== 'ALL' && !doesOrderLineBelongToDispatchPoint(l, ord, dispatchPointFilter, companies, skus)) {
+                        return;
+                      }
+                      if (dispatchCompanyFilter !== 'ALL' && getEffectiveLineCompanyId(l, ord, skus) !== dispatchCompanyFilter) {
+                        return;
+                      }
                       const skuObj = skus.find((s) => s.id === l.sku_id);
                       if (!skuMap[l.sku_id]) {
                         skuMap[l.sku_id] = {
@@ -1254,6 +1654,7 @@ export const BillingInvoicing: React.FC = () => {
                   });
 
                   const skuLines = Object.values(skuMap);
+                  if (skuLines.length === 0) return null;
                   const groupTotalQty = skuLines.reduce((s, r) => s + r.quantity, 0);
                   const groupTotalVal = skuLines.reduce((s, r) => s + r.total, 0);
                   const isGroupExpanded = expandedGroupKey === grp.key;
@@ -1526,6 +1927,11 @@ export const BillingInvoicing: React.FC = () => {
                           >
                             {inv.invoice_type === 'REGISTERED_GST' ? 'GST Tax Inv' : 'Cash Non-GST'}
                           </span>
+                          {inv.is_credit_note_discount && (
+                            <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                              Credit Note {inv.credit_note_number || ''} (-₹{(inv.credit_note_discount_amount || 0).toLocaleString('en-IN')})
+                            </span>
+                          )}
                           {inv.e_way_bill_no && (
                             <div className="text-[9px] text-slate-500 font-mono mt-0.5">
                               E-Way: {inv.e_way_bill_no}
@@ -1644,17 +2050,31 @@ export const BillingInvoicing: React.FC = () => {
                           </button>
 
                           {inv.status !== 'PAID' && (
-                            <button
-                              onClick={() => {
-                                setSelectedInvoiceForPayment(inv);
-                                setPayRetailerId(inv.retailer_id || '');
-                                setPayAmount(remaining);
-                                setIsRecordPaymentOpen(true);
-                              }}
-                              className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold inline-flex items-center gap-1"
-                            >
-                              <Plus size={12} /> Record Pay
-                            </button>
+                            <>
+                              <button
+                                onClick={() => {
+                                  setCreditNoteInvoice(inv);
+                                  setCreditNoteAmt('');
+                                  setCreditNoteNum(`CN-${Date.now().toString().slice(-5)}`);
+                                  setCreditNoteReason('');
+                                }}
+                                className="px-2 py-1 rounded bg-purple-900/50 hover:bg-purple-800/70 text-purple-200 border border-purple-500/30 text-[10px] font-semibold inline-flex items-center gap-1"
+                                title="Issue occasional BE Credit Note discount against this invoice"
+                              >
+                                Credit Note
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setSelectedInvoiceForPayment(inv);
+                                  setPayRetailerId(inv.retailer_id || '');
+                                  setPayAmount(remaining);
+                                  setIsRecordPaymentOpen(true);
+                                }}
+                                className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold inline-flex items-center gap-1"
+                              >
+                                <Plus size={12} /> Record Pay
+                              </button>
+                            </>
                           )}
                         </td>
                       </tr>
@@ -1802,7 +2222,7 @@ export const BillingInvoicing: React.FC = () => {
                                     <ShieldAlert size={12} /> Resolve & Edit
                                   </button>
                                   <button
-                                    //onClick={() => handleVerifyPayment(pmt)}
+                                    onClick={() => handleVerifyPayment(pmt)}
                                     className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold inline-flex items-center gap-1 shadow-sm"
                                     title="Approve & Verify Flagged Payment directly into bank ledger"
                                   >
@@ -1840,7 +2260,7 @@ export const BillingInvoicing: React.FC = () => {
                               )}
 
                               <button
-                                //onClick={() => handleVerifyPayment(pmt)}
+                                onClick={() => handleVerifyPayment(pmt)}
                                 className={`px-2 py-1 rounded text-[10px] font-bold inline-flex items-center gap-1 ${
                                   isAccountant
                                     ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm'
@@ -1877,51 +2297,62 @@ export const BillingInvoicing: React.FC = () => {
             <div className="flex items-center justify-between text-xs font-bold">
               <span className="text-white flex items-center gap-2">
                 <ShieldAlert size={16} className="text-rose-400" />
-                Accounts Executive Credit Risk & Overdue Debt Threshold Audit
+                Live Party Credit Liability &amp; Fund Shortage Audit
               </span>
               <span className="text-slate-400 font-mono">
-                {creditExceededRetailers.length} Outlets Exceeding Credit Limits
+                {creditExceededParties.length} Parties Exceeding Credit Limits
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Outlets with current outstanding exceeding their approved credit limit or standard payment days threshold. Credit limit modifications require Accounts Executive authorization.
+              Real-time over-limit liability across Retailers, Distributors, and CFS accounts (Total Liability = Non-Cancelled Orders - Verified Payments - Explicit Credit Notes).
             </p>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {creditExceededRetailers.map((ret) => {
-              const limit = ret.credit_limit || activeTenantSettings.credit_limit_default;
-              const excess = ret.current_outstanding - limit;
-              return (
-                <div key={ret.id} className="p-4 bg-slate-900 border border-rose-500/40 rounded-2xl space-y-3">
-                  <div className="flex justify-between items-start">
+            {creditExceededParties.length === 0 ? (
+              <div className="md:col-span-2 p-8 text-center bg-slate-900 border border-slate-800 rounded-2xl text-xs text-slate-400">
+                No active parties currently exceed their approved credit limits.
+              </div>
+            ) : (
+              creditExceededParties.map((party) => (
+                <div key={`${party.partyKind}_${party.id}`} className="p-4 bg-slate-900 border border-rose-500/40 rounded-2xl space-y-3">
+                  <div className="flex justify-between items-start gap-2">
                     <div>
-                      <div className="text-sm font-bold text-white">{ret.name}</div>
-                      <div className="text-xs text-slate-400">
-                        Beat: {ret.beat_name} | Contact: {ret.contact_person} ({ret.phone})
+                      <div className="text-sm font-bold text-white flex items-center gap-2">
+                        <span>{party.name}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[9px] text-slate-300 uppercase">
+                          {party.categoryLabel}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-400 mt-0.5">
+                        {party.routeOrLocation} {party.mobileOrPhone ? `| ${party.mobileOrPhone}` : ''}
                       </div>
                     </div>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-rose-500/20 text-rose-300 border border-rose-500/30">
-                      EXCEEDED BY ₹{(excess || 0).toLocaleString('en-IN')}
+                    <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-rose-500/20 text-rose-300 border border-rose-500/30 shrink-0">
+                      SHORTAGE ₹{party.fund_shortage.toLocaleString('en-IN')}
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2 p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs font-mono">
+                  <div className="grid grid-cols-3 gap-2 p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs font-mono">
                     <div>
-                      <span className="text-slate-400 block text-[10px]">Approved Credit Limit:</span>
-                      <strong className="text-white">₹{(limit || 0).toLocaleString('en-IN')}</strong>
+                      <span className="text-slate-400 block text-[10px] font-sans">Credit Limit</span>
+                      <strong className="text-white">₹{party.credit_limit.toLocaleString('en-IN')}</strong>
                     </div>
                     <div>
-                      <span className="text-slate-400 block text-[10px]">Current Outstanding:</span>
-                      <strong className="text-rose-400">₹{(ret.current_outstanding || 0).toLocaleString('en-IN')}</strong>
+                      <span className="text-slate-400 block text-[10px] font-sans">Total Liability</span>
+                      <strong className="text-rose-400">₹{party.total_liability.toLocaleString('en-IN')}</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Remaining Credit</span>
+                      <strong className="text-emerald-400">₹{party.remaining_credit.toLocaleString('en-IN')}</strong>
                     </div>
                   </div>
 
                   <div className="flex justify-end gap-2 pt-2 border-t border-slate-800 text-xs">
                     <button
                       onClick={() => {
-                        setEditingCreditRetailer(ret);
-                        setNewCreditLimitVal(limit + 25000);
+                        setEditingCreditParty(party);
+                        setNewCreditLimitVal(party.credit_limit + 25000);
                       }}
                       className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg"
                     >
@@ -1929,8 +2360,8 @@ export const BillingInvoicing: React.FC = () => {
                     </button>
                   </div>
                 </div>
-              );
-            })}
+              ))
+            )}
           </div>
         </div>
       )}
@@ -1963,8 +2394,8 @@ export const BillingInvoicing: React.FC = () => {
               <div className="flex justify-between items-start border-b border-slate-800 pb-4">
                 <div>
                   <div className="text-lg font-black text-white">{activeTenant.name}</div>
-                  <div className="text-slate-400 font-mono">GSTIN: {activeTenant.gstin || '27AABCU9603R1ZM'}</div>
-                  <div className="text-slate-400">{activeTenant.address}</div>
+                  <div className="text-slate-400 font-mono">GSTIN: {activeTenant.gstin || 'Unregistered / Not Set'}</div>
+                  <div className="text-slate-400">{activeTenant.address || ''}</div>
                 </div>
                 <div className="text-right font-mono">
                   <div className="text-sm font-bold text-blue-400">{selectedInvoiceForPrint.invoice_number}</div>
@@ -2481,24 +2912,28 @@ export const BillingInvoicing: React.FC = () => {
       )}
 
       {/* ADJUST CREDIT LIMIT MODAL */}
-      {editingCreditRetailer && (
+      {editingCreditParty && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 text-slate-200 space-y-4">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800">
               <h2 className="text-sm font-bold text-white">
-                Adjust Approved Credit Limit ({editingCreditRetailer.name})
+                Adjust Approved Credit Limit ({editingCreditParty.name})
               </h2>
-              <button onClick={() => setEditingCreditRetailer(null)} className="text-slate-400 text-xs">
+              <button onClick={() => setEditingCreditParty(null)} className="text-slate-400 text-xs">
                 ✕
               </button>
             </div>
 
             <form
-              onSubmit={(e) => {
+              onSubmit={async (e) => {
                 e.preventDefault();
-                updateRetailerCreditLimit(editingCreditRetailer.id, newCreditLimitVal);
-                setEditingCreditRetailer(null);
-                alert(`Approved credit limit for ${editingCreditRetailer.name} updated to ₹${newCreditLimitVal.toLocaleString('en-IN')}.`);
+                await updatePartyCreditLimit(editingCreditParty.partyKind, editingCreditParty.id, newCreditLimitVal, {
+                  linkedUserId: editingCreditParty.linkedUserId,
+                  linkedDistributorId: editingCreditParty.linkedDistributorId,
+                });
+                const updatedName = editingCreditParty.name;
+                setEditingCreditParty(null);
+                showBillingBanner('success', `Approved credit limit for ${updatedName} updated to ₹${newCreditLimitVal.toLocaleString('en-IN')} in Firestore.`);
               }}
               className="space-y-3 text-xs"
             >
@@ -2516,7 +2951,7 @@ export const BillingInvoicing: React.FC = () => {
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
                 <button
                   type="button"
-                  onClick={() => setEditingCreditRetailer(null)}
+                  onClick={() => setEditingCreditParty(null)}
                   className="px-3 py-1.5 bg-slate-800 text-slate-300 rounded-lg"
                 >
                   Cancel
@@ -2639,17 +3074,17 @@ export const BillingInvoicing: React.FC = () => {
                 {/* Outlet Info */}
                 <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
                   <div className="font-bold text-indigo-400 text-xs uppercase tracking-wider flex items-center gap-1.5">
-                    <Building size={14} /> Retailer Outlet Details
+                    <Building size={14} /> Party / Outlet Details
                   </div>
                   <div>
                     <div className="text-sm font-bold text-white">{inv.retailer_name}</div>
-                    <div className="text-slate-400 mt-0.5">{retailerObj?.address || 'Main Commercial Market, Beat Route'}</div>
-                    <div className="text-slate-400 mt-0.5">Contact: <span className="text-slate-200 font-medium">{retailerObj?.contact_person || 'Store Manager'} ({retailerObj?.phone || '+91 98100 00000'})</span></div>
+                    <div className="text-slate-400 mt-0.5">{retailerObj?.address || linkedOrder?.beat_name || 'Address on file'}</div>
+                    <div className="text-slate-400 mt-0.5">Contact: <span className="text-slate-200 font-medium">{retailerObj?.contact_person || inv.retailer_name} {retailerObj?.phone ? `(${retailerObj.phone})` : ''}</span></div>
                   </div>
                   <div className="pt-2 border-t border-slate-900 grid grid-cols-2 gap-2 font-mono text-[11px]">
                     <div>
                       <span className="text-slate-500 block text-[9px] uppercase">GSTIN / URP</span>
-                      <span className="font-bold text-slate-200">{retailerObj?.gstin || (inv.invoice_type === 'REGISTERED_GST' ? '27AABCS1429P1Z8' : 'URP (Unregistered)')}</span>
+                      <span className="font-bold text-slate-200">{retailerObj?.gstin || (inv.invoice_type === 'REGISTERED_GST' ? 'Pending GSTIN' : 'URP (Unregistered)')}</span>
                     </div>
                     <div>
                       <span className="text-slate-500 block text-[9px] uppercase">E-Way Bill #</span>
@@ -2946,7 +3381,7 @@ export const BillingInvoicing: React.FC = () => {
               <button
                 onClick={() => {
                   navigator.clipboard.writeText(generateZohoInvoicesJsonPayload(zohoTargetInvoice));
-                  alert('Zoho API JSON payload copied to clipboard!');
+                  showBillingBanner('success', 'Zoho API JSON payload copied to clipboard.');
                 }}
                 className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-bold inline-flex items-center gap-1.5"
               >
@@ -2961,6 +3396,118 @@ export const BillingInvoicing: React.FC = () => {
                 Close Viewer
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* OCCASIONAL CREDIT NOTE DISCOUNT MODAL (EXPLICIT ONLY) */}
+      {creditNoteInvoice && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-purple-500/40 rounded-2xl w-full max-w-md p-6 text-slate-200 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div>
+                <span className="text-[10px] font-mono text-purple-400 uppercase font-bold">
+                  Occasional Credit Note Discount
+                </span>
+                <h2 className="text-sm font-bold text-white">
+                  {creditNoteInvoice.invoice_number} — {creditNoteInvoice.retailer_name}
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCreditNoteInvoice(null)}
+                className="text-slate-400 hover:text-white text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const amt = Number(creditNoteAmt);
+                if (!amt || amt <= 0) {
+                  showBillingBanner('error', 'Credit discount amount must be greater than zero.');
+                  return;
+                }
+                const res = issueCreditNoteDiscount({
+                  invoiceId: creditNoteInvoice.id,
+                  discountAmount: amt,
+                  creditNoteNumber: creditNoteNum,
+                  reason: creditNoteReason || 'Occasional Credit Note Discount',
+                  issuedByUserId: currentUser?.id,
+                  issuedByName: currentUser?.name || 'Billing Executive',
+                });
+                if (!res.success) {
+                  showBillingBanner('error', res.error || 'Failed to apply credit note.');
+                  return;
+                }
+                showBillingBanner('success', `Credit Note ${creditNoteNum} (-₹${amt.toLocaleString('en-IN')}) issued and synced to Firestore Party Ledger.`);
+                setCreditNoteInvoice(null);
+              }}
+              className="space-y-3 text-xs"
+            >
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl font-mono text-[11px] space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-slate-400 font-sans">Invoice Total:</span>
+                  <strong>₹{creditNoteInvoice.total_amount.toLocaleString('en-IN')}</strong>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400 font-sans">Paid So Far:</span>
+                  <strong className="text-emerald-400">₹{creditNoteInvoice.paid_amount.toLocaleString('en-IN')}</strong>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 mb-1">Credit Note Number *</label>
+                <input
+                  type="text"
+                  required
+                  value={creditNoteNum}
+                  onChange={(e) => setCreditNoteNum(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-white font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-300 mb-1">Credit Discount Amount (₹) *</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={Math.max(1, creditNoteInvoice.total_amount - creditNoteInvoice.paid_amount)}
+                  required
+                  value={creditNoteAmt}
+                  onChange={(e) => setCreditNoteAmt(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-white font-mono font-bold"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-300 mb-1">Reason for Discount *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Short supply / damaged goods claim"
+                  value={creditNoteReason}
+                  onChange={(e) => setCreditNoteReason(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-white"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setCreditNoteInvoice(null)}
+                  className="px-3 py-1.5 bg-slate-800 text-slate-300 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-bold"
+                >
+                  Issue Credit Note
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

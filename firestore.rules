@@ -66,6 +66,10 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    match /party_ledger/{entryId} {
+      allow read, write: if true;
+    }
+
     match /users/{userId} {
       allow read, write: if true;
     }

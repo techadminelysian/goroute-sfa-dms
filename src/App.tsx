@@ -18,11 +18,11 @@ import { AccessDenied } from './components/common/AccessDenied';
 import { TenantSettingsModal } from './components/settings/TenantSettingsModal';
 import { FirebaseConfigModal } from './components/settings/FirebaseConfigModal';
 import { AuthModal } from './components/auth/AuthModal';
-import { isTenantSettingsAuthorized, isOnboardingAuthorized } from './utils/authClient';
-import { Languages } from 'lucide-react';
+import { isTenantSettingsAuthorized, isOnboardingAuthorized, isMobileOnlyRole, formatRoleDisplayName, getWebPortalBlockedMessage } from './utils/authClient';
+import { Languages, ShieldAlert, Smartphone, LogOut } from 'lucide-react';
 
 export default function App() {
-  const { activeTenant, activeRole, isMobilePreview, isAuthenticated, theme, language, setLanguage, currentUser } = useAppStore();
+  const { activeTenant, activeRole, isMobilePreview, isAuthenticated, theme, language, setLanguage, currentUser, logout } = useAppStore();
 
   const isTenantSettingsAllowed = isTenantSettingsAuthorized(currentUser);
   const isOnboardingAllowed = isOnboardingAuthorized(currentUser);
@@ -33,9 +33,9 @@ export default function App() {
   const [isFirebaseOpen, setIsFirebaseOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
 
-  // Enforce English language for web view users (all roles except Commission Agent & Dispatcher)
+  // Enforce English language for web portal users
   useEffect(() => {
-    if (activeRole !== 'COMMISSION_AGENT' && activeRole !== 'DISPATCHER' && language !== 'en') {
+    if (!isMobileOnlyRole(activeRole) && language !== 'en') {
       setLanguage('en');
     }
   }, [activeRole, language, setLanguage]);
@@ -56,17 +56,61 @@ export default function App() {
     );
   }
 
-  // Define module role permissions
+  // Strict RBAC Web Portal Gate: Block all Mobile-Only roles from accessing the Web Portal
+  if (isMobileOnlyRole(activeRole)) {
+    return (
+      <div
+        className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-6 font-sans"
+        data-theme={theme}
+      >
+        <div className="max-w-md w-full bg-slate-900 border border-rose-500/40 rounded-2xl p-6 text-center space-y-4 shadow-2xl">
+          <div className="w-16 h-16 rounded-2xl bg-rose-950/70 border border-rose-700/60 text-rose-400 flex items-center justify-center mx-auto">
+            <ShieldAlert size={32} />
+          </div>
+          <div className="space-y-1">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-rose-400">
+              Web Portal Access Blocked
+            </p>
+            <h1 className="text-xl font-bold text-white">
+              Mobile Application Required
+            </h1>
+          </div>
+          <p className="text-xs text-slate-300 leading-relaxed">
+            {getWebPortalBlockedMessage(activeRole)}
+          </p>
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs flex items-center justify-between">
+            <span className="text-slate-400">Account Role:</span>
+            <span className="font-semibold text-amber-300 flex items-center gap-1.5">
+              <Smartphone size={13} />
+              {formatRoleDisplayName(activeRole)}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              logout();
+              setIsAuthOpen(true);
+            }}
+            className="w-full py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+          >
+            <LogOut size={14} />
+            <span>Sign Out & Return to Web Login</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Define module role permissions (strictly Web Portal roles)
   const moduleRoleRules: Record<string, string[]> = {
-    home: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER', 'DISPATCHER', 'ACCOUNTANT', 'DISTRIBUTOR', 'SALES_EXECUTIVE', 'COMMISSION_AGENT', 'DELIVERY_VAN_EXECUTIVE'],
-    orders: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER', 'COMMISSION_AGENT'],
-    inventory: ['ADMIN', 'SUB_ADMIN', 'DISPATCHER'],
+    home: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER', 'ACCOUNTANT'],
+    orders: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER'],
+    inventory: ['ADMIN', 'SUB_ADMIN'],
     billing: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ACCOUNTANT'],
     credit: ['ADMIN', 'SUB_ADMIN', 'ACCOUNTANT'],
     claims: ['ADMIN', 'SUB_ADMIN'],
     reports: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ACCOUNTANT'],
-    setup: ['ADMIN', 'SUB_ADMIN'],
-    my_retailers: ['ADMIN', 'SUB_ADMIN', 'COMMISSION_AGENT', 'ORDER_PUNCHER']
+    setup: ['ADMIN', 'SUB_ADMIN']
   };
 
   const isModuleAllowed = (mod: string): boolean => {
@@ -100,8 +144,24 @@ export default function App() {
           <div className="mb-3 w-full max-w-md flex items-center justify-between gap-2 px-1">
             <span className="text-xs font-semibold text-blue-400 bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20">
               {language === 'hi'
-                ? `मोबाइल टर्मिनल (${activeRole === 'DISPATCHER' ? 'डिपो डिस्पैचर' : 'कमीशन एजेंट'})`
-                : `Mobile Terminal (${activeRole === 'DISPATCHER' ? 'Depot Dispatcher' : 'Commission Agent'})`}
+                ? `मोबाइल टर्मिनल (${
+                    activeRole === 'DISPATCHER'
+                      ? 'डिपो डिस्पैचर'
+                      : activeRole === 'SALES_EXECUTIVE'
+                      ? 'सेल्स एग्जीक्यूटिव'
+                      : activeRole === 'DISTRIBUTOR'
+                      ? 'वितरक (Distributor)'
+                      : 'कमीशन एजेंट'
+                  })`
+                : `Mobile Terminal (${
+                    activeRole === 'DISPATCHER'
+                      ? 'Depot Dispatcher'
+                      : activeRole === 'SALES_EXECUTIVE'
+                      ? 'Sales Executive'
+                      : activeRole === 'DISTRIBUTOR'
+                      ? 'Distributor Portal'
+                      : 'Commission Agent'
+                  })`}
             </span>
 
             {/* Direct Language Switcher in Mobile Mode Top Banner */}
@@ -181,7 +241,7 @@ export default function App() {
 
                   {activeModule === 'reports' && <ReportingLayer />}
 
-                  {(activeModule === 'setup' || activeModule === 'my_retailers') && (
+                  {activeModule === 'setup' && (
                     <SetupView
                       onOpenOnboarding={() => {
                         if (isOnboardingAllowed) setIsOnboardingOpen(true);

@@ -172,7 +172,7 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({ onComplete }
           name: dp.name,
           code: dp.code || `DP-0${idx + 1}`,
           address: dp.address || 'Central Depot Premises',
-          supervisor_name: dp.supervisor_name || 'Supervisor',
+          supervisor_name: dp.supervisor_name?.trim() || 'No Supervisor',
           phone: '+91 98111 00000',
         });
       }

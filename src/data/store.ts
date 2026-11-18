@@ -16,6 +16,8 @@ import {
   Payment,
   PaymentAllocation,
   PaymentMode,
+  PartyLedgerEntry,
+  PartyLedgerEntryType,
   User,
   UserRole,
   PrinciplePurchaseOrder,
@@ -34,12 +36,24 @@ import {
   COLLECTIONS,
   saveRecordToFirestore,
   deleteRecordFromFirestore,
+  deleteUserFromFirestore,
   seedInitialFirestoreData,
   fetchAllFromFirestore,
   checkDatabaseNeedsSeeding,
   subscribeToAllCollections,
-  findFirestoreUserByMobile
+  findFirestoreUserByMobile,
+  fetchCreditGateCollectionsFromFirestore
 } from '../firebase/firestoreService';
+import {
+  CreditPartyKind,
+  PartyCreditRecord,
+  buildPartyCreditRecords,
+  calculatePartyLiveOutstanding,
+  resolveOrderCreditExposure
+} from '../utils/creditLedger';
+import { isFieldScopedRole } from '../utils/caRoutingLogic';
+import { getDepotAvailableStockMap, buildSplitOrdersForDepotAndPO } from '../utils/stockAvailability';
+import { splitOrderByDispatchPoint, syncDispatchPointsForUsers } from '../utils/dispatchRouting';
 import {
   sanitizeMobileNumber,
   isValidMobileNumber,
@@ -51,7 +65,10 @@ import {
   checkClientRateLimit,
   recordClientFailedAttempt,
   clearClientRateLimit,
-  hashClientPassword
+  hashClientPassword,
+  isMobileOnlyRole,
+  getPlatformForRole,
+  getWebPortalBlockedMessage
 } from '../utils/authClient';
 
 const LOCAL_STORAGE_KEY = 'decode_fmcg_v1_store';
@@ -73,6 +90,7 @@ interface StoreData {
   invoices: Invoice[];
   claims: Claim[];
   payments: Payment[];
+  partyLedger: PartyLedgerEntry[];
   users: User[];
   activeTenantId: string;
   activeRole: UserRole;
@@ -134,19 +152,27 @@ const loadStore = (): StoreData => {
         resolvedRole = 'COMMISSION_AGENT';
       }
 
+      // Enforce Web Portal RBAC: never hydrate a cached web session for mobile-only roles
+      if (isMobileOnlyRole(resolvedRole)) {
+        resolvedUserId = null;
+        resolvedToken = null;
+        resolvedRole = 'ADMIN';
+        clearSession();
+      }
+
       mergedUsers = mergedUsers.map((u) => {
         const isAgent = (u.role as any) === 'AGENT' || u.role === 'COMMISSION_AGENT';
-        if (isAgent) {
-          return {
-            ...u,
-            role: 'COMMISSION_AGENT' as UserRole,
-            dispatch_point_id: null
-          };
-        }
-        return u;
+        const normalizedRole = isAgent ? ('COMMISSION_AGENT' as UserRole) : u.role;
+        return {
+          ...u,
+          role: normalizedRole,
+          platform: getPlatformForRole(normalizedRole),
+          dispatch_point_id: isAgent ? null : u.dispatch_point_id,
+        };
       });
 
-      const loadedDps: DispatchPoint[] = Array.isArray(parsed.dispatchPoints) ? parsed.dispatchPoints : [];
+      const rawLoadedDps: DispatchPoint[] = Array.isArray(parsed.dispatchPoints) ? parsed.dispatchPoints : [];
+      const loadedDps: DispatchPoint[] = syncDispatchPointsForUsers(rawLoadedDps, mergedUsers).updatedDispatchPoints;
       const loadedCompanies: Company[] = Array.isArray(parsed.companies) ? parsed.companies : [];
 
       const normalizedCompanies: Company[] = loadedCompanies.map((c) => {
@@ -206,6 +232,7 @@ const loadStore = (): StoreData => {
               amount: Number(p.amount) || 0,
             }))
           : [],
+        partyLedger: Array.isArray(parsed.partyLedger) ? parsed.partyLedger : [],
         users: mergedUsers,
         activeTenantId: resolvedTenantId || 'tenant_ms_enterprises',
         activeRole: resolvedRole || 'ADMIN',
@@ -225,9 +252,13 @@ const loadStore = (): StoreData => {
   }
 
   const savedSession = getSavedSession();
-  const initUserId = savedSession?.user?.id || null;
-  const initToken = savedSession?.token || null;
-  const initRole = savedSession?.user?.role || 'ADMIN';
+  const isBlockedSession = savedSession?.user ? isMobileOnlyRole(savedSession.user.role) : false;
+  if (isBlockedSession) {
+    clearSession();
+  }
+  const initUserId = !isBlockedSession ? (savedSession?.user?.id || null) : null;
+  const initToken = !isBlockedSession ? (savedSession?.token || null) : null;
+  const initRole = !isBlockedSession ? (savedSession?.user?.role || 'ADMIN') : 'ADMIN';
   const initTenantId = savedSession?.user?.tenant_id || 'tenant_ms_enterprises';
 
   return {
@@ -247,6 +278,7 @@ const loadStore = (): StoreData => {
     invoices: [],
     claims: [],
     payments: [],
+    partyLedger: [],
     users: [],
     activeTenantId: initTenantId,
     activeRole: initRole,
@@ -348,14 +380,52 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
         if (Array.isArray(fetchResult.data.payments)) {
           memoryStore.payments = fetchResult.data.payments;
         }
+        if (Array.isArray(fetchResult.data.partyLedger)) {
+          memoryStore.partyLedger = fetchResult.data.partyLedger;
+        }
         if (Array.isArray(fetchResult.data.users) && fetchResult.data.users.length > 0) {
           memoryStore.users = fetchResult.data.users;
+        }
+        if (memoryStore.dispatchPoints.length > 0) {
+          const dpSync = syncDispatchPointsForUsers(memoryStore.dispatchPoints, memoryStore.users);
+          memoryStore.dispatchPoints = dpSync.updatedDispatchPoints;
         }
 
         memoryStore.firebaseStatus = 'CONNECTED';
         memoryStore.firebaseErrorMessage = null;
         memoryStore.lastSyncedAt = new Date().toISOString();
         persist();
+
+        // Seamlessly upgrade any pre-existing local session token (e.g. sess_local_*) to a signed server token
+        if (memoryStore.currentUserId && (!memoryStore.authToken || !memoryStore.authToken.startsWith('sess_v1.'))) {
+          const restoredUser = memoryStore.users.find(
+            (u) => u.id === memoryStore.currentUserId || u.firestore_doc_id === memoryStore.currentUserId
+          );
+          if (restoredUser && !isMobileOnlyRole(restoredUser.role)) {
+            fetch('/api/auth/sync-session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-client-platform': 'WEB' },
+              body: JSON.stringify({ user: restoredUser, client_platform: 'WEB' })
+            })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((syncData) => {
+                if (syncData?.success && syncData?.token) {
+                  memoryStore.authToken = syncData.token;
+                  const savedSess = getSavedSession();
+                  saveSession(
+                    {
+                      token: syncData.token,
+                      user: syncData.user || restoredUser,
+                      expires_at: syncData.expires_at || savedSess?.expires_at || new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+                    },
+                    true
+                  );
+                  persist();
+                }
+              })
+              .catch(() => {});
+          }
+        }
       }
 
       // Check if Firestore needs initial seeding
@@ -378,6 +448,13 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
       }
       if (liveData.companies && liveData.companies.length > 0) {
         memoryStore.companies = liveData.companies;
+        changed = true;
+      }
+      if (liveData.dispatchPoints && liveData.dispatchPoints.length > 0) {
+        memoryStore.dispatchPoints = syncDispatchPointsForUsers(
+          liveData.dispatchPoints,
+          memoryStore.users
+        ).updatedDispatchPoints;
         changed = true;
       }
       if (liveData.skus && liveData.skus.length > 0) {
@@ -416,8 +493,18 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
         memoryStore.payments = liveData.payments;
         changed = true;
       }
+      if (liveData.partyLedger && liveData.partyLedger.length > 0) {
+        memoryStore.partyLedger = liveData.partyLedger;
+        changed = true;
+      }
       if (liveData.users && liveData.users.length > 0) {
         memoryStore.users = liveData.users;
+        if (memoryStore.dispatchPoints.length > 0) {
+          memoryStore.dispatchPoints = syncDispatchPointsForUsers(
+            memoryStore.dispatchPoints,
+            liveData.users
+          ).updatedDispatchPoints;
+        }
         changed = true;
       }
         if (changed) {
@@ -442,79 +529,362 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
 // Trigger async initialization
 initFirestoreIntegration();
 
-// Unified calculation for retailer current outstanding balance across all transactions
+// Unified calculation for retailer/party current outstanding balance across all non-cancelled orders & verified payments
 export const calculateRetailerOutstanding = (
   retailer: Retailer,
   allOrders: Order[] = [],
   allInvoices: Invoice[] = [],
   allPayments: Payment[] = []
 ): number => {
-  const retId = retailer.id;
-  const retName = (retailer.name || '').trim().toLowerCase();
-
-  // 1. All invoices belonging to this retailer (matched by ID or raw name)
-  const retInvoices = allInvoices.filter(
-    (inv) =>
-      inv.retailer_id === retId ||
-      (inv.retailer_name && inv.retailer_name.trim().toLowerCase() === retName)
-  );
-
-  // Unpaid balance on all generated invoices
-  const unpaidInvoicesBalance = retInvoices.reduce((sum, inv) => {
-    const total = inv.total_amount || 0;
-    const paid = inv.paid_amount || 0;
-    return sum + Math.max(0, total - paid);
-  }, 0);
-
-  // 2. All delivered orders that have NOT yet been converted into an invoice
-  const retDeliveredUninvoicedOrders = allOrders.filter(
-    (o) =>
-      (o.retailer_id === retId ||
-        (o.retailer_name_raw && o.retailer_name_raw.trim().toLowerCase() === retName)) &&
-      o.status === 'DELIVERED' &&
-      !retInvoices.some((inv) => inv.order_id === o.id)
-  );
-
-  const deliveredUninvoicedAmount = retDeliveredUninvoicedOrders.reduce(
-    (sum, o) => sum + (o.total_amount || 0),
-    0
-  );
-
-  // 3. Any verified payments for this retailer
-  const retVerifiedPayments = allPayments.filter(
-    (p) =>
-      (p.retailer_id === retId ||
-        (p.retailer_name && p.retailer_name.trim().toLowerCase() === retName)) &&
-      p.status === 'VERIFIED'
-  );
-
-  const totalVerifiedPayments = retVerifiedPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
-  const totalInvoicePaidAmounts = retInvoices.reduce((sum, inv) => sum + (inv.paid_amount || 0), 0);
-
-  // Extra verified payments beyond invoice paid_amount deductions
-  const unallocatedVerifiedPayments = Math.max(0, totalVerifiedPayments - totalInvoicePaidAmounts);
-
-  // Computed from active transactions
-  const transactionBalance = Math.max(
-    0,
-    unpaidInvoicesBalance + deliveredUninvoicedAmount - unallocatedVerifiedPayments
-  );
-
-  // If there are transactional records (invoices, delivered orders, or verified payments),
-  // this computed balance is the live source of truth.
-  if (retInvoices.length > 0 || retDeliveredUninvoicedOrders.length > 0 || retVerifiedPayments.length > 0) {
-    return transactionBalance;
-  }
-
-  // Fallback to retailer's stored current_outstanding if no transaction records exist yet
-  return Math.max(0, retailer.current_outstanding || 0);
+  return calculatePartyLiveOutstanding({
+    matchIds: [retailer.id],
+    matchNames: [retailer.name],
+    fallbackOutstanding: retailer.current_outstanding,
+    orders: allOrders,
+    invoices: allInvoices,
+    payments: allPayments,
+  });
 };
 
-export const useAppStore = () => {
-  useSyncExternalStore(subscribeToStore, getStoreSnapshot);
+// Recalculates live party credit metrics, updates Retailer/Distributor/User docs in memory & Firestore,
+// and optionally appends a chronological PartyLedgerEntry to Cloud Firestore `party_ledger`.
+const syncPartyCreditAndWriteLedger = (params: {
+  tenantId: string;
+  partyId?: string | null;
+  partyName?: string | null;
+  entryType?: PartyLedgerEntryType;
+  order?: Order | null;
+  invoice?: Invoice | null;
+  payment?: Payment | null;
+  debitAmount?: number;
+  creditAmount?: number;
+  isCreditNoteDiscount?: boolean;
+  creditNoteNumber?: string | null;
+  notes?: string;
+  actorUserId?: string | null;
+  actorName?: string | null;
+}): PartyCreditRecord | null => {
+  const defaultLimit =
+    memoryStore.tenantSettings?.[params.tenantId]?.credit_limit_default ?? 50000;
+
+  const tenantRetailers = (memoryStore.retailers || []).filter(
+    (r) => r.tenant_id === params.tenantId
+  );
+  const tenantDistributors = (memoryStore.distributors || []).filter(
+    (d) => d.tenant_id === params.tenantId
+  );
+  const tenantUsers = (memoryStore.users || []).filter(
+    (u) => u.tenant_id === params.tenantId
+  );
+  const tenantOrders = (memoryStore.orders || []).filter(
+    (o) => o.tenant_id === params.tenantId
+  );
+  const tenantInvoices = (memoryStore.invoices || []).filter(
+    (i) => i.tenant_id === params.tenantId
+  );
+  const tenantPayments = (memoryStore.payments || []).filter(
+    (p) => p.tenant_id === params.tenantId
+  );
+
+  const partyRecords = buildPartyCreditRecords({
+    retailers: tenantRetailers,
+    distributors: tenantDistributors,
+    users: tenantUsers,
+    orders: tenantOrders,
+    invoices: tenantInvoices,
+    payments: tenantPayments,
+    defaultCreditLimit: defaultLimit,
+  });
+
+  const targetId = params.partyId || params.order?.retailer_id || params.invoice?.retailer_id || params.payment?.retailer_id;
+  const targetNormName = (
+    params.partyName ||
+    params.order?.retailer_name_raw ||
+    params.invoice?.retailer_name ||
+    params.payment?.retailer_name ||
+    ''
+  )
+    .trim()
+    .toLowerCase();
+
+  let matchedParty =
+    (targetId ? partyRecords.find((p) => p.matchIds.includes(targetId)) : undefined) ||
+    (targetNormName
+      ? partyRecords.find((p) =>
+          p.matchNames.some((n) => n.trim().toLowerCase() === targetNormName)
+        )
+      : undefined);
+
+  if (
+    !matchedParty &&
+    params.order?.created_by_user_id &&
+    (params.order.channel === 'DISTRIBUTOR' || params.order.order_source_role === 'DISTRIBUTOR')
+  ) {
+    matchedParty = partyRecords.find((p) =>
+      p.matchIds.includes(params.order!.created_by_user_id)
+    );
+  }
+
+  if (!matchedParty) return null;
+
+  // Sync computed totals onto matching Retailer / Distributor / User documents in store & Cloud Firestore
+  const matchIdSet = new Set(matchedParty.matchIds);
+
+  memoryStore.retailers = (memoryStore.retailers || []).map((r) => {
+    if (r.tenant_id === params.tenantId && matchIdSet.has(r.id)) {
+      const updatedRet: Retailer = {
+        ...r,
+        current_outstanding: matchedParty!.total_liability,
+        utilized_credit: matchedParty!.utilized_credit,
+        available_credit: matchedParty!.available_credit,
+        remaining_credit: matchedParty!.remaining_credit,
+        fund_shortage: matchedParty!.fund_shortage,
+      };
+      if (isFirebaseConfigured()) {
+        saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updatedRet);
+      }
+      return updatedRet;
+    }
+    return r;
+  });
+
+  memoryStore.distributors = (memoryStore.distributors || []).map((d) => {
+    if (d.tenant_id === params.tenantId && matchIdSet.has(d.id)) {
+      const updatedDist: DistributorInstitution = {
+        ...d,
+        current_outstanding: matchedParty!.total_liability,
+        utilized_credit: matchedParty!.utilized_credit,
+        available_credit: matchedParty!.available_credit,
+        remaining_credit: matchedParty!.remaining_credit,
+        fund_shortage: matchedParty!.fund_shortage,
+        updated_at: new Date().toISOString(),
+      };
+      if (isFirebaseConfigured()) {
+        saveRecordToFirestore(COLLECTIONS.DISTRIBUTORS, d.id, updatedDist);
+      }
+      return updatedDist;
+    }
+    return d;
+  });
+
+  memoryStore.users = (memoryStore.users || []).map((u) => {
+    if (u.tenant_id === params.tenantId && matchIdSet.has(u.id)) {
+      const updatedUser: User = {
+        ...u,
+        current_outstanding: matchedParty!.total_liability,
+        utilized_credit: matchedParty!.utilized_credit,
+        available_credit: matchedParty!.available_credit,
+        remaining_credit: matchedParty!.remaining_credit,
+        fund_shortage: matchedParty!.fund_shortage,
+      };
+      if (isFirebaseConfigured()) {
+        saveRecordToFirestore(
+          COLLECTIONS.USERS,
+          updatedUser.firestore_doc_id || updatedUser.id,
+          updatedUser
+        );
+      }
+      return updatedUser;
+    }
+    return u;
+  });
+
+  // Append chronological audit entry to party_ledger when an explicit event occurred
+  const debit = Math.max(0, Number(params.debitAmount) || 0);
+  const credit = Math.max(0, Number(params.creditAmount) || 0);
+  if (
+    params.entryType &&
+    (debit > 0 || credit > 0 || params.entryType === 'ORDER_CANCELLATION_REVERSAL')
+  ) {
+    const ledgerEntry: PartyLedgerEntry = {
+      id: `pl_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      tenant_id: params.tenantId,
+      party_id: matchedParty.id,
+      party_kind: matchedParty.partyKind,
+      party_name: matchedParty.name,
+      entry_type: params.entryType,
+      order_id: params.order?.id || null,
+      order_number: params.order?.order_number || null,
+      invoice_id: params.invoice?.id || null,
+      invoice_number: params.invoice?.invoice_number || null,
+      payment_id: params.payment?.id || null,
+      debit_amount: Math.round(debit * 100) / 100,
+      credit_amount: Math.round(credit * 100) / 100,
+      balance_after: matchedParty.total_liability,
+      credit_limit_snapshot: matchedParty.credit_limit,
+      remaining_credit_after: matchedParty.remaining_credit,
+      fund_shortage_after: matchedParty.fund_shortage,
+      is_credit_note_discount: Boolean(params.isCreditNoteDiscount),
+      credit_note_number: params.isCreditNoteDiscount ? params.creditNoteNumber || null : null,
+      notes: params.notes || '',
+      created_by_user_id: params.actorUserId || null,
+      created_by_name: params.actorName || null,
+      created_at: new Date().toISOString(),
+    };
+    memoryStore.partyLedger = [ledgerEntry, ...(memoryStore.partyLedger || [])];
+    if (isFirebaseConfigured()) {
+      saveRecordToFirestore(COLLECTIONS.PARTY_LEDGER, ledgerEntry.id, ledgerEntry);
+    }
+  }
+
+  return matchedParty;
+};
+
+// Module-level Fast-Track Confirmation from Existing Depot Stock (safe to invoke from hook & split fallback)
+const confirmOrdersFromDepotStockAction = (
+  orderIds: string[],
+  confirmedByName: string = 'Order Puncher'
+): { success: boolean; confirmedCount: number; message: string } => {
+  const targetOrders = memoryStore.orders.filter(
+    (o) => orderIds.includes(o.id) && (o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING')
+  );
+  if (targetOrders.length === 0) {
+    return { success: false, confirmedCount: 0, message: 'No eligible VERIFIED orders selected.' };
+  }
+
+  // Live Depot Stock Validation per depot
+  const remainingByDepot: Record<string, Record<string, number>> = {};
+  const validOrders: Order[] = [];
+  const rejectedReasons: string[] = [];
+
+  for (const ord of targetOrders) {
+    const dpId = ord.dispatch_point_id || 'dp_sahibabad';
+    if (!remainingByDepot[dpId]) {
+      const stockMap = getDepotAvailableStockMap(dpId, memoryStore.stockLedger, memoryStore.orders);
+      const rem: Record<string, number> = {};
+      for (const [skuId, info] of Object.entries(stockMap)) {
+        rem[skuId] = info.availableForConfirmation;
+      }
+      remainingByDepot[dpId] = rem;
+    }
+    const rem = remainingByDepot[dpId];
+    let canFulfillAll = true;
+    for (const line of ord.lines || []) {
+      const reqQty = line.verified_quantity != null ? Number(line.verified_quantity) : Number(line.quantity) || 0;
+      const avail = rem[line.sku_id] || 0;
+      if (reqQty > avail) {
+        canFulfillAll = false;
+        rejectedReasons.push(`${ord.order_number} (${line.sku_name}: need ${reqQty}, avail ${avail})`);
+        break;
+      }
+    }
+    if (canFulfillAll) {
+      for (const line of ord.lines || []) {
+        const reqQty = line.verified_quantity != null ? Number(line.verified_quantity) : Number(line.quantity) || 0;
+        rem[line.sku_id] = Math.max(0, (rem[line.sku_id] || 0) - reqQty);
+      }
+      validOrders.push(ord);
+    }
+  }
+
+  if (validOrders.length === 0) {
+    return {
+      success: false,
+      confirmedCount: 0,
+      message: `Insufficient live depot stock: ${rejectedReasons.join('; ')}`,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const validSet = new Set(validOrders.map((o) => o.id));
+  const updatedOrders: Order[] = [];
+
+  memoryStore.orders = memoryStore.orders.map((o) => {
+    if (validSet.has(o.id)) {
+      const next: Order = {
+        ...o,
+        status: 'CONFIRMED',
+        fulfillment_source: 'DEPOT_STOCK',
+        is_locked: true,
+        notes: `${o.notes ? `${o.notes} | ` : ''}Fast-track confirmed from Depot Stock by ${confirmedByName} on ${now.split('T')[0]}`,
+      };
+      updatedOrders.push(next);
+      return next;
+    }
+    return o;
+  });
+
+  const notifs: WorkflowNotification[] = updatedOrders.map((ord, idx) => ({
+    id: `notif_depot_stk_${Date.now()}_${idx}`,
+    timestamp: now,
+    created_at: now,
+    tenant_id: ord.tenant_id,
+    title: `Order #${ord.order_number} Confirmed from Depot Stock`,
+    message: `Order #${ord.order_number} (${ord.retailer_name_raw}) fast-track confirmed from existing Depot Stock. Auto-queued for Dispatch & Invoicing.`,
+    type: 'ORDER_CONFIRMED_DEPOT_STOCK',
+    target_roles: ['BILLING', 'DISPATCHER', 'COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR', 'ADMIN'],
+    target_user_id: ord.created_by_user_id || ord.commission_agent_id || undefined,
+    related_entity_id: ord.id,
+    related_entity_type: 'ORDER',
+    order_id: ord.id,
+    order_number: ord.order_number,
+    retailer_name: ord.retailer_name_raw,
+    is_read: false,
+  }));
+
+  memoryStore.workflowNotifications = [...notifs, ...(memoryStore.workflowNotifications || [])];
+  persist();
+
+  if (typeof window !== 'undefined') {
+    updatedOrders.forEach((ord) => {
+      fetch(`/api/orders/${ord.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: 'CONFIRMED',
+          fulfillment_source: 'DEPOT_STOCK',
+          is_locked: true,
+          notes: ord.notes,
+        }),
+      }).catch((err) => console.warn('[DB SYNC] Failed to confirm depot stock order on server:', err));
+
+      if (isFirebaseConfigured()) {
+        saveRecordToFirestore(COLLECTIONS.ORDERS, ord.id, ord);
+      }
+    });
+  }
+
+  return {
+    success: true,
+    confirmedCount: updatedOrders.length,
+    message: rejectedReasons.length > 0
+      ? `Confirmed ${updatedOrders.length} order(s) from Depot Stock. Skipped shortage order(s): ${rejectedReasons.join('; ')}`
+      : `Confirmed ${updatedOrders.length} order(s) directly from Depot Stock.`,
+  };
+};
+
+interface CachedTenantView {
+  cacheKey: string;
+  allTenants: Tenant[];
+  activeTenant: Tenant;
+  activeTenantSettings: TenantSettings;
+  tenantCompanies: Company[];
+  tenantDispatchPoints: DispatchPoint[];
+  tenantSkus: SKU[];
+  tenantBeats: (Beat & { retailer_count: number })[];
+  tenantRetailers: Retailer[];
+  tenantDistributors: DistributorInstitution[];
+  tenantOrders: Order[];
+  tenantPurchaseOrders: PrinciplePurchaseOrder[];
+  tenantWorkflowNotifications: WorkflowNotification[];
+  tenantStockLedger: StockLedgerEntry[];
+  tenantReturnableAssetLedger: ReturnableAssetLedgerEntry[];
+  tenantInvoices: Invoice[];
+  tenantClaims: Claim[];
+  tenantPayments: Payment[];
+  tenantPartyLedger: PartyLedgerEntry[];
+  tenantUsers: User[];
+}
+
+let cachedTenantView: CachedTenantView | null = null;
+
+function getMemoizedTenantView(activeTenantId: string): CachedTenantView {
+  const cacheKey = `${storeVersion}::${activeTenantId}`;
+  if (cachedTenantView && cachedTenantView.cacheKey === cacheKey) {
+    return cachedTenantView;
+  }
 
   const allTenants = Array.isArray(memoryStore.tenants) && memoryStore.tenants.length > 0 ? memoryStore.tenants : [];
-  const activeTenantId = memoryStore.activeTenantId || (allTenants[0]?.id || 'tenant_ms_enterprises');
   const defaultFallbackTenant: Tenant = {
     id: activeTenantId,
     name: 'Decode Enterprises',
@@ -539,7 +909,6 @@ export const useAppStore = () => {
     require_stock_gate: true,
   };
 
-  // Helper functions strictly scoped to active tenant
   const tenantCompanies = (memoryStore.companies || []).filter((c) => c.tenant_id === activeTenantId);
   const tenantDispatchPoints = (memoryStore.dispatchPoints || []).filter((dp) => dp.tenant_id === activeTenantId);
   const tenantSkus = (memoryStore.skus || []).filter((s) => s.tenant_id === activeTenantId);
@@ -554,27 +923,56 @@ export const useAppStore = () => {
   const tenantInvoices = (memoryStore.invoices || []).filter((inv) => inv.tenant_id === activeTenantId);
   const tenantClaims = (memoryStore.claims || []).filter((c) => c.tenant_id === activeTenantId);
   const tenantPayments = (memoryStore.payments || []).filter((p) => p.tenant_id === activeTenantId);
+  const tenantPartyLedger = (memoryStore.partyLedger || []).filter((pl) => pl.tenant_id === activeTenantId);
   const tenantUsers = (memoryStore.users || []).filter((u) => u.tenant_id === activeTenantId);
 
-  // Map tenant retailers with real-time live current_outstanding synchronized across all orders, invoices & payments
+  const defaultCreditLimit = activeTenantSettings.credit_limit_default ?? 50000;
+  const partyRecords = buildPartyCreditRecords({
+    retailers: rawTenantRetailers,
+    distributors: rawTenantDistributors,
+    users: tenantUsers,
+    orders: tenantOrders,
+    invoices: tenantInvoices,
+    payments: tenantPayments,
+    defaultCreditLimit,
+  });
+
   const tenantRetailers = rawTenantRetailers.map((r) => {
-    const liveOutstanding = calculateRetailerOutstanding(r, tenantOrders, tenantInvoices, tenantPayments);
+    const rec = partyRecords.find((p) => p.partyKind === 'RETAILER' && p.id === r.id);
+    const liveOutstanding = rec
+      ? rec.total_liability
+      : calculateRetailerOutstanding(r, tenantOrders, tenantInvoices, tenantPayments);
+    const limit = typeof r.credit_limit === 'number' ? r.credit_limit : defaultCreditLimit;
+    const rem = Math.max(0, limit - liveOutstanding);
+    const shortage = Math.max(0, liveOutstanding - limit);
     return {
       ...r,
       current_outstanding: liveOutstanding,
+      utilized_credit: liveOutstanding,
+      available_credit: rem,
+      remaining_credit: rem,
+      fund_shortage: shortage,
     };
   });
 
-  // Map tenant distributors with real-time live current_outstanding
   const tenantDistributors = rawTenantDistributors.map((d) => {
-    const liveOutstanding = calculateRetailerOutstanding(d as any, tenantOrders, tenantInvoices, tenantPayments);
+    const rec = partyRecords.find((p) => p.partyKind === 'DISTRIBUTOR_INSTITUTION' && p.id === d.id);
+    const liveOutstanding = rec
+      ? rec.total_liability
+      : calculateRetailerOutstanding(d as any, tenantOrders, tenantInvoices, tenantPayments);
+    const limit = typeof d.credit_limit === 'number' ? d.credit_limit : defaultCreditLimit;
+    const rem = Math.max(0, limit - liveOutstanding);
+    const shortage = Math.max(0, liveOutstanding - limit);
     return {
       ...d,
       current_outstanding: liveOutstanding,
+      utilized_credit: liveOutstanding,
+      available_credit: rem,
+      remaining_credit: rem,
+      fund_shortage: shortage,
     };
   });
 
-  // Calculate live retailer counts for beats
   const tenantBeats = rawTenantBeats.map((beat) => {
     const beatRetailers = tenantRetailers.filter((r) => r.beat_id === beat.id || r.beat_name === beat.name);
     return {
@@ -584,20 +982,90 @@ export const useAppStore = () => {
     };
   });
 
-  // Current authenticated user resolution with fallback safety
+  cachedTenantView = {
+    cacheKey,
+    allTenants,
+    activeTenant,
+    activeTenantSettings,
+    tenantCompanies,
+    tenantDispatchPoints,
+    tenantSkus,
+    tenantBeats,
+    tenantRetailers,
+    tenantDistributors,
+    tenantOrders,
+    tenantPurchaseOrders,
+    tenantWorkflowNotifications,
+    tenantStockLedger,
+    tenantReturnableAssetLedger,
+    tenantInvoices,
+    tenantClaims,
+    tenantPayments,
+    tenantPartyLedger,
+    tenantUsers,
+  };
+
+  return cachedTenantView;
+}
+
+export const useAppStore = () => {
+  useSyncExternalStore(subscribeToStore, getStoreSnapshot);
+
+  const allTenantsRaw = Array.isArray(memoryStore.tenants) && memoryStore.tenants.length > 0 ? memoryStore.tenants : [];
+  const activeTenantId = memoryStore.activeTenantId || (allTenantsRaw[0]?.id || 'tenant_ms_enterprises');
+
+  const {
+    allTenants,
+    activeTenant,
+    activeTenantSettings,
+    tenantCompanies,
+    tenantDispatchPoints,
+    tenantSkus,
+    tenantBeats,
+    tenantRetailers,
+    tenantDistributors,
+    tenantOrders,
+    tenantPurchaseOrders,
+    tenantWorkflowNotifications,
+    tenantStockLedger,
+    tenantReturnableAssetLedger,
+    tenantInvoices,
+    tenantClaims,
+    tenantPayments,
+    tenantPartyLedger,
+    tenantUsers,
+  } = getMemoizedTenantView(activeTenantId);
+
+  const isMobileTerminalRole = (role?: UserRole | string): boolean => {
+    return isMobileOnlyRole(role);
+  };
+
+  // Current authenticated user resolution (always prefer live memoryStore.users over stale saved session)
   const currentUser: User | null = (() => {
     if (!memoryStore.currentUserId) return null;
     const allUsers = memoryStore.users || [];
-    const foundById = allUsers.find((u) => u.id === memoryStore.currentUserId);
+    const foundById = allUsers.find(
+      (u) => u.id === memoryStore.currentUserId || u.firestore_doc_id === memoryStore.currentUserId
+    );
     if (foundById) return foundById;
 
     const saved = getSavedSession();
-    if (saved?.user && (saved.user.id === memoryStore.currentUserId || sanitizeMobileNumber(saved.user.mobile_number || '') === sanitizeMobileNumber(memoryStore.currentUserId))) {
-      return saved.user;
+    const targetMobile = sanitizeMobileNumber(saved?.user?.mobile_number || memoryStore.currentUserId || '');
+    if (targetMobile) {
+      const foundByMobile = allUsers.find(
+        (u) => u.mobile_number && sanitizeMobileNumber(u.mobile_number) === targetMobile
+      );
+      if (foundByMobile) return foundByMobile;
     }
 
-    const foundByMobile = allUsers.find((u) => u.mobile_number && sanitizeMobileNumber(u.mobile_number) === sanitizeMobileNumber(memoryStore.currentUserId || ''));
-    if (foundByMobile) return foundByMobile;
+    if (
+      saved?.user &&
+      (saved.user.id === memoryStore.currentUserId ||
+        saved.user.firestore_doc_id === memoryStore.currentUserId ||
+        sanitizeMobileNumber(saved.user.mobile_number || '') === sanitizeMobileNumber(memoryStore.currentUserId))
+    ) {
+      return saved.user;
+    }
 
     return null;
   })();
@@ -615,7 +1083,7 @@ export const useAppStore = () => {
     currentUser,
     isAuthenticated,
     authToken: memoryStore.authToken,
-    isMobilePreview: activeUserRole === 'COMMISSION_AGENT' || activeUserRole === 'DISPATCHER',
+    isMobilePreview: false,
     theme: memoryStore.theme || ('dark' as AppTheme),
     setTheme: (newTheme: AppTheme) => {
       memoryStore.theme = newTheme;
@@ -658,6 +1126,7 @@ export const useAppStore = () => {
     invoices: tenantInvoices,
     claims: tenantClaims,
     payments: tenantPayments,
+    partyLedger: tenantPartyLedger,
     users: tenantUsers,
 
     // Authentication Actions
@@ -676,11 +1145,77 @@ export const useAppStore = () => {
       if (rateCheck.isLocked) {
         return {
           success: false,
-          error: `Too many failed attempts. Account temporarily locked for 15 minutes. Try again in ${rateCheck.remainingSeconds}s.`
+          error: `Too many failed attempts. Account temporarily locked for 30 minutes. Try again in ${rateCheck.remainingSeconds}s.`
         };
       }
 
-      // 1. Direct Firestore Cloud lookup if configured
+      // 1. Primary: Authenticate via backend API (PBKDF2 verification + RBAC + signed session token)
+      let backendReachable = false;
+      try {
+        const resp = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-client-platform': 'WEB' },
+          body: JSON.stringify({ mobile_number: sanitized, password, client_platform: 'WEB' })
+        });
+        backendReachable = true;
+
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 403 || data?.code === 'WEB_PORTAL_ACCESS_DENIED') {
+          return {
+            success: false,
+            error: data?.error || 'Web Portal Access Restricted: This role is restricted strictly to the mobile application.'
+          };
+        }
+
+        if (resp.ok && data.success && data.user) {
+          if (isMobileTerminalRole(data.user.role)) {
+            return { success: false, error: getWebPortalBlockedMessage(data.user.role) };
+          }
+          clearClientRateLimit(sanitized);
+          const currentUsers = memoryStore.users || [];
+          const existingIdx = currentUsers.findIndex(
+            (u) => u.id === data.user.id || (u.mobile_number && sanitizeMobileNumber(u.mobile_number) === sanitized)
+          );
+          if (existingIdx >= 0) {
+            const updatedUsers = [...currentUsers];
+            updatedUsers[existingIdx] = { ...updatedUsers[existingIdx], ...data.user };
+            memoryStore.users = updatedUsers;
+          } else {
+            memoryStore.users = [data.user, ...currentUsers];
+          }
+
+          memoryStore.currentUserId = data.user.id;
+          memoryStore.activeRole = data.user.role;
+          memoryStore.activeTenantId = data.user.tenant_id;
+          memoryStore.authToken = data.token;
+          memoryStore.isMobilePreview = false;
+
+          saveSession({
+            token: data.token,
+            user: data.user,
+            expires_at: data.expires_at || new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+          }, rememberMe);
+
+          persist();
+          return { success: true, user: data.user };
+        }
+
+        // Backend explicitly rejected credentials or rate-limited
+        if (!resp.ok) {
+          return {
+            success: false,
+            error: data?.error || 'Invalid mobile number or password.'
+          };
+        }
+      } catch (_networkErr) {
+        backendReachable = false;
+      }
+
+      if (backendReachable) {
+        return { success: false, error: 'Invalid mobile number or password.' };
+      }
+
+      // 2. Offline Fallback: Direct Firestore / loaded memory store lookup only when backend is unreachable
       let user: User | null = null;
       if (isFirebaseConfigured()) {
         try {
@@ -690,7 +1225,6 @@ export const useAppStore = () => {
         }
       }
 
-      // 2. Fallback to loaded memory store if firestore direct query returned nothing
       if (!user) {
         const allUsers = memoryStore.users || [];
         user = allUsers.find(
@@ -698,62 +1232,11 @@ export const useAppStore = () => {
         ) || null;
       }
 
-      // 3. Fallback to server API if still not found
-      if (!user) {
-        try {
-          const resp = await fetch('/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mobile_number: sanitized, password })
-          });
-
-          if (resp.ok) {
-            const data = await resp.json();
-            if (data.success && data.user) {
-              clearClientRateLimit(sanitized);
-              const currentUsers = memoryStore.users || [];
-              const existingIdx = currentUsers.findIndex(
-                (u) => u.id === data.user.id || (u.mobile_number && sanitizeMobileNumber(u.mobile_number) === sanitized)
-              );
-              if (existingIdx >= 0) {
-                const updatedUsers = [...currentUsers];
-                updatedUsers[existingIdx] = { ...updatedUsers[existingIdx], ...data.user };
-                memoryStore.users = updatedUsers;
-              } else {
-                memoryStore.users = [data.user, ...currentUsers];
-              }
-
-              memoryStore.currentUserId = data.user.id;
-              memoryStore.activeRole = data.user.role;
-              memoryStore.activeTenantId = data.user.tenant_id;
-              memoryStore.authToken = data.token;
-              if (data.user.role === 'DISPATCHER' || data.user.role === 'COMMISSION_AGENT') {
-                memoryStore.isMobilePreview = true;
-              } else {
-                memoryStore.isMobilePreview = false;
-              }
-
-              saveSession({
-                token: data.token,
-                user: data.user,
-                expires_at: data.expires_at || new Date(Date.now() + 24 * 3600 * 1000).toISOString()
-              }, rememberMe);
-
-              persist();
-              return { success: true, user: data.user };
-            }
-          }
-        } catch (networkErr) {
-          // Ignore
-        }
-      }
-
-      // If user is not present in database, do not allow login
       if (!user) {
         const lockRes = recordClientFailedAttempt(sanitized);
         return {
           success: false,
-          error: lockRes.isNowLocked ? 'Account locked for 15 minutes due to 5 failed attempts.' : 'Invalid mobile number or password.'
+          error: lockRes.isNowLocked ? 'Account locked for 30 minutes due to 3 failed attempts.' : 'Invalid mobile number or password.'
         };
       }
 
@@ -772,13 +1255,42 @@ export const useAppStore = () => {
         const lockRes = recordClientFailedAttempt(sanitized);
         return {
           success: false,
-          error: lockRes.isNowLocked ? 'Account locked for 15 minutes due to 5 failed attempts.' : 'Invalid mobile number or password.'
+          error: lockRes.isNowLocked ? 'Account locked for 30 minutes due to 3 failed attempts.' : 'Invalid mobile number or password.'
+        };
+      }
+
+      // Strict Web Portal RBAC check after credential verification
+      if (isMobileTerminalRole(user.role)) {
+        clearClientRateLimit(sanitized);
+        return {
+          success: false,
+          error: getWebPortalBlockedMessage(user.role)
         };
       }
 
       clearClientRateLimit(sanitized);
-      const sessionToken = `sess_local_${Date.now()}_${user.id}`;
-      
+      let sessionToken = `sess_local_${Date.now()}_${user.id}`;
+      let sessionExpiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+      try {
+        const syncResp = await fetch('/api/auth/sync-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-client-platform': 'WEB' },
+          body: JSON.stringify({ user, token: sessionToken, client_platform: 'WEB' })
+        });
+        if (syncResp.ok) {
+          const syncData = await syncResp.json();
+          if (syncData?.token) {
+            sessionToken = syncData.token;
+          }
+          if (syncData?.expires_at) {
+            sessionExpiresAt = syncData.expires_at;
+          }
+        }
+      } catch (err) {
+        console.warn('[AUTH SYNC] Backend session sync notice:', err);
+      }
+
       const allUsers = memoryStore.users || [];
       const existingIdx = allUsers.findIndex((u) => u.id === user!.id);
       if (existingIdx >= 0) {
@@ -793,31 +1305,24 @@ export const useAppStore = () => {
       memoryStore.activeRole = user.role;
       memoryStore.activeTenantId = user.tenant_id;
       memoryStore.authToken = sessionToken;
-      if (user.role === 'DISPATCHER' || user.role === 'COMMISSION_AGENT') {
-        memoryStore.isMobilePreview = true;
-      } else {
-        memoryStore.isMobilePreview = false;
-      }
+      memoryStore.isMobilePreview = false;
 
       saveSession({
         token: sessionToken,
         user,
-        expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+        expires_at: sessionExpiresAt
       }, rememberMe);
-
-      // Synchronize active session with backend server
-      fetch('/api/auth/sync-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user, token: sessionToken })
-      }).catch((err) => console.warn('[AUTH SYNC] Backend session sync notice:', err));
 
       persist();
       return { success: true, user };
     },
 
     adminResetUserPassword: async (targetUserId: string, customPassword?: string): Promise<AdminResetUserPasswordResponse> => {
-      const activeUser = memoryStore.users.find((u) => u.id === memoryStore.currentUserId);
+      const savedSess = getSavedSession();
+      const activeUser =
+        memoryStore.users.find((u) => u.id === memoryStore.currentUserId || u.firestore_doc_id === memoryStore.currentUserId) ||
+        savedSess?.user ||
+        null;
       const isCallerAdmin = memoryStore.activeRole === 'ADMIN' || activeUser?.role === 'ADMIN';
 
       if (!isCallerAdmin) {
@@ -827,7 +1332,7 @@ export const useAppStore = () => {
         };
       }
 
-      const targetUser = memoryStore.users.find((u) => u.id === targetUserId);
+      const targetUser = memoryStore.users.find((u) => u.id === targetUserId || u.firestore_doc_id === targetUserId);
       if (!targetUser) {
         return {
           success: false,
@@ -853,7 +1358,37 @@ export const useAppStore = () => {
       }
 
       try {
-        const token = memoryStore.authToken || getSavedSession()?.token;
+        let token = memoryStore.authToken || savedSess?.token || '';
+
+        // Upgrade legacy/local token (sess_local_*) or missing backend token to a signed sess_v1 token before calling admin API
+        if ((!token || !token.startsWith('sess_v1.')) && activeUser) {
+          try {
+            const syncResp = await fetch('/api/auth/sync-session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-client-platform': 'WEB' },
+              body: JSON.stringify({ user: activeUser, client_platform: 'WEB' })
+            });
+            if (syncResp.ok) {
+              const syncData = await syncResp.json();
+              if (syncData?.success && syncData?.token) {
+                token = syncData.token;
+                memoryStore.authToken = token;
+                saveSession(
+                  {
+                    token,
+                    user: syncData.user || activeUser,
+                    expires_at: syncData.expires_at || savedSess?.expires_at || new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+                  },
+                  true
+                );
+                persist();
+              }
+            }
+          } catch (_syncErr) {
+            // Proceed to reset-password endpoint and report actual error if unreachable
+          }
+        }
+
         const resp = await fetch(`/api/admin/users/${targetUserId}/reset-password`, {
           method: 'POST',
           headers: {
@@ -863,53 +1398,41 @@ export const useAppStore = () => {
           body: JSON.stringify({ new_password: passwordToSet })
         });
 
-        if (resp.ok) {
-          const data = await resp.json();
-          // Update local memory user password
-          const newSalt = `salt_${Date.now()}`;
-          const userIdx = memoryStore.users.findIndex((u) => u.id === targetUserId);
-          if (userIdx !== -1) {
-            memoryStore.users[userIdx].salt = newSalt;
-            memoryStore.users[userIdx].password_hash = hashClientPassword(passwordToSet, newSalt);
-            if (isFirebaseConfigured()) {
-              saveRecordToFirestore(COLLECTIONS.USERS, targetUserId, memoryStore.users[userIdx]);
-            }
-          }
-          persist();
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data.success) {
+          // Server already persisted PBKDF2 password_hash + salt to DB & Firestore; do not overwrite with client hash
           return {
             success: true,
             message: data.message || `Password for ${targetUser.name} has been reset.`,
-            new_password: passwordToSet,
+            new_password: data.new_password || passwordToSet,
             user: targetUser
           };
-        } else {
-          const err = await resp.json().catch(() => ({}));
-          if (err.error) {
-            return { success: false, error: err.error };
+        }
+
+        return {
+          success: false,
+          error: data?.error || `Password reset failed (HTTP ${resp.status}).`
+        };
+      } catch (_networkErr) {
+        // Offline-only fallback when backend server is unreachable
+        const newSalt = `salt_${Date.now()}`;
+        const userIdx = memoryStore.users.findIndex((u) => u.id === targetUserId);
+        if (userIdx !== -1) {
+          memoryStore.users[userIdx].salt = newSalt;
+          memoryStore.users[userIdx].password_hash = hashClientPassword(passwordToSet, newSalt);
+          if (isFirebaseConfigured()) {
+            saveRecordToFirestore(COLLECTIONS.USERS, targetUserId, memoryStore.users[userIdx]);
           }
         }
-      } catch (e) {
-        // Fallback for offline local state
-      }
+        persist();
 
-      // Client local fallback if backend route is unreachable
-      const newSalt = `salt_${Date.now()}`;
-      const userIdx = memoryStore.users.findIndex((u) => u.id === targetUserId);
-      if (userIdx !== -1) {
-        memoryStore.users[userIdx].salt = newSalt;
-        memoryStore.users[userIdx].password_hash = hashClientPassword(passwordToSet, newSalt);
-        if (isFirebaseConfigured()) {
-          saveRecordToFirestore(COLLECTIONS.USERS, targetUserId, memoryStore.users[userIdx]);
-        }
+        return {
+          success: true,
+          message: `Password for ${targetUser.name} (${targetUser.role}) has been reset locally (offline mode).`,
+          new_password: passwordToSet,
+          user: targetUser
+        };
       }
-      persist();
-
-      return {
-        success: true,
-        message: `Password for ${targetUser.name} (${targetUser.role}) has been reset successfully.`,
-        new_password: passwordToSet,
-        user: targetUser
-      };
     },
 
     requestPasswordReset: async (_mobileNumber: string) => {
@@ -1166,17 +1689,52 @@ export const useAppStore = () => {
 
     // Dispatch Point CRUD
     addDispatchPoint: (dp: DispatchPoint) => {
-      memoryStore.dispatchPoints = [dp, ...memoryStore.dispatchPoints];
+      const dpSynced = syncDispatchPointsForUsers([dp], memoryStore.users, [dp.id]).updatedDispatchPoints[0] || dp;
+      memoryStore.dispatchPoints = [dpSynced, ...memoryStore.dispatchPoints];
       persist();
 
+      fetch('/api/dispatch-points', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dpSynced),
+      }).catch((err) => console.warn('[DB SYNC] Failed to create dispatch point in backend DB:', err));
+
       if (isFirebaseConfigured()) {
-        saveRecordToFirestore(COLLECTIONS.DISPATCH_POINTS, dp.id, dp);
+        saveRecordToFirestore(COLLECTIONS.DISPATCH_POINTS, dpSynced.id, dpSynced);
+      }
+    },
+
+    updateDispatchPoint: (dpId: string, updates: Partial<DispatchPoint>) => {
+      let updatedDp: DispatchPoint | undefined;
+      memoryStore.dispatchPoints = memoryStore.dispatchPoints.map((dp) => {
+        if (dp.id === dpId) {
+          updatedDp = { ...dp, ...updates, id: dpId };
+          return updatedDp;
+        }
+        return dp;
+      });
+      persist();
+
+      if (updatedDp) {
+        fetch(`/api/dispatch-points/${encodeURIComponent(dpId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates),
+        }).catch((err) => console.warn('[DB SYNC] Failed to update dispatch point in backend DB:', err));
+
+        if (isFirebaseConfigured()) {
+          saveRecordToFirestore(COLLECTIONS.DISPATCH_POINTS, dpId, updatedDp);
+        }
       }
     },
 
     deleteDispatchPoint: (dpId: string) => {
       memoryStore.dispatchPoints = memoryStore.dispatchPoints.filter((dp) => dp.id !== dpId);
       persist();
+
+      fetch(`/api/dispatch-points/${encodeURIComponent(dpId)}`, {
+        method: 'DELETE',
+      }).catch((err) => console.warn('[DB SYNC] Failed to delete dispatch point from backend DB:', err));
 
       if (isFirebaseConfigured()) {
         deleteRecordFromFirestore(COLLECTIONS.DISPATCH_POINTS, dpId);
@@ -1461,6 +2019,23 @@ export const useAppStore = () => {
       }
     },
 
+    deleteRetailer: (id: string) => {
+      memoryStore.retailers = memoryStore.retailers.filter((r) => r.id !== id);
+      memoryStore.beats = (memoryStore.beats || []).map((b) => {
+        if (b.retailer_ids && b.retailer_ids.includes(id)) {
+          const updatedB = { ...b, retailer_ids: b.retailer_ids.filter((rid) => rid !== id) };
+          if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.BEATS, b.id, updatedB);
+          return updatedB;
+        }
+        return b;
+      });
+      persist();
+
+      if (isFirebaseConfigured()) {
+        deleteRecordFromFirestore(COLLECTIONS.RETAILERS, id);
+      }
+    },
+
     // Distributor & Institutional Management
     addDistributor: (distributor: DistributorInstitution) => {
       memoryStore.distributors = [distributor, ...(memoryStore.distributors || [])];
@@ -1504,10 +2079,10 @@ export const useAppStore = () => {
       }
     },
 
-    // Order Punching & Editing
-    addOrder: (order: Order) => {
-      // Auto-assign billing_executive_id from creator user (CFS, SE, Distributor) or distributor client
-      let assignedBE = order.billing_executive_id;
+    // Order Punching & Editing (with Dynamic Multi-Dispatch Point Splitting)
+    addOrder: (order: Order): Order[] => {
+      // Strict BE assignment from creator user (CFS, SE, Distributor) or distributor client (no primary BE fallback)
+      let assignedBE: string | null | undefined = order.billing_executive_id || null;
       if (!assignedBE) {
         const creator = memoryStore.users.find(
           (u) => u.id === order.created_by_user_id || u.id === order.commission_agent_id
@@ -1520,63 +2095,104 @@ export const useAppStore = () => {
             assignedBE = dist.billing_executive_id;
           }
         }
-        if (!assignedBE) {
-          const defaultBE = memoryStore.users.find((u) => u.role === 'BILLING' && u.is_active !== false);
-          assignedBE = defaultBE?.id || 'usr_billing_1';
-        }
       }
 
       const effectiveOrder: Order = {
         ...order,
-        billing_executive_id: assignedBE,
+        billing_executive_id: assignedBE || null,
       };
 
-      memoryStore.orders = [effectiveOrder, ...memoryStore.orders];
-      persist();
+      const tenantDps = (memoryStore.dispatchPoints || []).filter((dp) => dp.tenant_id === effectiveOrder.tenant_id);
+      const splitOrders = splitOrderByDispatchPoint(
+        effectiveOrder,
+        memoryStore.companies || [],
+        memoryStore.skus || [],
+        tenantDps.length > 0 ? tenantDps : (memoryStore.dispatchPoints || [])
+      );
 
-      // Persist order to server backend database (sync across Android mobile app and web console)
-      fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(effectiveOrder),
-      }).catch((err) => console.warn('[DB SYNC] Failed to save order to server database:', err));
-
-      if (isFirebaseConfigured()) {
-        saveRecordToFirestore(COLLECTIONS.ORDERS, effectiveOrder.id, effectiveOrder);
+      // Enrich each split order with live credit exposure snapshot (never set credit-note flags by default)
+      const enrichedSplitOrders: Order[] = [];
+      for (const rawSplit of splitOrders) {
+        const exp = resolveOrderCreditExposure({
+          order: rawSplit,
+          retailers: memoryStore.retailers,
+          distributors: memoryStore.distributors,
+          users: memoryStore.users,
+          orders: [...enrichedSplitOrders, ...memoryStore.orders],
+          invoices: memoryStore.invoices,
+          payments: memoryStore.payments,
+          defaultCreditLimit: memoryStore.tenantSettings?.[rawSplit.tenant_id]?.credit_limit_default ?? 50000,
+        });
+        enrichedSplitOrders.push({
+          ...rawSplit,
+          credit_limit_exceeded: exp.isExceeded,
+          exposure_variance: exp.fundShortage,
+          approved_credit_limit_snapshot: exp.creditLimit,
+          retailer_outstanding_snapshot: exp.priorUnpaidOrders,
+        });
       }
 
-      // Automatically check for below-cost lines and raise claim entries if configured
-      (order.lines || []).forEach((line) => {
-        if (line.is_below_cost) {
-          const sku = memoryStore.skus.find((s) => s.id === line.sku_id);
-          const comp = memoryStore.companies.find((c) => c.id === sku?.company_id);
-          const newClaim: Claim = {
-            id: `clm_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            tenant_id: order.tenant_id,
-            claim_number: `CLM-${comp?.code || 'AUTO'}-${Math.floor(1000 + Math.random() * 9000)}`,
-            company_id: sku?.company_id || order.company_id,
-            company_name: comp?.name || 'Principal Company',
-            sku_id: line.sku_id,
-            sku_name: line.sku_name,
-            invoice_id: `INV-AUTO-${order.order_number}`,
-            claim_type: 'SCHEME_MARGIN',
-            quantity: line.quantity,
-            rate_per_unit: (line.landing_price - line.unit_price) > 0 ? (line.landing_price - line.unit_price) : (sku?.expected_claim_per_unit || 1),
-            claim_amount: line.expected_claim_total || (line.quantity * 2),
-            status: 'RAISED',
-            raised_date: new Date().toISOString().split('T')[0],
-            submitted_date: null,
-            settled_date: null,
-            is_leakage_flagged: false,
-          };
-          memoryStore.claims = [newClaim, ...memoryStore.claims];
-          if (isFirebaseConfigured()) {
-            saveRecordToFirestore(COLLECTIONS.CLAIMS, newClaim.id, newClaim);
-          }
+      memoryStore.orders = [...enrichedSplitOrders, ...memoryStore.orders];
+
+      // Persist each split order, immediately reserve credit & record ORDER_DEBIT in party_ledger
+      enrichedSplitOrders.forEach((splitOrd) => {
+        syncPartyCreditAndWriteLedger({
+          tenantId: splitOrd.tenant_id,
+          partyId: splitOrd.retailer_id,
+          partyName: splitOrd.retailer_name_raw,
+          entryType: 'ORDER_DEBIT',
+          order: splitOrd,
+          debitAmount: splitOrd.total_amount,
+          creditAmount: 0,
+          notes: `Order #${splitOrd.order_number} placed (${splitOrd.status}) — credit reserved`,
+          actorUserId: splitOrd.created_by_user_id || splitOrd.commission_agent_id,
+          actorName: splitOrd.order_raiser_name || splitOrd.commission_agent_name,
+        });
+
+        fetch('/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(splitOrd),
+        }).catch((err) => console.warn('[DB SYNC] Failed to save order to server database:', err));
+
+        if (isFirebaseConfigured()) {
+          saveRecordToFirestore(COLLECTIONS.ORDERS, splitOrd.id, splitOrd);
         }
+
+        // Check below-cost lines per split order and raise claim entries if configured
+        (splitOrd.lines || []).forEach((line) => {
+          if (line.is_below_cost) {
+            const sku = memoryStore.skus.find((s) => s.id === line.sku_id);
+            const comp = memoryStore.companies.find((c) => c.id === (line.company_id || sku?.company_id));
+            const newClaim: Claim = {
+              id: `clm_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+              tenant_id: splitOrd.tenant_id,
+              claim_number: `CLM-${comp?.code || 'AUTO'}-${Math.floor(1000 + Math.random() * 9000)}`,
+              company_id: line.company_id || sku?.company_id || splitOrd.company_id,
+              company_name: comp?.name || 'Principal Company',
+              sku_id: line.sku_id,
+              sku_name: line.sku_name,
+              invoice_id: `INV-AUTO-${splitOrd.order_number}`,
+              claim_type: 'SCHEME_MARGIN',
+              quantity: line.quantity,
+              rate_per_unit: (line.landing_price - line.unit_price) > 0 ? (line.landing_price - line.unit_price) : (sku?.expected_claim_per_unit || 1),
+              claim_amount: line.expected_claim_total || (line.quantity * 2),
+              status: 'RAISED',
+              raised_date: new Date().toISOString().split('T')[0],
+              submitted_date: null,
+              settled_date: null,
+              is_leakage_flagged: false,
+            };
+            memoryStore.claims = [newClaim, ...memoryStore.claims];
+            if (isFirebaseConfigured()) {
+              saveRecordToFirestore(COLLECTIONS.CLAIMS, newClaim.id, newClaim);
+            }
+          }
+        });
       });
 
       persist();
+      return enrichedSplitOrders;
     },
 
     updateOrder: (orderId: string, updatedOrder: Partial<Order>) => {
@@ -1585,61 +2201,101 @@ export const useAppStore = () => {
         o.id === orderId ? { ...o, ...updatedOrder } : o
       );
 
-      // If status changed to DELIVERED, recognize trade receivable debt in retailer current_outstanding
-      if (prevOrder && prevOrder.status !== 'DELIVERED' && updatedOrder.status === 'DELIVERED') {
-        const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
-        if (fullOrder && fullOrder.retailer_id) {
-          const alreadyInvoiced = memoryStore.invoices.some((i) => i.order_id === orderId);
-          if (!alreadyInvoiced) {
-            memoryStore.retailers = memoryStore.retailers.map((r) => {
-              if (r.id === fullOrder.retailer_id) {
-                const updated = { ...r, current_outstanding: r.current_outstanding + fullOrder.total_amount };
-                if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updated);
-                return updated;
-              }
-              return r;
-            });
-          }
+      const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
+      if (prevOrder && fullOrder) {
+        if (prevOrder.status !== 'CANCELLED' && fullOrder.status === 'CANCELLED') {
+          syncPartyCreditAndWriteLedger({
+            tenantId: fullOrder.tenant_id,
+            partyId: fullOrder.retailer_id,
+            partyName: fullOrder.retailer_name_raw,
+            entryType: 'ORDER_CANCELLATION_REVERSAL',
+            order: fullOrder,
+            debitAmount: 0,
+            creditAmount: prevOrder.total_amount,
+            notes: `Order #${fullOrder.order_number} cancelled — reserved credit released`,
+          });
+        } else if (fullOrder.status !== 'CANCELLED' && updatedOrder.total_amount !== undefined && updatedOrder.total_amount !== prevOrder.total_amount) {
+          const delta = Number(fullOrder.total_amount) - Number(prevOrder.total_amount);
+          syncPartyCreditAndWriteLedger({
+            tenantId: fullOrder.tenant_id,
+            partyId: fullOrder.retailer_id,
+            partyName: fullOrder.retailer_name_raw,
+            entryType: 'ORDER_AMEND_ADJUSTMENT',
+            order: fullOrder,
+            debitAmount: delta > 0 ? delta : 0,
+            creditAmount: delta < 0 ? Math.abs(delta) : 0,
+            notes: `Order #${fullOrder.order_number} amended from ₹${prevOrder.total_amount.toLocaleString('en-IN')} to ₹${fullOrder.total_amount.toLocaleString('en-IN')}`,
+          });
+        } else {
+          syncPartyCreditAndWriteLedger({
+            tenantId: fullOrder.tenant_id,
+            partyId: fullOrder.retailer_id,
+            partyName: fullOrder.retailer_name_raw,
+            order: fullOrder,
+          });
         }
       }
 
       persist();
 
-      if (isFirebaseConfigured()) {
-        const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
-        if (fullOrder) saveRecordToFirestore(COLLECTIONS.ORDERS, orderId, fullOrder);
+      fetch(`/api/orders/${orderId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedOrder),
+      }).catch((err) => console.warn('[DB SYNC] Failed to update order in server database:', err));
+
+      if (isFirebaseConfigured() && fullOrder) {
+        saveRecordToFirestore(COLLECTIONS.ORDERS, orderId, fullOrder);
       }
     },
 
     updateOrderStatus: (orderId: string, status: Order['status']) => {
       const prevOrder = memoryStore.orders.find((o) => o.id === orderId);
+      const now = new Date().toISOString();
+      const extraPatch: Partial<Order> = {};
+      if (status === 'DISPATCHED') {
+        extraPatch.dispatched_at = prevOrder?.dispatched_at || now;
+      } else if (status === 'INVOICED') {
+        extraPatch.invoiced_at = prevOrder?.invoiced_at || now;
+      }
+
       memoryStore.orders = memoryStore.orders.map((o) =>
-        o.id === orderId ? { ...o, status } : o
+        o.id === orderId ? { ...o, status, ...extraPatch } : o
       );
 
-      // If status changed to DELIVERED, recognize trade receivable debt in retailer current_outstanding
-      if (prevOrder && prevOrder.status !== 'DELIVERED' && status === 'DELIVERED') {
-        const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
-        if (fullOrder && fullOrder.retailer_id) {
-          const alreadyInvoiced = memoryStore.invoices.some((i) => i.order_id === orderId);
-          if (!alreadyInvoiced) {
-            memoryStore.retailers = memoryStore.retailers.map((r) => {
-              if (r.id === fullOrder.retailer_id) {
-                const updated = { ...r, current_outstanding: r.current_outstanding + fullOrder.total_amount };
-                if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updated);
-                return updated;
-              }
-              return r;
-            });
-          }
+      const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
+      if (prevOrder && fullOrder) {
+        if (prevOrder.status !== 'CANCELLED' && status === 'CANCELLED') {
+          syncPartyCreditAndWriteLedger({
+            tenantId: fullOrder.tenant_id,
+            partyId: fullOrder.retailer_id,
+            partyName: fullOrder.retailer_name_raw,
+            entryType: 'ORDER_CANCELLATION_REVERSAL',
+            order: fullOrder,
+            debitAmount: 0,
+            creditAmount: prevOrder.total_amount,
+            notes: `Order #${fullOrder.order_number} cancelled — reserved credit released`,
+          });
+        } else {
+          syncPartyCreditAndWriteLedger({
+            tenantId: fullOrder.tenant_id,
+            partyId: fullOrder.retailer_id,
+            partyName: fullOrder.retailer_name_raw,
+            order: fullOrder,
+          });
         }
       }
 
       persist();
 
-      if (isFirebaseConfigured()) {
-        const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
-        if (fullOrder) saveRecordToFirestore(COLLECTIONS.ORDERS, orderId, fullOrder);
+      fetch(`/api/orders/${orderId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status, ...extraPatch }),
+      }).catch((err) => console.warn('[DB SYNC] Failed to patch order status in server database:', err));
+
+      if (isFirebaseConfigured() && fullOrder) {
+        saveRecordToFirestore(COLLECTIONS.ORDERS, orderId, fullOrder);
       }
     },
 
@@ -1684,28 +2340,211 @@ export const useAppStore = () => {
     // Pillar 3: Purchase Orders (SKU-Wise Consolidation for Principle Company)
     addPurchaseOrder: (po: PrinciplePurchaseOrder) => {
       memoryStore.purchaseOrders = [po, ...(memoryStore.purchaseOrders || [])];
-      
-      // Update linked order statuses to PUNCHED_TO_PRINCIPAL / PO_GENERATED
-      if (po.linked_order_ids && po.linked_order_ids.length > 0) {
-        memoryStore.orders = memoryStore.orders.map((o) =>
-          po.linked_order_ids.includes(o.id) ? { ...o, status: 'PUNCHED_TO_PRINCIPAL' as const } : o
-        );
+      const now = new Date().toISOString();
+      const linkedIds = po.linked_order_ids || [];
+      const updatedOrders: Order[] = [];
+
+      // Transition linked orders from VERIFIED -> CONFIRMED (fulfillment_source: 'PRINCIPAL_PO')
+      if (linkedIds.length > 0) {
+        memoryStore.orders = memoryStore.orders.map((o) => {
+          if (linkedIds.includes(o.id)) {
+            const nextOrder: Order = {
+              ...o,
+              status: 'CONFIRMED',
+              fulfillment_source: 'PRINCIPAL_PO',
+              is_locked: true,
+            };
+            updatedOrders.push(nextOrder);
+            return nextOrder;
+          }
+          return o;
+        });
       }
 
-      // Add audit notification
-      const poNotif: WorkflowNotification = {
-        id: `notif_po_${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        title: `Consolidated PO Submitted to ${po.company_name}`,
-        message: `PO #${po.po_number} (${po.total_quantity} units, ₹${po.total_amount.toLocaleString('en-IN')}) submitted to Principle Company.`,
-        type: 'PO_SUBMITTED',
-        target_roles: ['ORDER_PUNCHER', 'DISPATCHER', 'ADMIN'],
-        company_name: po.company_name,
-        is_read: false
-      };
-      memoryStore.workflowNotifications = [poNotif, ...(memoryStore.workflowNotifications || [])];
+      // Emit ORDER_CONFIRMED_PO_SUBMITTED notification for BE, Dispatcher, Order Puncher & Order Raisers
+      const confirmNotifs: WorkflowNotification[] = [
+        {
+          id: `notif_po_${Date.now()}`,
+          timestamp: now,
+          created_at: now,
+          tenant_id: po.tenant_id,
+          title: `Principal PO ${po.po_number} Confirmed (${po.company_name})`,
+          message: `PO #${po.po_number} (${po.total_quantity} units, ₹${po.total_amount.toLocaleString('en-IN')}) submitted. ${updatedOrders.length} store order(s) transitioned to CONFIRMED for next-day dispatch & invoicing.`,
+          type: 'ORDER_CONFIRMED_PO_SUBMITTED',
+          target_roles: ['BILLING', 'DISPATCHER', 'ORDER_PUNCHER', 'ADMIN'],
+          related_entity_id: po.id,
+          related_entity_type: 'PURCHASE_ORDER',
+          company_name: po.company_name,
+          is_read: false,
+        },
+      ];
 
+      // Notify mapped BE and individual Order Raiser for each confirmed order
+      updatedOrders.forEach((ord, idx) => {
+        const raiserUserId = ord.created_by_user_id || ord.commission_agent_id || undefined;
+        if (raiserUserId) {
+          confirmNotifs.push({
+            id: `notif_po_raiser_${Date.now()}_${idx}`,
+            timestamp: now,
+            created_at: now,
+            tenant_id: ord.tenant_id,
+            title: `Order #${ord.order_number} Confirmed (Principal PO)`,
+            message: `Your order #${ord.order_number} for ${ord.retailer_name_raw} is CONFIRMED under PO #${po.po_number} (${po.company_name}) and queued for next-day dispatch.`,
+            type: 'ORDER_CONFIRMED_PO_SUBMITTED',
+            target_roles: ['COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR'],
+            target_user_id: raiserUserId,
+            related_entity_id: ord.id,
+            related_entity_type: 'ORDER',
+            order_id: ord.id,
+            order_number: ord.order_number,
+            retailer_name: ord.retailer_name_raw,
+            company_name: po.company_name,
+            is_read: false,
+          });
+        }
+        if (ord.billing_executive_id) {
+          confirmNotifs.push({
+            id: `notif_po_be_${Date.now()}_${idx}`,
+            timestamp: now,
+            created_at: now,
+            tenant_id: ord.tenant_id,
+            title: `Order #${ord.order_number} Confirmed — Invoicing Unlocked`,
+            message: `Principal PO #${po.po_number} submitted for #${ord.order_number} (${ord.retailer_name_raw}). Tax/Cash invoicing is now unlocked.`,
+            type: 'ORDER_CONFIRMED_PO_SUBMITTED',
+            target_roles: ['BILLING'],
+            target_user_id: ord.billing_executive_id,
+            related_entity_id: ord.id,
+            related_entity_type: 'ORDER',
+            order_id: ord.id,
+            order_number: ord.order_number,
+            retailer_name: ord.retailer_name_raw,
+            company_name: po.company_name,
+            is_read: false,
+          });
+        }
+      });
+
+      memoryStore.workflowNotifications = [...confirmNotifs, ...(memoryStore.workflowNotifications || [])];
       persist();
+
+      // Sync updated orders to server DB and Cloud Firestore
+      updatedOrders.forEach((ord) => {
+        fetch(`/api/orders/${ord.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            status: 'CONFIRMED',
+            fulfillment_source: 'PRINCIPAL_PO',
+            is_locked: true,
+          }),
+        }).catch((err) => console.warn('[DB SYNC] Failed to confirm order on server:', err));
+
+        if (isFirebaseConfigured()) {
+          saveRecordToFirestore(COLLECTIONS.ORDERS, ord.id, ord);
+        }
+      });
+    },
+
+    // Fast-Track Confirmation from Existing Depot Stock (Full Order)
+    confirmOrdersFromDepotStock: confirmOrdersFromDepotStockAction,
+
+    // Partial Depot Stock Split: Confirms fulfillable SKUs -> CONFIRMED (DEPOT_STOCK) & leaves shortage -> VERIFIED (PRINCIPAL_PO)
+    splitAndConfirmOrderFromDepotStock: (
+      orderId: string,
+      fulfillableQtyByLineId: Record<string, number>,
+      confirmedByName: string = 'Order Puncher'
+    ): { success: boolean; confirmedOrder?: Order; shortageOrder?: Order; message: string } => {
+      const targetOrder = memoryStore.orders.find(
+        (o) => o.id === orderId && (o.status === 'VERIFIED' || o.status === 'VERIFIED_BY_BILLING')
+      );
+      if (!targetOrder) {
+        return { success: false, message: 'Order not found or not in VERIFIED status.' };
+      }
+
+      const dpId = targetOrder.dispatch_point_id || 'dp_sahibabad';
+      const stockMap = getDepotAvailableStockMap(dpId, memoryStore.stockLedger, memoryStore.orders);
+
+      // Cap fulfillable quantities strictly by live available depot stock
+      const cappedAlloc: Record<string, number> = {};
+      let totalFulfill = 0;
+      let totalShortage = 0;
+
+      for (const line of targetOrder.lines || []) {
+        const ordered = line.verified_quantity != null ? Number(line.verified_quantity) : Number(line.quantity) || 0;
+        const requested = fulfillableQtyByLineId[line.id] ?? fulfillableQtyByLineId[line.sku_id] ?? 0;
+        const avail = stockMap[line.sku_id]?.availableForConfirmation || 0;
+        const safeFulfill = Math.max(0, Math.min(ordered, avail, Math.floor(requested)));
+        cappedAlloc[line.id] = safeFulfill;
+        totalFulfill += safeFulfill;
+        totalShortage += Math.max(0, ordered - safeFulfill);
+      }
+
+      if (totalFulfill <= 0) {
+        return { success: false, message: 'No available depot stock to fulfill any line on this order.' };
+      }
+      if (totalShortage === 0) {
+        const res = confirmOrdersFromDepotStockAction([orderId], confirmedByName);
+        const fullOrd = memoryStore.orders.find((o) => o.id === orderId);
+        return { success: res.success, confirmedOrder: fullOrd, message: res.message };
+      }
+
+      const { confirmedOrder, shortageOrder } = buildSplitOrdersForDepotAndPO(
+        targetOrder,
+        cappedAlloc,
+        memoryStore.skus,
+        confirmedByName
+      );
+
+      // Update shortage remainder in-place & insert new confirmed depot-stock child order
+      memoryStore.orders = [
+        confirmedOrder,
+        ...memoryStore.orders.map((o) => (o.id === targetOrder.id ? shortageOrder : o)),
+      ];
+
+      const now = new Date().toISOString();
+      const splitNotif: WorkflowNotification = {
+        id: `notif_split_${Date.now()}`,
+        timestamp: now,
+        created_at: now,
+        tenant_id: targetOrder.tenant_id,
+        title: `Order #${targetOrder.order_number} Split (Depot Stock + PO)`,
+        message: `${confirmedOrder.order_number} (${totalFulfill} units) CONFIRMED from Depot Stock for immediate Dispatch/Invoicing. Remaining ${totalShortage} units kept in VERIFIED (#${shortageOrder.order_number}) for Principal PO.`,
+        type: 'ORDER_CONFIRMED_DEPOT_STOCK',
+        target_roles: ['BILLING', 'DISPATCHER', 'COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR', 'ORDER_PUNCHER', 'ADMIN'],
+        target_user_id: targetOrder.created_by_user_id || targetOrder.commission_agent_id || undefined,
+        related_entity_id: confirmedOrder.id,
+        related_entity_type: 'ORDER',
+        order_id: confirmedOrder.id,
+        order_number: confirmedOrder.order_number,
+        retailer_name: targetOrder.retailer_name_raw,
+        is_read: false,
+      };
+      memoryStore.workflowNotifications = [splitNotif, ...(memoryStore.workflowNotifications || [])];
+      persist();
+
+      fetch('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(confirmedOrder),
+      }).catch((err) => console.warn('[DB SYNC] Failed to create split depot order:', err));
+
+      fetch(`/api/orders/${shortageOrder.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(shortageOrder),
+      }).catch((err) => console.warn('[DB SYNC] Failed to update shortage PO order:', err));
+
+      if (isFirebaseConfigured()) {
+        saveRecordToFirestore(COLLECTIONS.ORDERS, confirmedOrder.id, confirmedOrder);
+        saveRecordToFirestore(COLLECTIONS.ORDERS, shortageOrder.id, shortageOrder);
+      }
+
+      return {
+        success: true,
+        confirmedOrder,
+        shortageOrder,
+        message: `Split complete: ${confirmedOrder.order_number} (${totalFulfill} units) CONFIRMED from Depot Stock; ${totalShortage} shortage units queued for Principal PO.`,
+      };
     },
 
     updatePurchaseOrderStatus: (poId: string, status: PrinciplePurchaseOrder['status']) => {
@@ -2141,33 +2980,49 @@ export const useAppStore = () => {
       };
     },
 
-    // Invoice Generation
+    // Invoice Generation (Strictly gated to post-PO / Depot-Stock CONFIRMED orders)
     addInvoice: (invoice: Invoice) => {
-      memoryStore.invoices = [invoice, ...memoryStore.invoices];
       const targetOrder = memoryStore.orders.find((o) => o.id === invoice.order_id);
+      const invoiceableStatuses: Order['status'][] = ['CONFIRMED', 'DISPATCHED', 'APPROVED', 'DELIVERED', 'PUNCHED_TO_PRINCIPAL'];
+      if (targetOrder && !invoiceableStatuses.includes(targetOrder.status)) {
+        console.warn(`[INVOICING GATE] Blocked invoice creation for order ${targetOrder.order_number} in status ${targetOrder.status}. Must be CONFIRMED first.`);
+        return;
+      }
+
+      const now = new Date().toISOString();
+      memoryStore.invoices = [invoice, ...memoryStore.invoices];
       const wasAlreadyDelivered = targetOrder?.status === 'DELIVERED';
 
-      // Update order status to INVOICED
+      // Update order status to INVOICED & stamp invoiced_at (preserve dispatched_at for parallel dispatch tracking)
       memoryStore.orders = memoryStore.orders.map((o) =>
-        o.id === invoice.order_id ? { ...o, status: 'INVOICED' } : o
+        o.id === invoice.order_id
+          ? {
+              ...o,
+              status: 'INVOICED',
+              invoiced_at: o.invoiced_at || now,
+            }
+          : o
       );
-      // Update retailer current_outstanding balance
-      if (invoice.retailer_id) {
-        const unpaidAmount = Math.max(0, invoice.total_amount - invoice.paid_amount);
-        memoryStore.retailers = memoryStore.retailers.map((r) => {
-          if (r.id === invoice.retailer_id) {
-            // If already delivered, only apply difference if invoice total differs from delivered order amount
-            const additionalDebit = wasAlreadyDelivered
-              ? Math.max(0, invoice.total_amount - (targetOrder?.total_amount || 0))
-              : unpaidAmount;
-            const updated = { ...r, current_outstanding: r.current_outstanding + additionalDebit };
-            if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updated);
-            return updated;
-          }
-          return r;
-        });
-      }
+
+      // Sync party credit cleanly without double-counting an order already in memoryStore.orders
+      syncPartyCreditAndWriteLedger({
+        tenantId: invoice.tenant_id,
+        partyId: invoice.retailer_id,
+        partyName: invoice.retailer_name,
+        invoice,
+        entryType: !targetOrder ? 'ORDER_DEBIT' : undefined,
+        debitAmount: !targetOrder ? Math.max(0, invoice.total_amount) : 0,
+        creditAmount: 0,
+        notes: !targetOrder ? `Standalone invoice #${invoice.invoice_number} raised` : undefined,
+      });
+
       persist();
+
+      fetch(`/api/orders/${invoice.order_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'INVOICED', invoiced_at: now }),
+      }).catch((err) => console.warn('[DB SYNC] Failed to update invoiced status on server:', err));
 
       if (isFirebaseConfigured()) {
         saveRecordToFirestore(COLLECTIONS.INVOICES, invoice.id, invoice);
@@ -2202,33 +3057,187 @@ export const useAppStore = () => {
 
     // Retailer Credit Limit
     updateRetailerCreditLimit: (id: string, limit: number) => {
-      memoryStore.retailers = memoryStore.retailers.map((r) =>
-        r.id === id ? { ...r, credit_limit: limit } : r
-      );
-      persist();
-
-      if (isFirebaseConfigured()) {
-        const updated = memoryStore.retailers.find((r) => r.id === id);
-        if (updated) saveRecordToFirestore(COLLECTIONS.RETAILERS, id, updated);
+      const sanitizedLimit = Math.max(0, Number(limit) || 0);
+      let updated: Retailer | undefined;
+      memoryStore.retailers = memoryStore.retailers.map((r) => {
+        if (r.id === id) {
+          updated = { ...r, credit_limit: sanitizedLimit };
+          return updated;
+        }
+        return r;
+      });
+      if (updated) {
+        syncPartyCreditAndWriteLedger({
+          tenantId: updated.tenant_id || memoryStore.activeTenantId,
+          partyId: id,
+          partyName: updated.name,
+        });
       }
+      persist();
+    },
+
+    // Unified Party Credit Gate Actions (Retailer, Distributor, CFS User) -> Cloud Firestore + Backend Sync
+    syncCreditGateFromFirestore: async (): Promise<boolean> => {
+      if (!isFirebaseConfigured()) return false;
+      const res = await fetchCreditGateCollectionsFromFirestore();
+      if (!res.success) return false;
+      if (res.users) memoryStore.users = res.users;
+      if (res.distributors) memoryStore.distributors = res.distributors;
+      if (res.retailers) memoryStore.retailers = res.retailers;
+      if (res.orders) memoryStore.orders = res.orders;
+      if (res.invoices) memoryStore.invoices = res.invoices;
+      if (res.payments) memoryStore.payments = res.payments;
+      if (res.partyLedger) memoryStore.partyLedger = res.partyLedger;
+      memoryStore.lastSyncedAt = new Date().toISOString();
+      persist();
+      return true;
+    },
+
+    updatePartyCreditLimit: async (
+      partyKind: CreditPartyKind,
+      id: string,
+      newLimit: number,
+      linkedIds?: { linkedUserId?: string; linkedDistributorId?: string }
+    ): Promise<{ success: boolean; error?: string }> => {
+      const sanitizedLimit = Math.max(0, Number(newLimit) || 0);
+      const persistWrites: Promise<any>[] = [];
+      let partyTenantId = memoryStore.activeTenantId;
+      let partyName = '';
+
+      if (partyKind === 'RETAILER') {
+        let updatedRet: Retailer | undefined;
+        memoryStore.retailers = memoryStore.retailers.map((r) => {
+          if (r.id === id) {
+            updatedRet = { ...r, credit_limit: sanitizedLimit };
+            partyTenantId = r.tenant_id || partyTenantId;
+            partyName = r.name;
+            return updatedRet;
+          }
+          return r;
+        });
+        if (isFirebaseConfigured() && updatedRet) {
+          persistWrites.push(saveRecordToFirestore(COLLECTIONS.RETAILERS, id, updatedRet));
+        }
+      } else if (partyKind === 'DISTRIBUTOR_INSTITUTION' || linkedIds?.linkedDistributorId) {
+        const targetDistId = partyKind === 'DISTRIBUTOR_INSTITUTION' ? id : linkedIds!.linkedDistributorId!;
+        let updatedDist: DistributorInstitution | undefined;
+        memoryStore.distributors = (memoryStore.distributors || []).map((d) => {
+          if (d.id === targetDistId) {
+            updatedDist = { ...d, credit_limit: sanitizedLimit, updated_at: new Date().toISOString() };
+            partyTenantId = d.tenant_id || partyTenantId;
+            partyName = d.name;
+            return updatedDist;
+          }
+          return d;
+        });
+        if (isFirebaseConfigured() && updatedDist) {
+          persistWrites.push(saveRecordToFirestore(COLLECTIONS.DISTRIBUTORS, targetDistId, updatedDist));
+        }
+      }
+
+      const targetUserId = partyKind === 'USER' ? id : linkedIds?.linkedUserId;
+      if (targetUserId) {
+        let updatedUser: User | undefined;
+        memoryStore.users = memoryStore.users.map((u) => {
+          if (u.id === targetUserId || u.firestore_doc_id === targetUserId) {
+            updatedUser = { ...u, credit_limit: sanitizedLimit, credit_gate_enabled: true };
+            partyTenantId = u.tenant_id || partyTenantId;
+            if (!partyName) partyName = u.name;
+            return updatedUser;
+          }
+          return u;
+        });
+
+        persistWrites.push(
+          fetch(`/api/users/${encodeURIComponent(targetUserId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ credit_limit: sanitizedLimit, credit_gate_enabled: true }),
+          }).catch((err) => console.warn('[DB SYNC] Failed to sync user credit limit to backend DB:', err))
+        );
+
+        if (isFirebaseConfigured() && updatedUser) {
+          persistWrites.push(
+            saveRecordToFirestore(COLLECTIONS.USERS, updatedUser.firestore_doc_id || updatedUser.id, updatedUser)
+          );
+        }
+      }
+
+      // Immediately recompute utilized_credit, remaining_credit, and fund_shortage across linked records
+      syncPartyCreditAndWriteLedger({
+        tenantId: partyTenantId,
+        partyId: id,
+        partyName,
+      });
+
+      persist();
+      await Promise.allSettled(persistWrites);
+      return { success: true };
+    },
+
+    removeCreditParty: async (
+      partyKind: CreditPartyKind,
+      id: string,
+      linkedIds?: { linkedUserId?: string; linkedDistributorId?: string }
+    ): Promise<{ success: boolean; error?: string }> => {
+      const persistWrites: Promise<any>[] = [];
+
+      if (partyKind === 'RETAILER') {
+        memoryStore.retailers = memoryStore.retailers.filter((r) => r.id !== id);
+        memoryStore.beats = (memoryStore.beats || []).map((b) => {
+          if (b.retailer_ids && b.retailer_ids.includes(id)) {
+            const updatedB = { ...b, retailer_ids: b.retailer_ids.filter((rid) => rid !== id) };
+            if (isFirebaseConfigured()) {
+              persistWrites.push(saveRecordToFirestore(COLLECTIONS.BEATS, b.id, updatedB));
+            }
+            return updatedB;
+          }
+          return b;
+        });
+        if (isFirebaseConfigured()) {
+          persistWrites.push(deleteRecordFromFirestore(COLLECTIONS.RETAILERS, id));
+        }
+      } else if (partyKind === 'DISTRIBUTOR_INSTITUTION') {
+        memoryStore.distributors = (memoryStore.distributors || []).filter((d) => d.id !== id);
+        if (isFirebaseConfigured()) {
+          persistWrites.push(deleteRecordFromFirestore(COLLECTIONS.DISTRIBUTORS, id));
+        }
+      }
+
+      const targetUserId = partyKind === 'USER' ? id : linkedIds?.linkedUserId;
+      if (targetUserId) {
+        let updatedUser: User | undefined;
+        memoryStore.users = memoryStore.users.map((u) => {
+          if (u.id === targetUserId || u.firestore_doc_id === targetUserId) {
+            updatedUser = { ...u, credit_gate_enabled: false };
+            return updatedUser;
+          }
+          return u;
+        });
+
+        persistWrites.push(
+          fetch(`/api/users/${encodeURIComponent(targetUserId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ credit_gate_enabled: false }),
+          }).catch((err) => console.warn('[DB SYNC] Failed to remove user from Credit Gate on backend:', err))
+        );
+
+        if (isFirebaseConfigured() && updatedUser) {
+          persistWrites.push(
+            saveRecordToFirestore(COLLECTIONS.USERS, updatedUser.firestore_doc_id || updatedUser.id, updatedUser)
+          );
+        }
+      }
+
+      persist();
+      await Promise.allSettled(persistWrites);
+      return { success: true };
     },
 
     // Payments & Collections Controller Actions
     addPayment: (payment: Payment) => {
       memoryStore.payments = [payment, ...memoryStore.payments];
-
-      // Update retailer outstanding balance ONLY if payment is already VERIFIED
-      if (payment.retailer_id && payment.status === 'VERIFIED') {
-        memoryStore.retailers = memoryStore.retailers.map((r) => {
-          if (r.id === payment.retailer_id) {
-            const newOutstanding = Math.max(0, r.current_outstanding - payment.amount);
-            const updated = { ...r, current_outstanding: newOutstanding };
-            if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updated);
-            return updated;
-          }
-          return r;
-        });
-      }
 
       if (payment.matched_invoice_id && payment.status === 'VERIFIED') {
         memoryStore.invoices = memoryStore.invoices.map((inv) => {
@@ -2242,6 +3251,21 @@ export const useAppStore = () => {
           return inv;
         });
       }
+
+      if (payment.status === 'VERIFIED') {
+        syncPartyCreditAndWriteLedger({
+          tenantId: payment.tenant_id,
+          partyId: payment.retailer_id,
+          partyName: payment.retailer_name,
+          entryType: 'PAYMENT_CREDIT',
+          payment,
+          debitAmount: 0,
+          creditAmount: payment.amount,
+          notes: `Verified payment #${payment.payment_number} (${payment.payment_mode} • ${payment.reference_number || 'Direct'})`,
+          actorName: payment.collector_name || null,
+        });
+      }
+
       persist();
 
       if (isFirebaseConfigured()) {
@@ -2262,6 +3286,14 @@ export const useAppStore = () => {
         }
         return p;
       });
+      if (updatedPmt) {
+        syncPartyCreditAndWriteLedger({
+          tenantId: updatedPmt.tenant_id,
+          partyId: updatedPmt.retailer_id,
+          partyName: updatedPmt.retailer_name,
+          payment: updatedPmt,
+        });
+      }
       persist();
 
       if (isFirebaseConfigured() && updatedPmt) {
@@ -2292,29 +3324,48 @@ export const useAppStore = () => {
     verifyPayment: (paymentId: string, allocations?: PaymentAllocation[]) => {
       const targetPayment = memoryStore.payments.find((p) => p.id === paymentId);
       if (!targetPayment) return;
+      const wasAlreadyVerified = targetPayment.status === 'VERIFIED';
 
       const updatedAllocations = allocations || targetPayment.allocations || [];
+      let verifiedPaymentRecord: Payment = {
+        ...targetPayment,
+        status: 'VERIFIED' as const,
+        allocations: updatedAllocations,
+        flag_reason: null,
+      };
 
       memoryStore.payments = memoryStore.payments.map((p) => {
         if (p.id === paymentId) {
-          const updated = {
+          verifiedPaymentRecord = {
             ...p,
             status: 'VERIFIED' as const,
             allocations: updatedAllocations,
             flag_reason: null,
           };
-          if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.PAYMENTS, paymentId, updated);
-          return updated;
+          if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.PAYMENTS, paymentId, verifiedPaymentRecord);
+          return verifiedPaymentRecord;
         }
         return p;
       });
 
-      // Update matched invoices paid_amount and status
-      if (updatedAllocations.length > 0) {
-        updatedAllocations.forEach((alloc) => {
+      if (!wasAlreadyVerified) {
+        if (updatedAllocations.length > 0) {
+          updatedAllocations.forEach((alloc) => {
+            memoryStore.invoices = memoryStore.invoices.map((inv) => {
+              if (inv.id === alloc.invoice_id) {
+                const newPaid = inv.paid_amount + alloc.amount;
+                const newStatus = newPaid >= inv.total_amount ? 'PAID' : 'PARTIAL';
+                const updated = { ...inv, paid_amount: newPaid, status: newStatus as Invoice['status'] };
+                if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.INVOICES, inv.id, updated);
+                return updated;
+              }
+              return inv;
+            });
+          });
+        } else if (targetPayment.matched_invoice_id) {
           memoryStore.invoices = memoryStore.invoices.map((inv) => {
-            if (inv.id === alloc.invoice_id) {
-              const newPaid = inv.paid_amount + alloc.amount;
+            if (inv.id === targetPayment.matched_invoice_id) {
+              const newPaid = inv.paid_amount + targetPayment.amount;
               const newStatus = newPaid >= inv.total_amount ? 'PAID' : 'PARTIAL';
               const updated = { ...inv, paid_amount: newPaid, status: newStatus as Invoice['status'] };
               if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.INVOICES, inv.id, updated);
@@ -2322,30 +3373,18 @@ export const useAppStore = () => {
             }
             return inv;
           });
-        });
-      } else if (targetPayment.matched_invoice_id) {
-        memoryStore.invoices = memoryStore.invoices.map((inv) => {
-          if (inv.id === targetPayment.matched_invoice_id) {
-            const newPaid = inv.paid_amount + targetPayment.amount;
-            const newStatus = newPaid >= inv.total_amount ? 'PAID' : 'PARTIAL';
-            const updated = { ...inv, paid_amount: newPaid, status: newStatus as Invoice['status'] };
-            if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.INVOICES, inv.id, updated);
-            return updated;
-          }
-          return inv;
-        });
-      }
+        }
 
-      // Update retailer outstanding if applicable
-      if (targetPayment.retailer_id) {
-        memoryStore.retailers = memoryStore.retailers.map((r) => {
-          if (r.id === targetPayment.retailer_id) {
-            const newOutstanding = Math.max(0, r.current_outstanding - targetPayment.amount);
-            const updated = { ...r, current_outstanding: newOutstanding };
-            if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updated);
-            return updated;
-          }
-          return r;
+        syncPartyCreditAndWriteLedger({
+          tenantId: verifiedPaymentRecord.tenant_id,
+          partyId: verifiedPaymentRecord.retailer_id,
+          partyName: verifiedPaymentRecord.retailer_name,
+          entryType: 'PAYMENT_CREDIT',
+          payment: verifiedPaymentRecord,
+          debitAmount: 0,
+          creditAmount: verifiedPaymentRecord.amount,
+          notes: `Payment #${verifiedPaymentRecord.payment_number} verified (${verifiedPaymentRecord.payment_mode} • ${verifiedPaymentRecord.reference_number || 'Direct'})`,
+          actorName: verifiedPaymentRecord.collector_name || 'Accounts Executive',
         });
       }
 
@@ -2361,6 +3400,14 @@ export const useAppStore = () => {
         }
         return p;
       });
+      if (updatedPmt) {
+        syncPartyCreditAndWriteLedger({
+          tenantId: updatedPmt.tenant_id,
+          partyId: updatedPmt.retailer_id,
+          partyName: updatedPmt.retailer_name,
+          payment: updatedPmt,
+        });
+      }
       persist();
 
       if (isFirebaseConfigured() && updatedPmt) {
@@ -2407,7 +3454,6 @@ export const useAppStore = () => {
         saveRecordToFirestore(COLLECTIONS.PAYMENTS, paymentId, updatedPmt);
       }
 
-      // Adjust matched invoice if amount changed
       const invoiceId = updates.matched_invoice_id || oldPayment.matched_invoice_id;
       if (invoiceId && diffAmount !== 0) {
         memoryStore.invoices = memoryStore.invoices.map((inv) => {
@@ -2422,16 +3468,25 @@ export const useAppStore = () => {
         });
       }
 
-      // Adjust retailer current_outstanding if amount changed
-      const retId = oldPayment.retailer_id;
-      if (retId && diffAmount !== 0) {
-        memoryStore.retailers = memoryStore.retailers.map((r) => {
-          if (r.id === retId) {
-            const updatedRet = { ...r, current_outstanding: Math.max(0, r.current_outstanding - diffAmount) };
-            if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updatedRet);
-            return updatedRet;
-          }
-          return r;
+      if (updatedPmt && (diffAmount !== 0 || (updates.status && updates.status !== oldPayment.status))) {
+        const isNowVerified = updatedPmt.status === 'VERIFIED';
+        const effectiveDelta =
+          oldPayment.status !== 'VERIFIED' && isNowVerified
+            ? updatedPmt.amount
+            : oldPayment.status === 'VERIFIED' && !isNowVerified
+              ? -oldPayment.amount
+              : isNowVerified
+                ? diffAmount
+                : 0;
+        syncPartyCreditAndWriteLedger({
+          tenantId: updatedPmt.tenant_id,
+          partyId: updatedPmt.retailer_id,
+          partyName: updatedPmt.retailer_name,
+          entryType: effectiveDelta !== 0 ? 'PAYMENT_CREDIT' : undefined,
+          payment: updatedPmt,
+          debitAmount: effectiveDelta < 0 ? Math.abs(effectiveDelta) : 0,
+          creditAmount: effectiveDelta > 0 ? effectiveDelta : 0,
+          notes: `Payment #${updatedPmt.payment_number} updated (${updatedPmt.payment_mode})`,
         });
       }
 
@@ -2446,25 +3501,15 @@ export const useAppStore = () => {
       const diff = sanitizedPaid - targetInv.paid_amount;
       const newStatus = sanitizedPaid >= targetInv.total_amount ? 'PAID' : sanitizedPaid > 0 ? 'PARTIAL' : 'UNPAID';
 
+      let updatedInvRecord: Invoice = targetInv;
       memoryStore.invoices = memoryStore.invoices.map((inv) => {
         if (inv.id === invoiceId) {
-          const updated = { ...inv, paid_amount: sanitizedPaid, status: newStatus as Invoice['status'] };
-          if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.INVOICES, inv.id, updated);
-          return updated;
+          updatedInvRecord = { ...inv, paid_amount: sanitizedPaid, status: newStatus as Invoice['status'] };
+          if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.INVOICES, inv.id, updatedInvRecord);
+          return updatedInvRecord;
         }
         return inv;
       });
-
-      if (targetInv.retailer_id && diff !== 0) {
-        memoryStore.retailers = memoryStore.retailers.map((r) => {
-          if (r.id === targetInv.retailer_id) {
-            const updated = { ...r, current_outstanding: Math.max(0, r.current_outstanding - diff) };
-            if (isFirebaseConfigured()) saveRecordToFirestore(COLLECTIONS.RETAILERS, r.id, updated);
-            return updated;
-          }
-          return r;
-        });
-      }
 
       if (diff > 0) {
         const autoPayment: Payment = {
@@ -2486,9 +3531,107 @@ export const useAppStore = () => {
         if (isFirebaseConfigured()) {
           saveRecordToFirestore(COLLECTIONS.PAYMENTS, autoPayment.id, autoPayment);
         }
+
+        syncPartyCreditAndWriteLedger({
+          tenantId: targetInv.tenant_id,
+          partyId: targetInv.retailer_id,
+          partyName: targetInv.retailer_name,
+          entryType: 'PAYMENT_CREDIT',
+          invoice: updatedInvRecord,
+          payment: autoPayment,
+          debitAmount: 0,
+          creditAmount: diff,
+          notes: `Payment collected against Invoice #${targetInv.invoice_number} (${paymentMode})`,
+          actorName: 'Billing Executive',
+        });
       }
 
       persist();
+    },
+
+    // Explicit-only occasional Credit Note / Discount issued by BE/AE against an invoice
+    issueCreditNoteDiscount: (params: {
+      invoiceId: string;
+      discountAmount: number;
+      creditNoteNumber: string;
+      reason: string;
+      issuedByUserId?: string;
+      issuedByName?: string;
+    }): { success: boolean; error?: string } => {
+      const targetInv = memoryStore.invoices.find((i) => i.id === params.invoiceId);
+      if (!targetInv) {
+        return { success: false, error: 'Target invoice not found.' };
+      }
+      const cleanDiscount = Math.max(0, Number(params.discountAmount) || 0);
+      if (cleanDiscount <= 0) {
+        return { success: false, error: 'Credit discount amount must be greater than zero.' };
+      }
+      const maxAllowable = Math.max(0, targetInv.total_amount - targetInv.paid_amount);
+      const boundedDiscount = Math.min(cleanDiscount, maxAllowable || targetInv.total_amount);
+      const cnNumber = params.creditNoteNumber.trim() || `CN-${Date.now().toString().slice(-6)}`;
+
+      let updatedInv: Invoice = targetInv;
+      const newTotalCN = (Number(targetInv.credit_note_discount_amount) || 0) + boundedDiscount;
+      const effectiveDue = Math.max(0, targetInv.total_amount - newTotalCN);
+      const nextStatus: Invoice['status'] =
+        targetInv.paid_amount >= effectiveDue ? 'PAID' : targetInv.paid_amount > 0 ? 'PARTIAL' : targetInv.status;
+
+      memoryStore.invoices = memoryStore.invoices.map((inv) => {
+        if (inv.id === targetInv.id) {
+          updatedInv = {
+            ...inv,
+            is_credit_note_discount: true,
+            credit_note_discount_amount: newTotalCN,
+            credit_note_number: cnNumber,
+            credit_note_reason: params.reason || 'BE Credit Note Discount',
+            status: nextStatus,
+          };
+          return updatedInv;
+        }
+        return inv;
+      });
+      if (isFirebaseConfigured()) {
+        saveRecordToFirestore(COLLECTIONS.INVOICES, updatedInv.id, updatedInv);
+      }
+
+      let updatedOrder: Order | undefined;
+      if (targetInv.order_id) {
+        memoryStore.orders = memoryStore.orders.map((ord) => {
+          if (ord.id === targetInv.order_id) {
+            updatedOrder = {
+              ...ord,
+              is_credit_note_discount: true,
+              credit_note_discount_amount: (Number(ord.credit_note_discount_amount) || 0) + boundedDiscount,
+              credit_note_number: cnNumber,
+              credit_note_reason: params.reason || 'BE Credit Note Discount',
+            };
+            return updatedOrder;
+          }
+          return ord;
+        });
+        if (isFirebaseConfigured() && updatedOrder) {
+          saveRecordToFirestore(COLLECTIONS.ORDERS, updatedOrder.id, updatedOrder);
+        }
+      }
+
+      syncPartyCreditAndWriteLedger({
+        tenantId: targetInv.tenant_id,
+        partyId: targetInv.retailer_id,
+        partyName: targetInv.retailer_name,
+        entryType: 'CREDIT_NOTE_DISCOUNT',
+        invoice: updatedInv,
+        order: updatedOrder || null,
+        debitAmount: 0,
+        creditAmount: boundedDiscount,
+        isCreditNoteDiscount: true,
+        creditNoteNumber: cnNumber,
+        notes: `Credit Note #${cnNumber} on ${targetInv.invoice_number}: ${params.reason || 'Occasional credit discount'}`,
+        actorUserId: params.issuedByUserId || null,
+        actorName: params.issuedByName || 'Billing Executive',
+      });
+
+      persist();
+      return { success: true };
     },
 
     toggleLockInvoice: (invoiceId: string, lockedBy: string) => {
@@ -2532,15 +3675,29 @@ export const useAppStore = () => {
 
       const userWithAuth: User = {
         ...user,
+        platform: getPlatformForRole(user.role),
         email: user.email || '',
         password_hash,
         salt,
       };
 
       memoryStore.users = [userWithAuth, ...memoryStore.users];
+
+      // Sync assigned warehouse supervisor when a DISPATCHER is created
+      let changedDispatchPoints: DispatchPoint[] = [];
+      if (userWithAuth.role === 'DISPATCHER' && userWithAuth.dispatch_point_id) {
+        const dpSync = syncDispatchPointsForUsers(
+          memoryStore.dispatchPoints,
+          memoryStore.users,
+          [userWithAuth.dispatch_point_id]
+        );
+        memoryStore.dispatchPoints = dpSync.updatedDispatchPoints;
+        changedDispatchPoints = dpSync.changedDispatchPoints;
+      }
+
       persist();
 
-      // Sync to backend persistent DB
+      // Sync to backend persistent DB (authoritative PBKDF2 hash + Firestore write)
       fetch('/api/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2556,23 +3713,64 @@ export const useAppStore = () => {
           billing_executive_id: user.billing_executive_id || null,
           beat_id: user.beat_id || null,
           beat_name: user.beat_name || null,
+          company_scope: Array.isArray(user.company_scope) ? user.company_scope : [],
         })
-      }).catch((err) => console.warn('[DB SYNC] Failed to register user in backend DB:', err));
+      })
+        .then((res) => {
+          if (!res.ok && isFirebaseConfigured()) {
+            saveRecordToFirestore(COLLECTIONS.USERS, userWithAuth.id, userWithAuth);
+          }
+        })
+        .catch((err) => {
+          console.warn('[DB SYNC] Failed to register user in backend DB, saving directly to Firestore:', err);
+          if (isFirebaseConfigured()) {
+            saveRecordToFirestore(COLLECTIONS.USERS, userWithAuth.id, userWithAuth);
+          }
+        });
 
       if (isFirebaseConfigured()) {
-        saveRecordToFirestore(COLLECTIONS.USERS, userWithAuth.id, userWithAuth);
+        changedDispatchPoints.forEach((dp) => {
+          saveRecordToFirestore(COLLECTIONS.DISPATCH_POINTS, dp.id, dp);
+        });
       }
     },
 
     updateUser: (userId: string, updates: Partial<User>) => {
+      const prevUser = memoryStore.users.find((u) => u.id === userId);
+      const prevDpId = prevUser?.dispatch_point_id;
+      const prevRole = prevUser?.role;
+
       let updatedUser: User | undefined;
       memoryStore.users = memoryStore.users.map((u) => {
         if (u.id === userId) {
-          updatedUser = { ...u, ...updates };
+          const nextRole = updates.role || u.role;
+          updatedUser = {
+            ...u,
+            ...updates,
+            platform: getPlatformForRole(nextRole),
+          };
           return updatedUser;
         }
         return u;
       });
+
+      let changedDispatchPoints: DispatchPoint[] = [];
+      if (
+        prevRole === 'DISPATCHER' ||
+        updatedUser?.role === 'DISPATCHER' ||
+        updates.dispatch_point_id !== undefined ||
+        updates.name !== undefined ||
+        updates.mobile_number !== undefined
+      ) {
+        const dpSync = syncDispatchPointsForUsers(
+          memoryStore.dispatchPoints,
+          memoryStore.users,
+          [prevDpId, updatedUser?.dispatch_point_id]
+        );
+        memoryStore.dispatchPoints = dpSync.updatedDispatchPoints;
+        changedDispatchPoints = dpSync.changedDispatchPoints;
+      }
+
       persist();
 
       // Persist user updates to backend persistent DB (e.g. BE mapping, dispatch point)
@@ -2584,6 +3782,9 @@ export const useAppStore = () => {
 
       if (isFirebaseConfigured() && updatedUser) {
         saveRecordToFirestore(COLLECTIONS.USERS, userId, updatedUser);
+        changedDispatchPoints.forEach((dp) => {
+          saveRecordToFirestore(COLLECTIONS.DISPATCH_POINTS, dp.id, dp);
+        });
       }
     },
 
@@ -2728,7 +3929,18 @@ export const useAppStore = () => {
         };
       });
 
-      const newTaxAmount = Math.round(newTotal * 0.18 * 100) / 100;
+      // Calculate itemized tax dynamically based on each SKU's master tax_rate
+      let calculatedTax = 0;
+      (order.lines || []).forEach((line) => {
+        const sku = memoryStore.skus.find((s) => s.id === line.sku_id);
+        const taxRate = sku?.tax_rate !== undefined ? Number(sku.tax_rate) : 18;
+        const amendment = amendedLines?.find((a) => a.sku_id === line.sku_id);
+        const verifiedQty = amendment !== undefined ? Math.max(0, Number(amendment.verified_quantity)) : (line.verified_quantity ?? line.quantity);
+        const lineProductTotal = verifiedQty * line.unit_price;
+        calculatedTax += lineProductTotal * (taxRate / 100);
+      });
+
+      const newTaxAmount = Math.round(calculatedTax * 100) / 100;
       const newTotalWithGst = Math.round((newTotal + newTaxAmount) * 100) / 100;
 
       const updatedOrder: Order = {
@@ -2746,6 +3958,31 @@ export const useAppStore = () => {
       };
 
       memoryStore.orders = memoryStore.orders.map((o) => (o.id === orderId ? updatedOrder : o));
+
+      // Adjust live utilized credit if BE partially amended order total
+      const totalDelta = Math.round((newTotalWithGst - Number(order.total_amount || 0)) * 100) / 100;
+      const syncedParty = syncPartyCreditAndWriteLedger({
+        tenantId: updatedOrder.tenant_id,
+        partyId: updatedOrder.retailer_id,
+        partyName: updatedOrder.retailer_name_raw,
+        entryType: totalDelta !== 0 ? 'ORDER_AMEND_ADJUSTMENT' : undefined,
+        order: updatedOrder,
+        debitAmount: totalDelta > 0 ? totalDelta : 0,
+        creditAmount: totalDelta < 0 ? Math.abs(totalDelta) : 0,
+        notes:
+          totalDelta !== 0
+            ? `BE Partial Approval amended #${order.order_number} from ₹${Number(order.total_amount).toLocaleString('en-IN')} to ₹${newTotalWithGst.toLocaleString('en-IN')}`
+            : undefined,
+        actorUserId: approverUserId,
+        actorName: approverName,
+      });
+
+      if (syncedParty) {
+        updatedOrder.credit_limit_exceeded = syncedParty.is_credit_blocked;
+        updatedOrder.exposure_variance = syncedParty.fund_shortage;
+        updatedOrder.approved_credit_limit_snapshot = syncedParty.credit_limit;
+        memoryStore.orders = memoryStore.orders.map((o) => (o.id === orderId ? updatedOrder : o));
+      }
 
       // Sync with server-side backend API
       fetch(`/api/orders/${orderId}/verify`, {
@@ -2769,7 +4006,7 @@ export const useAppStore = () => {
         timestamp: now,
         created_at: now,
         title: `Order Verified by ${approverName}`,
-        message: `Order #${order.order_number} (${retName}, ₹${newTotal.toLocaleString('en-IN')}) verified as ${finalInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'} & locked. Available in DP dispatch bucket.`,
+        message: `Order #${order.order_number} (${retName}, ₹${newTotalWithGst.toLocaleString('en-IN')}) verified as ${finalInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'} & locked. Available in DP dispatch bucket.`,
         type: 'VERIFIED_PARALLEL_ALERT',
         target_roles: ['ORDER_PUNCHER', 'DISPATCHER', 'ADMIN', 'BILLING'],
         order_id: order.id,
@@ -2805,7 +4042,7 @@ export const useAppStore = () => {
           is_read: false,
           metadata: {
             amended_lines: amendedAuditList,
-            new_total: newTotal,
+            new_total: newTotalWithGst,
             original_total: order.original_total_amount || order.total_amount,
           },
         };
@@ -2846,8 +4083,27 @@ export const useAppStore = () => {
       const order = memoryStore.orders.find((o) => o.id === orderId);
       if (!order) return;
 
+      // Governance rule: verified, invoiced, dispatched, or already cancelled orders cannot be cancelled
+      const isNonCancellable =
+        order.status === 'VERIFIED' ||
+        order.status === 'VERIFIED_BY_BILLING' ||
+        order.status === 'CONFIRMED' ||
+        order.status === 'INVOICED' ||
+        order.status === 'DISPATCHED' ||
+        order.status === 'DELIVERED' ||
+        order.status === 'PO_GENERATED' ||
+        order.status === 'PUNCHED_TO_PRINCIPAL' ||
+        order.status === 'CANCELLED' ||
+        Boolean(order.verified_at);
+
+      if (isNonCancellable) {
+        console.warn(`[GOVERNANCE] Cancellation blocked for order ${order.order_number}: Order is already in non-cancellable state (${order.status})`);
+        return;
+      }
+
       const now = new Date().toISOString();
       const retName = order.retailer_name_raw || 'Retail Outlet';
+      const canceller = memoryStore.users.find((u) => u.id === cancelledByUserId);
 
       const updatedOrder: Order = {
         ...order,
@@ -2857,6 +4113,20 @@ export const useAppStore = () => {
       };
 
       memoryStore.orders = memoryStore.orders.map((o) => (o.id === orderId ? updatedOrder : o));
+
+      // Immediately release reserved order value and restore remaining credit + log reversal in Firestore party_ledger
+      syncPartyCreditAndWriteLedger({
+        tenantId: updatedOrder.tenant_id,
+        partyId: updatedOrder.retailer_id,
+        partyName: updatedOrder.retailer_name_raw,
+        entryType: 'ORDER_CANCELLATION_REVERSAL',
+        order: updatedOrder,
+        debitAmount: 0,
+        creditAmount: order.total_amount,
+        notes: `BE Cancelled Order #${order.order_number}: ${reason} — reserved credit restored`,
+        actorUserId: cancelledByUserId,
+        actorName: canceller?.name || 'Billing Executive',
+      });
 
       // Push notification to Commission Agent's mobile app
       const cancelAlert: WorkflowNotification = {
@@ -2883,18 +4153,93 @@ export const useAppStore = () => {
       memoryStore.workflowNotifications = [cancelAlert, ...(memoryStore.workflowNotifications || [])];
       persist();
 
+      fetch(`/api/orders/${orderId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: 'CANCELLED',
+          cancelled_reason: reason,
+          is_locked: true,
+        }),
+      }).catch((err) => console.warn('[DB SYNC] Failed to persist order cancellation on server:', err));
+
       if (isFirebaseConfigured()) {
         saveRecordToFirestore(COLLECTIONS.ORDERS, orderId, updatedOrder);
       }
     },
 
-    deleteUser: (userId: string) => {
-      memoryStore.users = memoryStore.users.filter((u) => u.id !== userId);
+    deleteUser: async (userId: string): Promise<{ success: boolean; error?: string }> => {
+      if (!userId) {
+        return { success: false, error: 'Missing user ID for deletion.' };
+      }
+
+      if (memoryStore.currentUserId && userId === memoryStore.currentUserId) {
+        return { success: false, error: 'You cannot delete the currently signed-in admin account.' };
+      }
+
+      const previousUsers = [...memoryStore.users];
+      const previousDps = [...memoryStore.dispatchPoints];
+      const targetUser = previousUsers.find(
+        (u) => u.id === userId || u.firestore_doc_id === userId
+      );
+
+      // Optimistically remove matching user record(s) locally
+      memoryStore.users = previousUsers.filter(
+        (u) =>
+          u.id !== userId &&
+          (!targetUser?.firestore_doc_id || u.firestore_doc_id !== targetUser.firestore_doc_id)
+      );
+
+      let changedDispatchPoints: DispatchPoint[] = [];
+      if (targetUser && (targetUser.role === 'DISPATCHER' || targetUser.dispatch_point_id)) {
+        const dpSync = syncDispatchPointsForUsers(
+          memoryStore.dispatchPoints,
+          memoryStore.users,
+          [targetUser.dispatch_point_id]
+        );
+        memoryStore.dispatchPoints = dpSync.updatedDispatchPoints;
+        changedDispatchPoints = dpSync.changedDispatchPoints;
+      }
+
       persist();
 
-      if (isFirebaseConfigured()) {
-        deleteRecordFromFirestore(COLLECTIONS.USERS, userId);
+      // Persist removal to backend Express DB (which also deletes canonical doc from Firestore)
+      let backendError: string | null = null;
+      try {
+        const resp = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
+          method: 'DELETE',
+        });
+        if (!resp.ok) {
+          const payload = await resp.json().catch(() => ({}));
+          backendError = payload.error || `Backend responded with status ${resp.status}`;
+        }
+      } catch (err) {
+        console.warn('[DB SYNC] Backend user delete network error:', err);
       }
+
+      // Also ensure removal directly from Client Cloud Firestore SDK using canonical firestore_doc_id & userId
+      if (isFirebaseConfigured()) {
+        const fsRes = await deleteUserFromFirestore(userId, targetUser?.firestore_doc_id);
+        if (!fsRes.success) {
+          memoryStore.users = previousUsers;
+          memoryStore.dispatchPoints = previousDps;
+          persist();
+          return {
+            success: false,
+            error: fsRes.error || backendError || 'Failed to remove user from Cloud Firestore.',
+          };
+        }
+        changedDispatchPoints.forEach((dp) => {
+          saveRecordToFirestore(COLLECTIONS.DISPATCH_POINTS, dp.id, dp);
+        });
+      } else if (backendError) {
+        memoryStore.users = previousUsers;
+        memoryStore.dispatchPoints = previousDps;
+        persist();
+        return { success: false, error: backendError };
+      }
+
+      return { success: true };
     },
 
     // Reset store to clean state and re-sync from server DB
@@ -2916,6 +4261,7 @@ export const useAppStore = () => {
         invoices: [],
         claims: [],
         payments: [],
+        partyLedger: [],
         users: [],
         activeTenantId: 'tenant_ms_enterprises',
         activeRole: 'ADMIN',

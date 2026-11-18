@@ -174,15 +174,18 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
   const [retChannel, setRetChannel] = useState<'GT' | 'MT' | 'INSTITUTIONAL' | 'ECOMMERCE'>('GT');
   const [retLimit, setRetLimit] = useState(50000);
 
+  const availableBeatIdsKey = availableBeatsForOnboarding.map((b) => b.id).join('|');
   useEffect(() => {
     if (availableBeatsForOnboarding.length > 0) {
-      if (!availableBeatsForOnboarding.some((b) => b.id === retBeatId)) {
-        setRetBeatId(availableBeatsForOnboarding[0].id);
-      }
+      const firstId = availableBeatsForOnboarding[0].id;
+      setRetBeatId((prev) =>
+        availableBeatsForOnboarding.some((b) => b.id === prev) ? prev : firstId
+      );
     } else {
-      setRetBeatId('');
+      setRetBeatId((prev) => (prev === '' ? prev : ''));
     }
-  }, [availableBeatsForOnboarding, retBeatId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableBeatIdsKey]);
 
   const handleAddSku = (e: React.FormEvent) => {
     e.preventDefault();
@@ -238,7 +241,7 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
       below_cost_flag: Number(skuPtr) < Number(skuLanding),
       expected_claim_per_unit: expectedClaimPerUnit,
       pack_size: skuPack.trim() || '12 Packs/Case',
-      tax_rate: Number(skuGst) || 18,
+      tax_rate: Number.isFinite(Number(skuGst)) ? Number(skuGst) : 18,
       is_claim_eligible: skuIsClaimEligible,
       claim_scheme_id: skuIsClaimEligible ? (skuClaimSchemeId || null) : null,
       effective_from: skuIsClaimEligible ? skuEffectiveFrom : undefined,
@@ -339,7 +342,7 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
         s.landing_price,
         margin,
         s.below_cost_flag ? 'YES (Subsidized Scheme)' : 'NO',
-        s.tax_rate || 18
+        s.tax_rate !== undefined && s.tax_rate !== null ? s.tax_rate : 18
       ];
     });
 
@@ -384,7 +387,8 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
       const mrp = parseFloat(cleanCells[6]) || 100;
       const selling_price = parseFloat(cleanCells[7]) || 80;
       const landing_price = parseFloat(cleanCells[8]) || 65;
-      const tax_rate = parseFloat(cleanCells[9]) || 18;
+      const parsedTax = parseFloat(cleanCells[9]);
+      const tax_rate = !isNaN(parsedTax) ? parsedTax : 18;
 
       // Match company code against system companies
       const comp = companies.find(
@@ -1143,12 +1147,15 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
                           <td className="p-3 font-mono font-bold text-white">{s.code}</td>
                           <td className="p-3">
                             <div className="font-semibold text-white">{s.name}</div>
-                            <div className="text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
+                            <div className="text-[10px] text-slate-400 flex flex-wrap items-center gap-2 mt-0.5">
                               <span>{s.category || 'FMCG'}</span>
                               <span>•</span>
                               <span>Pack: {s.pack_size || 'Std'}</span>
                               <span>•</span>
-                              <span>HSN: {s.hsn_code || '1905'}</span>
+                              <span className="font-mono">HSN: {s.hsn_code || '1905'}</span>
+                              <span className="px-1.5 py-0.2 rounded bg-blue-500/15 text-blue-300 border border-blue-500/30 font-mono font-bold">
+                                GST: {s.tax_rate !== undefined && s.tax_rate !== null ? s.tax_rate : 18}%
+                              </span>
                             </div>
                           </td>
                           <td className="p-3 text-right font-mono font-bold text-slate-200">₹{s.mrp.toFixed(2)}</td>
@@ -1446,7 +1453,7 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 <div>
                   <label className="block font-bold text-slate-400 mb-1">Category</label>
                   <input
@@ -1464,6 +1471,20 @@ export const SetupView: React.FC<SetupViewProps> = ({ onOpenOnboarding, onOpenSe
                     onChange={(e) => setEditingSku({ ...editingSku, hsn_code: e.target.value })}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white font-mono"
                   />
+                </div>
+                <div>
+                  <label className="block font-bold text-slate-400 mb-1">GST Rate %</label>
+                  <select
+                    value={editingSku.tax_rate !== undefined && editingSku.tax_rate !== null ? editingSku.tax_rate : 18}
+                    onChange={(e) => setEditingSku({ ...editingSku, tax_rate: Number(e.target.value) })}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white font-mono"
+                  >
+                    <option value={0}>0% (Exempt)</option>
+                    <option value={5}>5% GST</option>
+                    <option value={12}>12% GST</option>
+                    <option value={18}>18% GST</option>
+                    <option value={28}>28% GST</option>
+                  </select>
                 </div>
               </div>
 

@@ -30,6 +30,7 @@ export const CompanySKUAccessMatrix: React.FC<CompanySKUAccessMatrixProps> = ({ 
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [showNotification, setShowNotification] = useState<string | null>(null);
   const [quickGrantCompanyId, setQuickGrantCompanyId] = useState<string>('');
+  const [isConfirmRevokeModalOpen, setIsConfirmRevokeModalOpen] = useState(false);
 
   // Admins & Sub-Admins have editing privilege
   const isAuthorized = currentUser?.role === 'ADMIN' || (currentUser?.role as string) === 'SUB_ADMIN';
@@ -177,11 +178,18 @@ export const CompanySKUAccessMatrix: React.FC<CompanySKUAccessMatrixProps> = ({ 
 
   const handleBulkRevokeAll = () => {
     if (selectedUserIds.length === 0) return;
-    if (!window.confirm(`Apply Zero-Trust Lock (0 Companies) to all ${selectedUserIds.length} selected agents? They will not be able to book orders until re-assigned.`)) return;
+    setIsConfirmRevokeModalOpen(true);
+  };
 
+  const handleConfirmBulkRevokeAll = () => {
+    if (selectedUserIds.length === 0) {
+      setIsConfirmRevokeModalOpen(false);
+      return;
+    }
     const updates = selectedUserIds.map((uid) => ({ userId: uid, companyIds: [] }));
     bulkUpdateUserCompanyScopes(updates);
     triggerToast(`Zero-Trust Lock applied to ${selectedUserIds.length} agents.`);
+    setIsConfirmRevokeModalOpen(false);
   };
 
   const handleBulkGrantAllCompanies = () => {
@@ -647,6 +655,39 @@ export const CompanySKUAccessMatrix: React.FC<CompanySKUAccessMatrixProps> = ({ 
           Showing {fieldUsers.length} of {users.length} total users across {companies.length} Principal Companies.
         </div>
       </div>
+
+      {/* In-App Confirmation Modal for Bulk Zero-Trust Lock */}
+      {isConfirmRevokeModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center gap-2.5 text-rose-400 border-b border-slate-800 pb-3">
+              <Lock className="w-5 h-5 shrink-0" />
+              <h3 className="font-bold text-sm text-white">Confirm Zero-Trust Access Lock</h3>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Apply Zero-Trust Lock (0 Principal Companies) to all{' '}
+              <strong className="text-white">{selectedUserIds.length}</strong> selected field user(s)? They will not be able to view or book orders in the mobile app until re-assigned.
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setIsConfirmRevokeModalOpen(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmBulkRevokeAll}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                Apply Zero-Trust Lock
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

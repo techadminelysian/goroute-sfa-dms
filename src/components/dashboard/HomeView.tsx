@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '../../data/store';
 import { Order, OrderInvoicingType } from '../../types';
-import { isOrderAssignedToBE, getOrderFinancialSummary } from '../../utils/caRoutingLogic';
+import { isOrderAssignedToBE, isOrderUnassignedToAnyBE, getOrderFinancialSummary } from '../../utils/caRoutingLogic';
+import { buildPartyCreditRecords, resolveOrderCreditExposure } from '../../utils/creditLedger';
 import { isOnboardingAuthorized } from '../../utils/authClient';
 import { KPICard } from '../common/KPICard';
 import { BEDistributorOnboardingModal } from '../common/BEDistributorOnboardingModal';
@@ -54,9 +55,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
     claims = [],
     skus = [],
     retailers = [],
+    distributors = [],
     stockLedger = [],
     dispatchPoints = [],
     companies = [],
+    payments = [],
     users = [],
     currentUser,
     updateOrderStatus,
@@ -71,6 +74,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
   const [isBEOnboardOpen, setIsBEOnboardOpen] = useState(false);
   const [isBEPunchOpen, setIsBEPunchOpen] = useState(false);
   const [selectedBEClientId, setSelectedBEClientId] = useState<string | undefined>(undefined);
+  const [homeBanner, setHomeBanner] = useState<{ type: 'success' | 'info'; message: string } | null>(null);
 
   // Strict access gate: Tenant Setup is restricted to Yash Sharma
   const isYashSharma = isOnboardingAuthorized(currentUser);
@@ -104,16 +108,30 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
   const pendingOrders = safeOrders.filter((o) => o.status === 'PUNCHED' || o.status === 'APPROVED');
   const flaggedOrders = safeOrders.filter((o) => o.has_below_cost_lines);
 
+  const creditThreshold = activeTenantSettings?.credit_limit_default ?? 50000;
+  const partyCreditRecords = useMemo(
+    () =>
+      buildPartyCreditRecords({
+        retailers: safeRetailers,
+        distributors,
+        users,
+        orders: safeOrders,
+        invoices: safeInvoices,
+        payments,
+        defaultCreditLimit: creditThreshold,
+      }),
+    [safeRetailers, distributors, users, safeOrders, safeInvoices, payments, creditThreshold]
+  );
+
   const totalInvoicedValue = safeInvoices.reduce((sum, i) => sum + (i.total_amount || 0), 0);
   const totalCollectedValue = safeInvoices.reduce((sum, i) => sum + (i.paid_amount || 0), 0);
-  const totalOutstandingValue = safeRetailers.reduce((sum, r) => sum + (r.current_outstanding || 0), 0);
+  const totalOutstandingValue = partyCreditRecords.reduce((sum, p) => sum + (p.total_liability || 0), 0);
 
   const totalClaimsVal = safeClaims.reduce((s, c) => s + (c.claim_amount || 0), 0);
   const leakageFlaggedCount = safeClaims.filter((c) => c.is_leakage_flagged).length;
 
-  const creditThreshold = activeTenantSettings?.credit_limit_default ?? 50000;
-  const overLimitRetailers = safeRetailers.filter(
-    (r) => r.current_outstanding > r.credit_limit || r.current_outstanding > creditThreshold
+  const overLimitRetailers = partyCreditRecords.filter(
+    (p) => p.fund_shortage > 0 || p.total_liability > p.credit_limit || p.total_liability > creditThreshold
   );
 
   // ---------------------------------------------------------------------------
@@ -315,6 +333,77 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             </div>
           </div>
         </div>
+
+        {/* Admin Exception Queue: Unassigned / Unmapped Orders */}
+        {(() => {
+          const unassignedOrders = safeOrders.filter(
+            (o) => o.status !== 'CANCELLED' && isOrderUnassignedToAnyBE(o, users, distributors)
+          );
+          const activeBEs = users.filter((u) => u.role === 'BILLING' && u.is_active !== false);
+          return (
+            <div className="bg-slate-900 border border-amber-500/30 rounded-2xl p-4 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                <div>
+                  <h2 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                    <AlertTriangle size={15} className="text-amber-400" />
+                    Unassigned BE Mapping Exception Queue ({unassignedOrders.length})
+                  </h2>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Orders without a mapped Billing Executive are isolated here instead of leaking to a default BE desk.
+                  </p>
+                </div>
+                <button
+                  onClick={() => onNavigate('billing')}
+                  className="text-[11px] font-semibold text-amber-400 hover:underline"
+                >
+                  Open BE Verification Console →
+                </button>
+              </div>
+
+              {unassignedOrders.length === 0 ? (
+                <div className="p-4 text-center text-xs text-slate-500 bg-slate-950 rounded-xl border border-slate-800">
+                  All incoming orders are cleanly mapped to an active Billing Executive.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
+                  {unassignedOrders.map((ord) => (
+                    <div
+                      key={ord.id}
+                      className="p-3 bg-slate-950 border border-amber-500/30 rounded-xl flex flex-wrap items-center justify-between gap-2"
+                    >
+                      <div>
+                        <div className="font-mono font-bold text-white flex items-center gap-2">
+                          {ord.order_number}
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-sans">
+                            {ord.channel}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-400 mt-0.5">
+                          {ord.retailer_name_raw} | Raiser: {ord.order_raiser_name || ord.commission_agent_name || 'Unmapped'} | ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                      <select
+                        defaultValue=""
+                        onChange={(e) => {
+                          if (!e.target.value) return;
+                          updateOrder(ord.id, { billing_executive_id: e.target.value });
+                        }}
+                        className="bg-slate-900 border border-amber-500/50 rounded-lg px-2.5 py-1.5 text-xs text-white font-semibold cursor-pointer"
+                      >
+                        <option value="">Assign BE Desk...</option>
+                        {activeBEs.map((be) => (
+                          <option key={be.id} value={be.id}>
+                            {be.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
     );
   }
@@ -335,23 +424,26 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
       billingExecutives[0];
 
     const effectiveCurrentBEId = currentBEUser?.id || 'usr_billing_1';
-    const currentBEName = currentBEUser?.name || 'Priya Verma (BE-1)';
+    const currentBEName = currentBEUser?.name || 'Unassigned BE';
 
     // Commission Agents assigned to this Billing Executive
     const assignedCAs = users.filter(
       (u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === effectiveCurrentBEId
     );
 
-    // Filter orders strictly to those taken by this BE's assigned Commission Agents or tagged to this BE
+    // Filter orders to those taken by this BE's assigned raisers (CFS, SE, Distributors) or tagged to this BE
     const beQueueOrders = safeOrders.filter((o) =>
-      isOrderAssignedToBE(o, effectiveCurrentBEId, users)
+      isOrderAssignedToBE(o, effectiveCurrentBEId, users, distributors)
     );
 
-    const pendingVerificationOrders = beQueueOrders.filter(
-      (o) => o.status === 'PENDING_VERIFICATION' || o.status === 'PUNCHED' || o.status === 'FLAGGED'
-    );
+    const postVerifiedStatuses = ['VERIFIED', 'VERIFIED_BY_BILLING', 'CONFIRMED', 'APPROVED', 'PO_GENERATED', 'PUNCHED_TO_PRINCIPAL', 'PRINCIPAL_DISPATCHED'];
+    const pendingVerificationOrders = beQueueOrders.filter((o) => {
+      const isVerified = postVerifiedStatuses.includes(o.status) || Boolean(o.verified_at);
+      const isTerminated = ['CANCELLED', 'INVOICED', 'DISPATCHED', 'DELIVERED'].includes(o.status);
+      return !isVerified && !isTerminated;
+    });
     const readyToInvoiceOrders = beQueueOrders.filter(
-      (o) => o.status === 'APPROVED' || o.status === 'DISPATCHED' || o.status === 'VERIFIED_BY_BILLING' || o.status === 'VERIFIED'
+      (o) => o.status === 'CONFIRMED' || o.status === 'APPROVED' || o.status === 'DISPATCHED' || o.status === 'PUNCHED_TO_PRINCIPAL'
     );
 
     const directBEOrders = safeOrders.filter(
@@ -366,7 +458,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
     const beInvoices = safeInvoices.filter((inv) => {
       const relatedOrder = safeOrders.find((o) => o.id === inv.order_id);
       if (relatedOrder) {
-        return isOrderAssignedToBE(relatedOrder, effectiveCurrentBEId, users);
+        return isOrderAssignedToBE(relatedOrder, effectiveCurrentBEId, users, distributors);
       }
       return true;
     });
@@ -374,6 +466,21 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
     return (
       <div className="space-y-6">
+        {homeBanner && (
+          <div className="p-3 bg-emerald-950/50 border border-emerald-500/40 rounded-xl flex items-center justify-between gap-3 text-xs text-emerald-200">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 size={15} className="text-emerald-400 shrink-0" />
+              <span>{homeBanner.message}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setHomeBanner(null)}
+              className="text-emerald-300 hover:text-white px-2 py-0.5 rounded text-[11px] font-semibold"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {/* Billing Executive Desk Header */}
         <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
           <div>
@@ -596,12 +703,12 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                 <h2 className="text-xs font-bold text-white uppercase tracking-wider">
                   Distributors & Institutions Direct Orders ({directBEOrders.length} Orders Placed)
                 </h2>
-                <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950 text-emerald-300 border border-emerald-800/60">
-                  Auto-Verified • Direct BE Scope
+                <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-950 text-purple-300 border border-purple-800/60">
+                  Universal BE Queue • Verification Required
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 mt-0.5">
-                B2B institutional and distributor orders punched directly by Billing Executives with custom rates. Bypasses CA verification queue directly to billing.
+                B2B institutional and distributor orders punched directly with custom rates. All orders enter the Billing Executive verification queue for audit review.
               </p>
             </div>
 
@@ -669,12 +776,18 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                     <span className="font-mono font-bold text-emerald-400 text-sm">
                       ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                     </span>
-                    <button
-                      onClick={() => onNavigate('billing')}
-                      className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors cursor-pointer"
-                    >
-                      Generate Invoice
-                    </button>
+                    {['CONFIRMED', 'APPROVED', 'DISPATCHED', 'PUNCHED_TO_PRINCIPAL', 'INVOICED', 'DELIVERED'].includes(ord.status) ? (
+                      <button
+                        onClick={() => onNavigate('billing')}
+                        className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors cursor-pointer"
+                      >
+                        Generate Invoice
+                      </button>
+                    ) : (
+                      <span className="px-2 py-1 rounded bg-slate-800 text-amber-300 border border-amber-500/30 text-[10px] font-semibold">
+                        {ord.status === 'VERIFIED' || ord.status === 'VERIFIED_BY_BILLING' ? 'Awaiting Principal PO / Stock' : 'Pending BE Verification'}
+                      </span>
+                    )}
                   </div>
                 </div>
               ))}
@@ -736,15 +849,24 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                     agentObj?.name ||
                     'Commission Agent';
 
-                  const financialSummary = getOrderFinancialSummary(selectedOrderForReview);
-                  const creditLimit =
-                    retailerObj?.credit_limit ||
-                    activeTenantSettings?.credit_limit_default ||
-                    50000;
-                  const currentOutstanding = retailerObj?.current_outstanding || 0;
-                  const projectedTotal =
-                    currentOutstanding + financialSummary.totalAmountWithGst;
-                  const isOverCredit = projectedTotal > creditLimit;
+                  const financialSummary = getOrderFinancialSummary(selectedOrderForReview, safeSkus);
+                  const creditExposure = resolveOrderCreditExposure({
+                    order: selectedOrderForReview,
+                    overrideOrderValue: financialSummary.totalAmountWithGst,
+                    retailers: safeRetailers,
+                    distributors,
+                    users,
+                    orders: safeOrders,
+                    invoices: safeInvoices,
+                    payments,
+                    defaultCreditLimit: creditThreshold,
+                  });
+                  const creditLimit = creditExposure.creditLimit;
+                  const priorUnpaidOrders = creditExposure.priorUnpaidOrders;
+                  const projectedTotal = creditExposure.totalLiability;
+                  const remainingCredit = creditExposure.remainingCredit;
+                  const fundShortage = creditExposure.fundShortage;
+                  const isOverCredit = creditExposure.isExceeded;
 
                   const hasBelowCost =
                     selectedOrderForReview.has_below_cost_lines ||
@@ -830,7 +952,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                         </div>
                       </div>
 
-                      {/* Retailer Credit Health & Exposure */}
+                      {/* Party Credit Health & Over-Limit Liability */}
                       <div
                         className={`p-3 rounded-xl border flex flex-wrap items-center justify-between gap-3 ${
                           isOverCredit
@@ -845,16 +967,26 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                           />
                           <div>
                             <span className="text-[10px] text-slate-400 font-semibold uppercase block">
-                              Retailer Credit Exposure
+                              Party Credit Exposure (Live Ledger)
                             </span>
-                            <div className="text-xs text-slate-300">
-                              Outstanding:{' '}
-                              <span className="font-mono font-bold text-amber-400">
-                                ₹{(currentOutstanding || 0).toLocaleString('en-IN')}
-                              </span>{' '}
-                              /{' '}Limit:{' '}
-                              <span className="font-mono font-semibold text-slate-400">
-                                ₹{(creditLimit || 0).toLocaleString('en-IN')}
+                            <div className="text-xs text-slate-300 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                              <span>
+                                Prior Unpaid:{' '}
+                                <span className="font-mono font-bold text-amber-400">
+                                  ₹{priorUnpaidOrders.toLocaleString('en-IN')}
+                                </span>
+                              </span>
+                              <span>
+                                Limit:{' '}
+                                <span className="font-mono font-semibold text-slate-300">
+                                  ₹{creditLimit.toLocaleString('en-IN')}
+                                </span>
+                              </span>
+                              <span>
+                                Remaining:{' '}
+                                <span className={`font-mono font-bold ${remainingCredit <= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                                  ₹{remainingCredit.toLocaleString('en-IN')}
+                                </span>
                               </span>
                             </div>
                           </div>
@@ -862,15 +994,17 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
                         <div className="text-right">
                           <span className="text-[10px] text-slate-400 block">
-                            Post-Order Exposure
+                            Total Liability {fundShortage > 0 ? '& Fund Shortage' : ''}
                           </span>
                           <span
                             className={`font-mono font-bold text-xs ${
                               isOverCredit ? 'text-rose-400' : 'text-emerald-400'
                             }`}
                           >
-                            ₹{(projectedTotal || 0).toLocaleString('en-IN')}{' '}
-                            {isOverCredit ? '(Exceeds Limit)' : '(Within Limit)'}
+                            ₹{projectedTotal.toLocaleString('en-IN')}{' '}
+                            {fundShortage > 0
+                              ? `(Shortage: ₹${fundShortage.toLocaleString('en-IN')})`
+                              : '(Within Limit)'}
                           </span>
                         </div>
                       </div>
@@ -921,6 +1055,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                             <tbody className="divide-y divide-slate-800/60">
                               {(selectedOrderForReview.lines || []).map((line, idx) => {
                                 const skuObj = safeSkus.find((s) => s.id === line.sku_id);
+                                const taxRate = skuObj?.tax_rate !== undefined ? Number(skuObj.tax_rate) : 18;
                                 const compObj = companies.find(
                                   (c) =>
                                     c.id === line.company_id ||
@@ -938,8 +1073,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                                     }`}
                                   >
                                     <td className="p-2.5">
-                                      <div className="font-semibold text-white">
-                                        {line.sku_name || skuObj?.name || line.sku_id}
+                                      <div className="font-semibold text-white flex items-center gap-1.5 flex-wrap">
+                                        <span>{line.sku_name || skuObj?.name || line.sku_id}</span>
+                                        <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono font-bold text-[9px]">
+                                          GST {taxRate}%
+                                        </span>
                                       </div>
                                       <div className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-0.5">
                                         {compObj && (
@@ -1029,7 +1167,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                               Registered GST
                             </div>
                             <div className="text-[10px] text-slate-400 mt-1">
-                              Official B2B Tax Invoice with item-level 18% GST tax credit pass-through.
+                              Official B2B Tax Invoice with item-level GST tax credit pass-through.
                             </div>
                           </button>
                         </div>
@@ -1049,7 +1187,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                         </div>
                         <div className="flex justify-between text-slate-400 text-xs">
                           <span className="flex items-center gap-1.5">
-                            <span>Applicable GST (18%):</span>
+                            <span>Applicable GST (Itemized):</span>
                             <span className="text-[10px] text-amber-400 bg-amber-950/40 border border-amber-800/60 px-1.5 py-0.5 rounded font-semibold">
                               FMCG Tax
                             </span>
@@ -1113,22 +1251,22 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                   <button
                     type="button"
                     onClick={() => {
-                      const fin = getOrderFinancialSummary(selectedOrderForReview);
-                      const retailerObj = safeRetailers.find(
-                        (r) =>
-                          r.id === selectedOrderForReview.retailer_id ||
-                          r.name.toLowerCase() === selectedOrderForReview.retailer_name_raw.toLowerCase()
-                      );
-                      const creditLimit =
-                        retailerObj?.credit_limit ||
-                        activeTenantSettings?.credit_limit_default ||
-                        50000;
-                      const currentOutstanding = retailerObj?.current_outstanding || 0;
-                      const projectedTotal = currentOutstanding + fin.totalAmountWithGst;
-                      const isOverCredit = projectedTotal > creditLimit;
+                      const fin = getOrderFinancialSummary(selectedOrderForReview, safeSkus);
+                      const exposure = resolveOrderCreditExposure({
+                        order: selectedOrderForReview,
+                        overrideOrderValue: fin.totalAmountWithGst,
+                        retailers: safeRetailers,
+                        distributors,
+                        users,
+                        orders: safeOrders,
+                        invoices: safeInvoices,
+                        payments,
+                        defaultCreditLimit: creditThreshold,
+                      });
+                      const isOverCredit = exposure.isExceeded;
 
                       const reason = isOverCredit
-                        ? `Billing Executive Authorized: Credit variance approved under direct B2B terms (${homeReviewInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'}).`
+                        ? `Billing Executive Authorized: Credit variance (Fund Shortage ₹${exposure.fundShortage.toLocaleString('en-IN')}) approved under B2B terms (${homeReviewInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'}).`
                         : `Verified & Approved by Billing Executive (${homeReviewInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'})`;
 
                       // Uniform backend logic & status with Billing Verification Queue
@@ -1140,9 +1278,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                         homeReviewInvoicingType
                       );
 
-                      alert(
-                        `Order ${selectedOrderForReview.order_number} successfully verified and approved by Billing Executive!\n\n• Classification: ${homeReviewInvoicingType === 'REGISTERED_GST' ? 'Registered GST (B2B Tax Invoice)' : 'Unregistered Cash (Commercial Bill)'}\n• Final Order Value: ₹${fin.totalAmountWithGst.toLocaleString('en-IN', { minimumFractionDigits: 2 })} (GST Included)\n• Status updated to VERIFIED & locked\n• Commission Agent can now deliver to ${selectedOrderForReview.retailer_name_raw}\n• Order moved to Ready to Invoice Queue`
-                      );
+                      setHomeBanner({
+                        type: 'success',
+                        message: `Order ${selectedOrderForReview.order_number} verified (${homeReviewInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'}) for ₹${fin.totalAmountWithGst.toLocaleString('en-IN', { minimumFractionDigits: 2 })} and queued for PO / Depot Stock confirmation.`,
+                      });
                       setSelectedOrderForReview(null);
                     }}
                     className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs flex items-center gap-2 shadow-lg shadow-emerald-950/40 transition-all transform active:scale-95"
@@ -1276,16 +1415,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
 
                   <div className="flex items-center gap-2">
                     <button
-                      onClick={() => updateOrderStatus(ord.id, 'APPROVED')}
+                      onClick={() => onNavigate('billing')}
                       className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
                     >
-                      Approve Order
-                    </button>
-                    <button
-                      onClick={() => updateOrderStatus(ord.id, 'CANCELLED')}
-                      className="px-3 py-1.5 rounded bg-rose-600/30 text-rose-300 border border-rose-500/40 hover:bg-rose-600/50 text-xs font-bold"
-                    >
-                      Reject
+                      Verify in Billing Queue
                     </button>
                   </div>
                 </div>
@@ -1468,6 +1601,18 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
   // ---------------------------------------------------------------------------
   return (
     <div className="max-w-md mx-auto space-y-4 text-xs">
+      {homeBanner && (
+        <div className="p-3 bg-emerald-950/50 border border-emerald-500/40 rounded-xl flex items-center justify-between gap-2 text-xs text-emerald-200">
+          <span>{homeBanner.message}</span>
+          <button
+            type="button"
+            onClick={() => setHomeBanner(null)}
+            className="text-emerald-300 hover:text-white font-semibold"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* Primary Action Hero Header */}
       <div className="p-4 bg-gradient-to-br from-blue-900/80 to-slate-900 border border-blue-500/40 rounded-3xl text-center space-y-3 shadow-xl">
         <span className="text-[10px] font-bold text-blue-300 uppercase tracking-wider bg-blue-500/20 px-3 py-1 rounded-full border border-blue-500/30">
@@ -1505,14 +1650,17 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
         <div className="space-y-2">
           {orders.map((ord, idx) => {
             const isDelivered = ord.status === 'DELIVERED';
-            const isPendingVerification = ord.status === 'PENDING_VERIFICATION' || ord.status === 'PUNCHED';
+            const isPendingVerification =
+              ord.status === 'PENDING_VERIFICATION' ||
+              ord.status === 'PUNCHED' ||
+              ord.status === 'CLEARED' ||
+              ord.status === 'FLAGGED';
             const isVerified = [
               'VERIFIED',
               'VERIFIED_BY_BILLING',
               'APPROVED',
               'DISPATCHED',
               'PUNCHED_TO_PRINCIPAL',
-              'CLEARED'
             ].includes(ord.status);
 
             return (
@@ -1545,7 +1693,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                     <button
                       onClick={() => {
                         updateOrderStatus(ord.id, 'DELIVERED');
-                        alert(`Order ${ord.order_number} marked as DELIVERED!\nRetailer outstanding balance updated.`);
+                        setHomeBanner({
+                          type: 'success',
+                          message: `Order ${ord.order_number} marked as DELIVERED and Party Ledger synced.`,
+                        });
                       }}
                       className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] rounded-lg shadow-sm flex items-center gap-1 transition-all"
                       title="Click to mark order delivered to store"

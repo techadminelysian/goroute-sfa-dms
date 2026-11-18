@@ -2,6 +2,18 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { useAppStore } from '../../data/store';
 import { Company, SKU, Retailer, DistributorInstitution, Order, OrderLine, OrderInvoicingType } from '../../types';
 import {
+  getAllowedCompaniesForUser,
+  getAllowedSkusForUser,
+  isFieldScopedRole,
+  isFieldUserAccessLocked
+} from '../../utils/caRoutingLogic';
+import {
+  getDispatchPickupBreakdown,
+  resolveDispatchPointIdForCompany,
+  SplitDispatchBreakdown
+} from '../../utils/dispatchRouting';
+import { resolveOrderCreditExposure } from '../../utils/creditLedger';
+import {
   Building2,
   X,
   CheckCircle2,
@@ -48,12 +60,16 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
 }) => {
   const {
     activeTenant,
+    activeTenantSettings,
     companies,
     skus,
     retailers,
     distributors,
+    users = [],
     dispatchPoints,
     orders,
+    invoices = [],
+    payments = [],
     currentUser,
     addOrder,
     activeRole
@@ -97,18 +113,37 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
     Record<string, { slab_name: string; discount_percent: number | string }>
   >({});
 
+  const isFieldUser = isFieldScopedRole(currentUser?.role);
+  const allowedCompanies = useMemo(() => {
+    const tid = activeTenant?.id || 'tenant_ms_enterprises';
+    const tenantScoped = (companies || []).filter((c) => !c.tenant_id || c.tenant_id === tid);
+    return getAllowedCompaniesForUser(currentUser, tenantScoped);
+  }, [companies, activeTenant, currentUser]);
+
+  const allowedCompanyIds = useMemo(() => new Set(allowedCompanies.map((c) => c.id)), [allowedCompanies]);
+
+  const accessibleSkus = useMemo(() => {
+    return getAllowedSkusForUser(currentUser, allowedCompanies, skus);
+  }, [currentUser, allowedCompanies, skus]);
+
+  const isDistributorAccessLocked = useMemo(() => {
+    return isFieldUserAccessLocked(currentUser);
+  }, [currentUser]);
+
   // Line items
   const [draftLines, setDraftLines] = useState<DraftLine[]>(() => {
-    const firstSku = skus[0];
-    return [
-      {
-        id: `line_${Date.now()}_1`,
-        sku_id: firstSku?.id || '',
-        quantity: 50,
-        unit_price: firstSku?.selling_price || 0,
-        discount_percentage: 0,
-      },
-    ];
+    const firstSku = accessibleSkus[0];
+    return firstSku
+      ? [
+          {
+            id: `line_${Date.now()}_1`,
+            sku_id: firstSku.id,
+            quantity: 50,
+            unit_price: firstSku.selling_price || 0,
+            discount_percentage: 0,
+          },
+        ]
+      : [];
   });
 
   // Principal Company filter & SKU Search
@@ -124,11 +159,15 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
 
   // Submission result
   const [submittedOrder, setSubmittedOrder] = useState<Order | null>(null);
+  const [submittedSplitOrders, setSubmittedSplitOrders] = useState<Order[]>([]);
+  const [submittedPickups, setSubmittedPickups] = useState<SplitDispatchBreakdown[]>([]);
 
   // Reset all modal state whenever the modal opens so stale completion cards never show
   useEffect(() => {
     if (isOpen) {
       setSubmittedOrder(null);
+      setSubmittedSplitOrders([]);
+      setSubmittedPickups([]);
       setUiError(null);
       setOrderNotes('');
       setOrderReference('');
@@ -141,7 +180,7 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
       } else if (directClients.length > 0) {
         setSelectedClientId(directClients[0].id);
       }
-      const firstSku = skus[0];
+      const firstSku = accessibleSkus[0];
       setDraftLines(
         firstSku
           ? [
@@ -162,6 +201,8 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
   // Clean close handler that resets state
   const handleModalClose = () => {
     setSubmittedOrder(null);
+    setSubmittedSplitOrders([]);
+    setSubmittedPickups([]);
     setUiError(null);
     onClose();
   };
@@ -177,13 +218,12 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
   }, [directClients, selectedClientId]);
 
   // Auto-set Invoicing Type based on client GSTIN registration
+  const selectedClientIdForSync = selectedClient?.id || '';
+  const selectedClientGstin = selectedClient?.gstin || '';
   useEffect(() => {
-    if (selectedClient?.gstin) {
-      setOrderInvoicingType('REGISTERED_GST');
-    } else {
-      setOrderInvoicingType('UNREGISTERED_CASH');
-    }
-  }, [selectedClient]);
+    const nextType: OrderInvoicingType = selectedClientGstin ? 'REGISTERED_GST' : 'UNREGISTERED_CASH';
+    setOrderInvoicingType((prev) => (prev === nextType ? prev : nextType));
+  }, [selectedClientIdForSync, selectedClientGstin]);
 
   // Set default dispatch point if client has one (stabilized via primitive id)
   const clientDispatchPointId = selectedClient?.dispatch_point_id;
@@ -207,24 +247,6 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
     });
     return Array.from(compMap.values());
   }, [draftLines, skus, companies]);
-
-  const isFieldUser = currentUser?.role === 'DISTRIBUTOR' || currentUser?.role === 'SALES_EXECUTIVE' || currentUser?.role === 'COMMISSION_AGENT';
-  const allowedCompanies = useMemo(() => {
-    const tid = activeTenant?.id || 'tenant_ms_enterprises';
-    const all = (companies || []).filter((c) => !c.tenant_id || c.tenant_id === tid);
-    if (!isFieldUser) return all;
-    const scope = currentUser?.company_scope || [];
-    return all.filter((c) => scope.includes(c.id));
-  }, [companies, activeTenant, currentUser, isFieldUser]);
-
-  const allowedCompanyIds = useMemo(() => new Set(allowedCompanies.map((c) => c.id)), [allowedCompanies]);
-
-  const accessibleSkus = useMemo(() => {
-    if (!isFieldUser) return skus;
-    return skus.filter((s) => allowedCompanyIds.has(s.company_id));
-  }, [skus, allowedCompanyIds, isFieldUser]);
-
-  const isDistributorAccessLocked = isFieldUser && (!currentUser?.company_scope || currentUser.company_scope.length === 0);
 
   const tenantCompanies = allowedCompanies;
 
@@ -250,9 +272,9 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
   // Add a new product line using the next available SKU from catalog
   const handleAddProductLine = () => {
     const addedSkuIds = new Set(draftLines.map((l) => l.sku_id));
-    const nextSku = filteredSkus.find((s) => !addedSkuIds.has(s.id)) || filteredSkus[0] || skus[0];
+    const nextSku = filteredSkus.find((s) => !addedSkuIds.has(s.id)) || filteredSkus[0] || accessibleSkus[0];
     if (!nextSku) {
-      setUiError('No products available under the selected Principal Company filter.');
+      setUiError('No authorized products available under the selected Principal Company filter.');
       return;
     }
 
@@ -261,8 +283,11 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
 
   // Change SKU on a specific row
   const handleLineSkuChange = (lineId: string, newSkuId: string) => {
-    const targetSku = skus.find((s) => s.id === newSkuId);
-    if (!targetSku) return;
+    const targetSku = accessibleSkus.find((s) => s.id === newSkuId);
+    if (!targetSku) {
+      setUiError('Selected SKU is not authorized under your Principal Company access scope.');
+      return;
+    }
 
     const companySlab = companyDiscountSlabs[targetSku.company_id];
     const defaultDisc = companySlab ? companySlab.discount_percent : 0;
@@ -386,16 +411,54 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
   const estimatedTax = subtotalAfterDiscounts * 0.18; // Standard 18% GST estimate
   const finalGrandTotal = subtotalAfterDiscounts + estimatedTax;
 
-  // Credit Limit Check
-  const creditLimit = selectedClient?.credit_limit || 0;
-  const currentOutstanding = selectedClient?.current_outstanding || 0;
-  const projectedExposure = currentOutstanding + finalGrandTotal;
-  const isCreditExceeded = creditLimit > 0 && projectedExposure > creditLimit;
-  const creditVariance = projectedExposure - creditLimit;
+  // Real-time Credit Limit, Total Liability, Remaining Credit & Fund Shortage Check
+  const liveExposure = useMemo(() => {
+    return resolveOrderCreditExposure({
+      order: {
+        id: '__draft_be_order__',
+        retailer_id: selectedClient?.id,
+        retailer_name_raw: selectedClient?.name || '',
+        created_by_user_id: currentUser?.id,
+        channel: (selectedClient?.channel as any) || 'DISTRIBUTOR',
+        order_source_role: 'DISTRIBUTOR',
+        total_amount: Math.round(finalGrandTotal),
+        status: 'PENDING_VERIFICATION',
+      },
+      retailers,
+      distributors,
+      users,
+      orders,
+      invoices,
+      payments,
+      defaultCreditLimit: activeTenantSettings?.credit_limit_default,
+    });
+  }, [
+    selectedClient,
+    currentUser?.id,
+    finalGrandTotal,
+    retailers,
+    distributors,
+    users,
+    orders,
+    invoices,
+    payments,
+    activeTenantSettings?.credit_limit_default,
+  ]);
+
+  const creditLimit = liveExposure.creditLimit;
+  const currentOutstanding = liveExposure.priorUnpaidOrders;
+  const projectedExposure = liveExposure.totalLiability;
+  const remainingCredit = liveExposure.remainingCredit;
+  const creditVariance = liveExposure.fundShortage;
+  const isCreditExceeded = liveExposure.isExceeded;
 
   if (!isOpen) return null;
 
   const handleGenerateOrder = () => {
+    if (isDistributorAccessLocked || allowedCompanies.length === 0) {
+      setUiError('Zero-Trust Security: No Principal Companies are assigned to your profile.');
+      return;
+    }
     if (!selectedClient) {
       setUiError('Please select or onboard a Distributor or Institution first.');
       return;
@@ -403,6 +466,13 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
     if (draftLines.length === 0) {
       setUiError('Cannot generate order: Please add at least one product SKU to the order.');
       return;
+    }
+    if (isFieldUser) {
+      const hasUnauthorized = draftLines.some((l) => !accessibleSkus.some((s) => s.id === l.sku_id));
+      if (hasUnauthorized) {
+        setUiError('Order Blocked: One or more selected products belong to an unauthorized Principal Company.');
+        return;
+      }
     }
     const totalQty = draftLines.reduce((sum, l) => sum + (Number(l.quantity) || 0), 0);
     if (totalQty <= 0) {
@@ -457,18 +527,24 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
       }
     });
 
-    // DIRECT VERIFIED STATUS: 'VERIFIED_BY_BILLING'
+    const firstCompanyId = allCompanyIds[0] || primaryCompanyId;
+    const defaultResolvedDp = resolveDispatchPointIdForCompany(
+      firstCompanyId,
+      companies,
+      selectedDispatchPointId || selectedClient.dispatch_point_id || dispatchPoints[0]?.id || 'dp_central'
+    );
+
     const newOrder: Order = {
       id: `ord_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       tenant_id: tenantId,
       order_number: orderNumber,
       channel: (selectedClient.channel as any) || 'DISTRIBUTOR',
-      company_id: primaryCompanyId,
+      company_id: allCompanyIds.length === 1 ? allCompanyIds[0] : 'MULTI',
       company_ids: allCompanyIds,
       retailer_id: selectedClient.id,
       retailer_name_raw: selectedClient.name,
       beat_name: selectedClient.beat_name || 'Direct / Institutional (No Beat)',
-      dispatch_point_id: selectedDispatchPointId || selectedClient.dispatch_point_id || dispatchPoints[0]?.id || '',
+      dispatch_point_id: defaultResolvedDp,
       billing_executive_id: (selectedClient as any).billing_executive_id || currentUser?.id || 'usr_billing_1',
       order_source_role: 'DISTRIBUTOR',
       order_raiser_name: selectedClient.name,
@@ -477,7 +553,7 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
       commission_agent_name: undefined,
       order_date: new Date().toISOString().split('T')[0],
       delivery_date: deliveryDate,
-      status: 'VERIFIED_BY_BILLING', // Bypasses pending verification queue!
+      status: 'PENDING_VERIFICATION', // Strictly requires manual BE verification review
       order_invoicing_type: orderInvoicingType,
       total_amount: Math.round(finalGrandTotal),
       original_total_amount: Math.round(finalGrandTotal),
@@ -488,11 +564,9 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
       exposure_variance: isCreditExceeded ? creditVariance : 0,
       approved_credit_limit_snapshot: creditLimit,
       retailer_outstanding_snapshot: currentOutstanding,
-      be_approval_reason: isCreditExceeded
-        ? `Billing Executive Authorized: Credit variance of ₹${creditVariance.toLocaleString('en-IN')} approved under direct B2B institutional terms (${orderInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'}).`
-        : `Direct BE Order Generation (Auto-Verified as ${orderInvoicingType === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'})`,
-      verified_by_user_id: currentUser?.id || 'usr_billing_1',
-      verified_at: new Date().toISOString(),
+      be_approval_reason: null,
+      verified_by_user_id: null,
+      verified_at: null,
       is_locked: false,
       source_type: 'BE_DIRECT',
       is_direct_be_order: true,
@@ -500,9 +574,12 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
       company_discount_slabs: slabRecord,
     };
 
-    addOrder(newOrder);
-    setSubmittedOrder(newOrder);
-    if (onOrderGenerated) onOrderGenerated(newOrder);
+    const createdOrders = addOrder(newOrder);
+    const primaryCreated = createdOrders[0] || newOrder;
+    setSubmittedSplitOrders(createdOrders);
+    setSubmittedPickups(getDispatchPickupBreakdown(createdOrders, companies, skus, dispatchPoints));
+    setSubmittedOrder(primaryCreated);
+    if (onOrderGenerated) createdOrders.forEach((o) => onOrderGenerated(o));
   };
 
   if (!isOpen) return null;
@@ -550,31 +627,57 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                 Status: VERIFIED_BY_BILLING
               </span>
               <h4 className="text-base font-bold text-white mt-2">
-                Order {submittedOrder.order_number} Generated Successfully!
+                {submittedSplitOrders.length > 1
+                  ? `${submittedSplitOrders.length} Split Orders Generated Across ${submittedPickups.length} Dispatch Points!`
+                  : `Order ${submittedOrder.order_number} Generated Successfully!`}
               </h4>
               <p className="text-xs text-slate-400 mt-1">
-                Direct order for <strong className="text-white">{selectedClient?.name}</strong> has been created in pre-verified state.
+                Direct order for <strong className="text-white">{selectedClient?.name}</strong> routed to mapped Dispatch Point(s).
               </p>
             </div>
 
-            <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl text-left text-xs space-y-2 max-w-lg mx-auto font-mono text-slate-300">
+            <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl text-left text-xs space-y-2.5 max-w-lg mx-auto font-mono text-slate-300">
+              {submittedPickups.length > 0 && (
+                <div className="space-y-1.5 pb-2 border-b border-slate-800">
+                  <div className="text-[11px] font-bold text-cyan-300">
+                    Pickup Dispatch Point Breakdown:
+                  </div>
+                  {submittedPickups.map((loc) => (
+                    <div
+                      key={`${loc.dispatchPointId}_${loc.orderId}`}
+                      className="p-2 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between text-[11px]"
+                    >
+                      <div>
+                        <div className="font-bold text-white">
+                          {loc.dispatchPointName} ({loc.dispatchPointCode})
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          {loc.companies.map((c) => c.name).join(', ')} • {loc.skuCount} SKUs ({loc.unitsCount} pcs)
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-amber-400 font-bold">{loc.orderNumber}</div>
+                        <div className="text-emerald-400">₹{loc.totalAmount.toLocaleString('en-IN')}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
               <div className="flex justify-between">
                 <span className="text-slate-500">Order Reference:</span>
-                <span className="text-amber-400 font-bold">{submittedOrder.order_number}</span>
+                <span className="text-amber-400 font-bold">
+                  {submittedSplitOrders.map((o) => o.order_number).join(', ') || submittedOrder.order_number}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">Total Invoiceable Amount:</span>
                 <span className="text-emerald-400 font-bold text-sm">
-                  ₹{submittedOrder.total_amount.toLocaleString('en-IN')}
+                  ₹{submittedSplitOrders.reduce((s, o) => s + (o.total_amount || 0), 0).toLocaleString('en-IN')}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">Verification Gate:</span>
-                <span className="text-purple-300 font-semibold">Auto-Bypassed (BE Direct)</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Next Action:</span>
-                <span className="text-cyan-400">Ready for Invoicing & Dispatch</span>
+                <span className="text-purple-300 font-semibold">{submittedOrder.status}</span>
               </div>
             </div>
 
@@ -590,15 +693,20 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                 type="button"
                 onClick={() => {
                   setSubmittedOrder(null);
-                  setDraftLines([
-                    {
-                      id: `line_${Date.now()}_1`,
-                      sku_id: skus[0]?.id || '',
-                      quantity: 50,
-                      unit_price: skus[0]?.selling_price || 0,
-                      discount_percentage: 0,
-                    },
-                  ]);
+                  const firstSku = accessibleSkus[0];
+                  setDraftLines(
+                    firstSku
+                      ? [
+                          {
+                            id: `line_${Date.now()}_1`,
+                            sku_id: firstSku.id,
+                            quantity: 50,
+                            unit_price: firstSku.selling_price || 0,
+                            discount_percentage: 0,
+                          },
+                        ]
+                      : []
+                  );
                 }}
                 className="px-5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition-all shadow-md flex items-center gap-1.5 cursor-pointer"
               >
@@ -671,9 +779,9 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                 </div>
               </div>
 
-              {/* Client Info & Credit Status Strip */}
+              {/* Client Info & Live Credit Status Strip */}
               {selectedClient && (
-                <div className="p-3 bg-slate-900/90 rounded-lg border border-slate-800 text-xs grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <div className="p-3 bg-slate-900/90 rounded-lg border border-slate-800 text-xs grid grid-cols-2 sm:grid-cols-6 gap-2.5">
                   <div>
                     <span className="text-slate-500 block text-[10px]">Segment & Code</span>
                     <span className="text-purple-300 font-semibold">
@@ -687,15 +795,27 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                     </span>
                   </div>
                   <div>
-                    <span className="text-slate-500 block text-[10px]">Approved Credit Limit</span>
-                    <span className="text-emerald-400 font-bold">
-                      ₹{selectedClient.credit_limit.toLocaleString('en-IN')}
+                    <span className="text-slate-500 block text-[10px]">Credit Limit</span>
+                    <span className="text-white font-mono font-bold">
+                      ₹{creditLimit.toLocaleString('en-IN')}
                     </span>
                   </div>
                   <div>
-                    <span className="text-slate-500 block text-[10px]">Current Outstanding</span>
-                    <span className="text-amber-400 font-semibold">
-                      ₹{selectedClient.current_outstanding.toLocaleString('en-IN')}
+                    <span className="text-slate-500 block text-[10px]">Prior Unpaid Orders</span>
+                    <span className="text-amber-400 font-mono font-semibold">
+                      ₹{currentOutstanding.toLocaleString('en-IN')}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[10px]">Projected Liability</span>
+                    <span className={`font-mono font-bold ${isCreditExceeded ? 'text-rose-400' : 'text-blue-300'}`}>
+                      ₹{projectedExposure.toLocaleString('en-IN')}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[10px]">Remaining Credit</span>
+                    <span className={`font-mono font-bold ${remainingCredit === 0 && projectedExposure > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                      ₹{remainingCredit.toLocaleString('en-IN')}
                     </span>
                   </div>
                 </div>
@@ -751,17 +871,17 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
 
               {/* Advisory Credit Limit Warning (Non-blocking as requested) */}
               {isCreditExceeded && (
-                <div className="p-3 bg-amber-950/40 border border-amber-800/80 rounded-lg text-xs text-amber-200 flex items-start gap-2.5 animate-fadeIn">
-                  <AlertTriangle size={16} className="text-amber-400 shrink-0 mt-0.5" />
+                <div className="p-3 bg-rose-950/40 border border-rose-700/70 rounded-lg text-xs text-rose-200 flex items-start gap-2.5 animate-fadeIn">
+                  <AlertTriangle size={16} className="text-rose-400 shrink-0 mt-0.5" />
                   <div className="space-y-1">
-                    <div className="font-bold text-amber-300 flex items-center gap-2">
-                      <span>Advisory Alert: Credit Threshold Exceeded by ₹{creditVariance.toLocaleString('en-IN')}</span>
+                    <div className="font-bold text-rose-300 flex items-center gap-2 flex-wrap">
+                      <span>Fund Shortage Alert: ₹{creditVariance.toLocaleString('en-IN')} Over Credit Limit</span>
                       <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-900/60 text-amber-200 border border-amber-700/60 font-mono">
                         Non-Blocking
                       </span>
                     </div>
-                    <p className="text-[11px] text-amber-200/80 leading-relaxed">
-                      This order will bring total exposure to ₹{projectedExposure.toLocaleString('en-IN')} against the approved credit limit of ₹{creditLimit.toLocaleString('en-IN')}. As a Billing Executive, you may proceed with generating this verified order.
+                    <p className="text-[11px] text-rose-200/85 leading-relaxed">
+                      Total Liability will be ₹{projectedExposure.toLocaleString('en-IN')} (Unpaid: ₹{currentOutstanding.toLocaleString('en-IN')} + Order: ₹{Math.round(finalGrandTotal).toLocaleString('en-IN')}) against Credit Limit ₹{creditLimit.toLocaleString('en-IN')} → Remaining Credit: ₹0, Fund Shortage: ₹{creditVariance.toLocaleString('en-IN')}.
                     </p>
                   </div>
                 </div>
@@ -939,9 +1059,9 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                       }}
                       className="w-full bg-slate-950 border border-slate-700 focus:border-purple-500 rounded-lg px-2.5 py-1.5 text-xs text-white outline-none cursor-pointer"
                     >
-                      <option value="ALL">🏢 All Companies ({skus.length} SKUs)</option>
+                      <option value="ALL">🏢 All Companies ({accessibleSkus.length} SKUs)</option>
                       {tenantCompanies.map((c) => {
-                        const count = skus.filter((s) => s.company_id === c.id).length;
+                        const count = accessibleSkus.filter((s) => s.company_id === c.id).length;
                         return (
                           <option key={c.id} value={c.id}>
                             🏢 {c.name} ({c.code}) — {count} SKUs
@@ -1084,7 +1204,7 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
                     </thead>
                     <tbody className="divide-y divide-slate-800">
                       {calculatedLines.map((line) => {
-                        const companySkusForLine = skus.filter((s) => s.company_id === line.sku?.company_id);
+                        const companySkusForLine = accessibleSkus.filter((s) => s.company_id === line.sku?.company_id);
                         return (
                           <tr key={line.id} className="hover:bg-slate-900/40">
                             <td className="p-2.5">

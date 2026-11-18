@@ -1,8 +1,69 @@
-import { User, AuthSession, LoginResponse, PasswordResetRequestResponse, PasswordResetConfirmResponse } from '../types';
+import { User, UserRole, AuthSession, LoginResponse, PasswordResetRequestResponse, PasswordResetConfirmResponse } from '../types';
 
 const AUTH_SESSION_KEY = 'decode_fmcg_auth_session';
 const FAILED_LOGINS_KEY = 'decode_fmcg_failed_logins';
 const PASSWORD_RESETS_KEY = 'decode_fmcg_active_resets';
+
+export const MOBILE_ONLY_ROLES: ReadonlyArray<UserRole> = [
+  'DISPATCHER',
+  'DISTRIBUTOR',
+  'SALES_EXECUTIVE',
+  'COMMISSION_AGENT',
+  'DELIVERY_VAN_EXECUTIVE',
+];
+
+export const WEB_PORTAL_ALLOWED_ROLES: ReadonlyArray<UserRole> = [
+  'ADMIN',
+  'SUB_ADMIN',
+  'BILLING',
+  'ORDER_PUNCHER',
+  'ACCOUNTANT',
+];
+
+export function isMobileOnlyRole(role?: UserRole | string | null): boolean {
+  if (!role) return false;
+  return MOBILE_ONLY_ROLES.includes(role as UserRole);
+}
+
+export function isWebPortalAllowedRole(role?: UserRole | string | null): boolean {
+  if (!role) return false;
+  return WEB_PORTAL_ALLOWED_ROLES.includes(role as UserRole);
+}
+
+export function getPlatformForRole(role?: UserRole | string | null): 'MOBILE' | 'WEB' {
+  return isMobileOnlyRole(role) ? 'MOBILE' : 'WEB';
+}
+
+export function formatRoleDisplayName(role?: UserRole | string | null): string {
+  switch (role) {
+    case 'DISPATCHER':
+      return 'Dispatcher';
+    case 'DISTRIBUTOR':
+      return 'Distributor';
+    case 'SALES_EXECUTIVE':
+      return 'Sales Rep (Sales Executive)';
+    case 'COMMISSION_AGENT':
+      return 'Commission Agent';
+    case 'DELIVERY_VAN_EXECUTIVE':
+      return 'Delivery Van Executive';
+    case 'BILLING':
+      return 'Billing Executive';
+    case 'ORDER_PUNCHER':
+      return 'Order Puncher';
+    case 'SUB_ADMIN':
+      return 'Sub-Admin';
+    case 'ADMIN':
+      return 'Administrator';
+    case 'ACCOUNTANT':
+      return 'Accountant';
+    default:
+      return String(role || 'User');
+  }
+}
+
+export function getWebPortalBlockedMessage(role?: UserRole | string | null): string {
+  return `Web Portal Access Restricted: ${formatRoleDisplayName(role)} accounts are restricted strictly to the mobile application and cannot access the web portal.`;
+}
 
 // Format and validate mobile number: E.164 or 10-digit Indian standard
 export function sanitizeMobileNumber(input: string): string {
@@ -197,11 +258,11 @@ export function recordClientFailedAttempt(mobile: string): { isNowLocked: boolea
   const entry = limits[sanitized] || { attempts: 0, lockedUntil: null };
 
   entry.attempts += 1;
-  if (entry.attempts >= 5) {
-    entry.lockedUntil = Date.now() + 15 * 60 * 1000; // 15 min lockout
+  if (entry.attempts >= 3) {
+    entry.lockedUntil = Date.now() + 30 * 60 * 1000; // 30 min lockout
     limits[sanitized] = entry;
     setRateLimits(limits);
-    return { isNowLocked: true, remainingSeconds: 15 * 60 };
+    return { isNowLocked: true, remainingSeconds: 30 * 60 };
   }
 
   limits[sanitized] = entry;

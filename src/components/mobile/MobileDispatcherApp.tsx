@@ -5,6 +5,14 @@ import {
   Order,
   RecipientType
 } from '../../types';
+import { isOrderAwaitingPhysicalDispatch } from '../../utils/stockAvailability';
+import {
+  buildDispatchSkuPartyMatrix,
+  doesOrderBelongToDispatchPoint,
+  doesOrderLineBelongToDispatchPoint,
+  serializeDispatchMatrixToCsv,
+  resolveDispatchPointSupervisor
+} from '../../utils/dispatchRouting';
 import {
   Warehouse,
   Truck,
@@ -39,7 +47,9 @@ import {
   Filter,
   ShieldAlert,
   Edit3,
-  Languages
+  Languages,
+  Download,
+  FileSpreadsheet
 } from 'lucide-react';
 
 export interface DemandSKUItem {
@@ -96,6 +106,7 @@ export const MobileDispatcherApp: React.FC = () => {
 
   // Search filter for demand list
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [matrixExportNotice, setMatrixExportNotice] = useState<string | null>(null);
 
   // Expanded Accordion state for demand groups
   const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null);
@@ -138,7 +149,7 @@ export const MobileDispatcherApp: React.FC = () => {
     const curr = stockBalanceMap[st.sku_id] || 0;
     if (st.entry_type === 'INWARD' || st.entry_type === 'RETURN') {
       stockBalanceMap[st.sku_id] = curr + st.quantity;
-    } else {
+    } else if (st.entry_type === 'DISPATCH_OUT' || st.entry_type === 'ADJUSTMENT_DAMAGE') {
       stockBalanceMap[st.sku_id] = Math.max(0, curr - st.quantity);
     }
   });
@@ -148,9 +159,14 @@ export const MobileDispatcherApp: React.FC = () => {
     (st) => st.entry_type === 'DISPATCH_OUT' && st.ack_status === 'PENDING'
   );
 
-  // Orders assigned to this depot that were verified/punched by Billing Executive
+  // Orders assigned to this depot (strictly scoped via Principal Company -> Dispatch Point mapping)
   const pendingOrdersForDepot = orders.filter(
-    (o) => o.dispatch_point_id === selectedDpId && (o.status === 'PUNCHED' || o.status === 'VERIFIED_BY_BILLING' || o.status === 'APPROVED')
+    (o) =>
+      doesOrderBelongToDispatchPoint(o, selectedDpId, companies, skus) &&
+      (o.status === 'CONFIRMED' ||
+        o.status === 'PUNCHED_TO_PRINCIPAL' ||
+        o.status === 'APPROVED' ||
+        (o.status === 'INVOICED' && isOrderAwaitingPhysicalDispatch(o, stockLedger)))
   );
 
   // Separate Institutional Direct Orders vs General Beat Orders
@@ -218,13 +234,17 @@ export const MobileDispatcherApp: React.FC = () => {
       };
     }
 
+    const dpLines = (ord.lines || []).filter((l) =>
+      doesOrderLineBelongToDispatchPoint(l, ord, selectedDpId, companies, skus)
+    );
+    if (dpLines.length === 0) return;
+
     const grp = demandGroupMap[groupKey];
     grp.orders.push(ord);
-    grp.totalDemandValue += ord.total_amount;
 
-    (ord.lines || []).forEach((l) => {
+    dpLines.forEach((l) => {
       const sku = skus.find((s) => s.id === l.sku_id);
-      const comp = companies.find((c) => c.id === sku?.company_id);
+      const comp = companies.find((c) => c.id === (l.company_id || sku?.company_id));
       const companyCode = comp ? comp.code : 'SKU';
       const companyName = comp ? comp.name : 'Principal';
 
@@ -242,8 +262,38 @@ export const MobileDispatcherApp: React.FC = () => {
 
       grp.skuSummary[l.sku_id].demandedQty += l.quantity;
       grp.skuSummary[l.sku_id].totalValue += l.total;
+      grp.totalDemandValue += Number(l.total) || 0;
     });
   });
+
+  const handleExportDepotMatrixCsv = () => {
+    const matrix = buildDispatchSkuPartyMatrix(
+      pendingOrdersForDepot,
+      selectedDpId,
+      companies,
+      skus,
+      users,
+      dispatchPoints
+    );
+    if (matrix.rows.length === 0) {
+      setMatrixExportNotice(`No confirmed SKUs mapped to ${currentDepot?.name || selectedDpId} to export.`);
+      return;
+    }
+    const csvContent = serializeDispatchMatrixToCsv(matrix);
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const today = new Date().toISOString().split('T')[0];
+    const safeCode = (matrix.dispatchPointCode || selectedDpId).replace(/[^A-Za-z0-9_-]/g, '_');
+    const filename = `Dispatch_Matrix_${safeCode}_${today}.csv`;
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setMatrixExportNotice(`Exported ${filename} (${matrix.rows.length} SKUs × ${matrix.parties.length} Parties)`);
+  };
 
   const allDemandGroups = Object.values(demandGroupMap);
 
@@ -316,9 +366,10 @@ export const MobileDispatcherApp: React.FC = () => {
         recipient_type: adjustingGroup.recipientType,
         recipient_id: adjustingGroup.groupId,
         recipient_name: adjustingGroup.recipientName,
+        linked_order_id: adjustingGroup.orders.length === 1 ? adjustingGroup.orders[0].id : undefined,
         timestamp: new Date().toISOString(),
         performed_by_user_id: 'usr_dispatcher',
-        dispatcher_name: currentDepot.supervisor_name,
+        dispatcher_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
         notes: `${allocationNotes} | Gate Pass: ${outpassNo}`,
         ack_status: 'PENDING',
         ack_type: 'DIGITAL_SIGNATURE'
@@ -363,13 +414,15 @@ export const MobileDispatcherApp: React.FC = () => {
 
     const outpassNo = `OUTPASS-INST-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    (order.lines || []).forEach((line) => {
+    (order.lines || [])
+      .filter((line) => doesOrderLineBelongToDispatchPoint(line, order, selectedDpId, companies, skus))
+      .forEach((line) => {
       const sku = skus.find((s) => s.id === line.sku_id);
       const newEntry: StockLedgerEntry = {
         id: `stk_out_inst_${Date.now()}_${line.id}`,
         tenant_id: activeTenant.id,
         dispatch_point_id: selectedDpId,
-        company_id: sku?.company_id || order.company_id,
+        company_id: sku?.company_id || line.company_id || order.company_id,
         sku_id: line.sku_id,
         entry_type: 'DISPATCH_OUT',
         quantity: line.quantity,
@@ -384,7 +437,7 @@ export const MobileDispatcherApp: React.FC = () => {
         linked_order_id: order.id,
         timestamp: new Date().toISOString(),
         performed_by_user_id: 'usr_dispatcher',
-        dispatcher_name: currentDepot.supervisor_name,
+        dispatcher_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
         notes: `Direct Institutional Order Dispatch for ${order.retailer_name_raw} (${outpassNo})`,
         ack_status: 'PENDING',
         ack_type: 'DIGITAL_SIGNATURE'
@@ -421,11 +474,11 @@ export const MobileDispatcherApp: React.FC = () => {
       vehicle_number: inwardVehicleNo || 'TRUCK-DOCK-01',
       timestamp: new Date().toISOString(),
       performed_by_user_id: 'usr_dispatcher',
-      dispatcher_name: currentDepot.supervisor_name,
+      dispatcher_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
       notes: `${inwardNotes} | Transporter: ${inwardTransporter}`,
       ack_status: 'RECEIVED',
       ack_type: 'PAPER_PHOTO',
-      ack_by_user_name: currentDepot.supervisor_name,
+      ack_by_user_name: resolveDispatchPointSupervisor(currentDepot, users).supervisorName,
       ack_timestamp: new Date().toISOString()
     };
 
@@ -608,17 +661,31 @@ export const MobileDispatcherApp: React.FC = () => {
         <div className="space-y-3 text-xs">
           {/* Header Banner & Recipient Category Filters */}
           <div className="p-3 bg-slate-900 border border-slate-800 rounded-2xl space-y-2.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <span className="font-bold text-white flex items-center gap-1.5 text-xs text-amber-300">
                 <Sun size={15} className="text-amber-400" /> Billing Exec Verified Demand Sheet
               </span>
-              <span className="text-[10px] font-mono text-slate-400 font-semibold">
-                {allDemandGroups.length} Allocation Queues
-              </span>
+              <button
+                type="button"
+                onClick={handleExportDepotMatrixCsv}
+                className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center gap-1"
+                title="Export SKU-vs-Party Dispatch Sheet Matrix CSV for this depot"
+              >
+                <FileSpreadsheet size={11} /> Export SKU-vs-Party CSV
+              </button>
             </div>
 
+            {matrixExportNotice && (
+              <div className="px-2.5 py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-[10px] text-emerald-200 flex items-center justify-between">
+                <span>{matrixExportNotice}</span>
+                <button type="button" onClick={() => setMatrixExportNotice(null)} className="text-emerald-400 hover:text-white">
+                  <X size={11} />
+                </button>
+              </div>
+            )}
+
             <p className="text-[10px] text-slate-400 leading-tight">
-              Pushed by Billing Executive from previous-day orders. Company & SKU-wise demand for Sub-Distributors, Agents & Delivery Execs.
+              Synced automatically for confirmed orders at {currentDepot?.name || selectedDpId} ({allDemandGroups.length} allocation queues).
             </p>
 
             {/* Recipient Category Filter Buttons */}

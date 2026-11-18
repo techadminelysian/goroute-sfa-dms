@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import { useAppStore } from '../../data/store';
 import { Order, Retailer, User, DispatchPoint, OrderInvoicingType } from '../../types';
-import { calculateCreditExposure, isOrderAssignedToBE } from '../../utils/caRoutingLogic';
+import { isOrderAssignedToBE, isOrderUnassignedToAnyBE } from '../../utils/caRoutingLogic';
+import { resolveOrderCreditExposure } from '../../utils/creditLedger';
 import { TestRunnerModal } from '../common/TestRunnerModal';
 import {
   CheckCircle2,
@@ -35,23 +36,28 @@ interface BEVerificationDashboardProps {
 export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = ({ onOrderProcessed }) => {
   const {
     orders = [],
+    invoices = [],
+    payments = [],
     users = [],
     retailers = [],
     distributors = [],
     dispatchPoints = [],
+    skus = [],
+    activeTenantSettings,
     currentUser,
     activeRole,
     verifyAndApproveOrderByBilling,
     cancelOrderByBilling,
     updateCAAssignments,
     setOrderInvoicingType,
+    updateOrder,
   } = useAppStore();
 
   // State
   const [statusFilter, setStatusFilter] = useState<'PENDING_VERIFICATION' | 'ALL' | 'VERIFIED' | 'CANCELLED'>('PENDING_VERIFICATION');
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [selectedDPFilter, setSelectedDPFilter] = useState<string>('ALL');
-  const [selectedRaiserRoleFilter, setSelectedRaiserRoleFilter] = useState<'ALL' | 'COMMISSION_AGENT' | 'SALES_EXECUTIVE' | 'DISTRIBUTOR'>('ALL');
+  const [selectedRaiserRoleFilter, setSelectedRaiserRoleFilter] = useState<'ALL' | 'COMMISSION_AGENT' | 'SALES_EXECUTIVE' | 'DISTRIBUTOR' | 'INSTITUTIONAL' | 'DIRECT'>('ALL');
 
   // Amendment & Partial Approval Modal
   const [activeAmendingOrder, setActiveAmendingOrder] = useState<Order | null>(null);
@@ -73,6 +79,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   const [selectedAgentsForReassign, setSelectedAgentsForReassign] = useState<string[]>([]);
   const [targetBEForReassign, setTargetBEForReassign] = useState<string>('');
   const [targetDPForReassign, setTargetDPForReassign] = useState<string>('');
+  const [reassignmentFeedback, setReassignmentFeedback] = useState<{ type: 'error' | 'success'; message: string } | null>(null);
 
   // Identify Billing Executives
   const billingExecutives = useMemo(() => {
@@ -148,8 +155,10 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   // Filter Orders: strictly to selected Billing Executive's mapped raisers (or all BEs if ALL selected)
   const filteredOrders = useMemo(() => {
     return orders.filter((o) => {
-      // 1. BE Filter: Strictly orders from selected BE's mapped raisers, or all if ALL selected
-      if (effectiveBEDeskFilter !== 'ALL') {
+      // 1. BE Filter: Strictly orders from selected BE's mapped raisers, or UNASSIGNED exception queue, or ALL for supervisors
+      if (effectiveBEDeskFilter === 'UNASSIGNED') {
+        if (!isOrderUnassignedToAnyBE(o, users, distributors)) return false;
+      } else if (effectiveBEDeskFilter !== 'ALL') {
         if (!isOrderAssignedToBE(o, effectiveBEDeskFilter, users, distributors)) return false;
       }
 
@@ -157,7 +166,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
       if (selectedRaiserRoleFilter !== 'ALL') {
         const creatorUser = users.find((u) => u.id === (o.created_by_user_id || o.commission_agent_id));
         const isDistClient = distributors.some((d) => d.id === o.retailer_id);
-        const resolvedRole = o.order_source_role || (creatorUser ? creatorUser.role : (isDistClient || o.channel === 'DISTRIBUTOR' ? 'DISTRIBUTOR' : 'COMMISSION_AGENT'));
+        const resolvedRole = o.order_source_role || (creatorUser ? creatorUser.role : (isDistClient || o.channel === 'DISTRIBUTOR' ? 'DISTRIBUTOR' : (o.channel === 'INSTITUTIONAL' ? 'INSTITUTIONAL' : (o.source_type === 'BE_DIRECT' ? 'DIRECT' : 'COMMISSION_AGENT'))));
         if (resolvedRole !== selectedRaiserRoleFilter) return false;
       }
 
@@ -167,11 +176,15 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
       }
 
       // 3. Status Filter
+      const postVerifiedStatuses = ['VERIFIED', 'VERIFIED_BY_BILLING', 'CONFIRMED', 'APPROVED', 'PO_GENERATED', 'PUNCHED_TO_PRINCIPAL', 'PRINCIPAL_DISPATCHED'];
       if (statusFilter !== 'ALL') {
         if (statusFilter === 'VERIFIED') {
-          if (o.status !== 'VERIFIED' && o.status !== 'VERIFIED_BY_BILLING') return false;
+          if (!postVerifiedStatuses.includes(o.status) && !o.verified_at) return false;
+          if (o.status === 'CANCELLED') return false;
         } else if (statusFilter === 'PENDING_VERIFICATION') {
-          if (o.status !== 'PENDING_VERIFICATION' && o.status !== 'PUNCHED' && o.status !== 'FLAGGED') return false;
+          const isVerified = postVerifiedStatuses.includes(o.status) || Boolean(o.verified_at);
+          const isTerminated = o.status === 'CANCELLED' || o.status === 'INVOICED' || o.status === 'DISPATCHED' || o.status === 'DELIVERED';
+          if (isVerified || isTerminated) return false;
         } else if (o.status !== statusFilter) {
           return false;
         }
@@ -237,11 +250,19 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   const handleDirectFullApproval = (order: Order) => {
     // If invoicing type already marked by BE on card
     if (order.order_invoicing_type) {
-      const retailer = retailers.find((r) => r.id === order.retailer_id);
-      const exposure = calculateCreditExposure(retailer, order.total_amount);
+      const exposure = resolveOrderCreditExposure({
+        order,
+        retailers,
+        distributors,
+        users,
+        orders,
+        invoices,
+        payments,
+        defaultCreditLimit: activeTenantSettings?.credit_limit_default,
+      });
 
       const reason = exposure.isExceeded
-        ? `Approved with Credit Limit Override (Variance: ₹${(exposure.variance || 0).toLocaleString('en-IN')})`
+        ? `Approved with Credit Limit Override (Fund Shortage: ₹${(exposure.fundShortage || 0).toLocaleString('en-IN')})`
         : 'Approved in Full';
 
       const approverBEId = order.billing_executive_id || effectiveCurrentBEId;
@@ -264,11 +285,19 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   // Confirm Approval from Invoicing Type Modal
   const handleConfirmApprovalWithInvoicingType = () => {
     if (!activeApprovingOrder || !selectedInvoicingTypeForApproval) return;
-    const retailer = retailers.find((r) => r.id === activeApprovingOrder.retailer_id);
-    const exposure = calculateCreditExposure(retailer, activeApprovingOrder.total_amount);
+    const exposure = resolveOrderCreditExposure({
+      order: activeApprovingOrder,
+      retailers,
+      distributors,
+      users,
+      orders,
+      invoices,
+      payments,
+      defaultCreditLimit: activeTenantSettings?.credit_limit_default,
+    });
 
     const reason = exposure.isExceeded
-      ? `Approved with Credit Limit Override (Variance: ₹${(exposure.variance || 0).toLocaleString('en-IN')})`
+      ? `Approved with Credit Limit Override (Fund Shortage: ₹${(exposure.fundShortage || 0).toLocaleString('en-IN')})`
       : 'Approved in Full';
 
     const approverBEId = activeApprovingOrder.billing_executive_id || effectiveCurrentBEId;
@@ -286,10 +315,10 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   // Submit Cancellation
   const handleSubmitCancellation = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeCancellingOrder) return;
+    if (!activeCancellingOrder || !cancellationReason.trim()) return;
 
     const cancelBEId = activeCancellingOrder.billing_executive_id || effectiveCurrentBEId;
-    cancelOrderByBilling(activeCancellingOrder.id, cancelBEId, cancellationReason);
+    cancelOrderByBilling(activeCancellingOrder.id, cancelBEId, cancellationReason.trim());
     setActiveCancellingOrder(null);
     if (onOrderProcessed) onOrderProcessed();
   };
@@ -298,7 +327,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
   const handleBulkReassignSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (selectedAgentsForReassign.length === 0) {
-      alert('Please select at least one Commission Agent to reassign.');
+      setReassignmentFeedback({ type: 'error', message: 'Please select at least one Commission Agent to reassign.' });
       return;
     }
 
@@ -310,29 +339,72 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
     setIsReassignmentModalOpen(false);
     setSelectedAgentsForReassign([]);
-    alert('Successfully updated Commission Agent routing assignments!');
+    setReassignmentFeedback({ type: 'success', message: 'Updated Commission Agent routing assignments.' });
   };
 
-  // Calculate live preview totals in amendment modal
+  // Calculate live preview totals & live credit exposure in amendment modal
   const amendmentStats = useMemo(() => {
-    if (!activeAmendingOrder) return { newProductValue: 0, newTaxAmount: 0, newTotal: 0, difference: 0, hasReductions: false };
+    if (!activeAmendingOrder) {
+      return {
+        newProductValue: 0,
+        newTaxAmount: 0,
+        newTotal: 0,
+        difference: 0,
+        hasReductions: false,
+        revisedExposure: null as ReturnType<typeof resolveOrderCreditExposure> | null,
+      };
+    }
     let newProductValue = 0;
+    let calculatedTax = 0;
     let hasReductions = false;
 
     (activeAmendingOrder.lines || []).forEach((line) => {
       const q = amendedQuantities[line.sku_id] !== undefined ? amendedQuantities[line.sku_id] : line.quantity;
-      newProductValue += q * line.unit_price;
+      const lineVal = q * line.unit_price;
+      newProductValue += lineVal;
+      const sku = skus.find((s) => s.id === line.sku_id);
+      const taxRate = sku?.tax_rate !== undefined ? Number(sku.tax_rate) : 18;
+      calculatedTax += lineVal * (taxRate / 100);
       if (q < line.quantity) hasReductions = true;
     });
 
-    const newTaxAmount = Math.round(newProductValue * 0.18 * 100) / 100;
+    const newTaxAmount = Math.round(calculatedTax * 100) / 100;
     const newTotal = Math.round((newProductValue + newTaxAmount) * 100) / 100;
     const diff = activeAmendingOrder.total_amount - newTotal;
-    return { newProductValue, newTaxAmount, newTotal, difference: diff, hasReductions };
-  }, [activeAmendingOrder, amendedQuantities]);
+    const revisedExposure = resolveOrderCreditExposure({
+      order: activeAmendingOrder,
+      overrideOrderValue: newTotal,
+      retailers,
+      distributors,
+      users,
+      orders,
+      invoices,
+      payments,
+      defaultCreditLimit: activeTenantSettings?.credit_limit_default,
+    });
+    return { newProductValue, newTaxAmount, newTotal, difference: diff, hasReductions, revisedExposure };
+  }, [activeAmendingOrder, amendedQuantities, skus, retailers, distributors, users, orders, invoices, payments, activeTenantSettings?.credit_limit_default]);
 
   return (
     <div className="space-y-6">
+      {reassignmentFeedback && (
+        <div
+          className={`px-4 py-2.5 rounded-xl border text-xs font-semibold flex items-center justify-between ${
+            reassignmentFeedback.type === 'error'
+              ? 'bg-rose-950/60 border-rose-500/40 text-rose-200'
+              : 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+          }`}
+        >
+          <span>{reassignmentFeedback.message}</span>
+          <button
+            type="button"
+            onClick={() => setReassignmentFeedback(null)}
+            className="text-xs font-bold opacity-80 hover:opacity-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* Top Header & Overview Banner */}
       <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-start gap-3">
@@ -378,6 +450,9 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                 className="bg-slate-900 border border-purple-700/70 rounded-lg px-2 py-1 text-xs text-white font-bold focus:outline-none focus:border-purple-400 cursor-pointer"
               >
                 <option value="ALL">All BE Desks (Consolidated • {orders.length} Orders)</option>
+                <option value="UNASSIGNED">
+                  ⚠ Unassigned Exception Queue ({orders.filter((o) => isOrderUnassignedToAnyBE(o, users, distributors)).length})
+                </option>
                 {billingExecutives.map((be) => {
                   const countCA = users.filter((u) => u.role === 'COMMISSION_AGENT' && u.billing_executive_id === be.id).length;
                   const countSE = users.filter((u) => u.role === 'SALES_EXECUTIVE' && u.billing_executive_id === be.id).length;
@@ -415,10 +490,12 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
               onChange={(e) => setSelectedRaiserRoleFilter(e.target.value as any)}
               className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white font-medium focus:outline-none focus:border-purple-500"
             >
-              <option value="ALL">All Raisers (CFS / SE / Dist)</option>
+              <option value="ALL">All Raisers (CFS • SE • Dist • Inst • Direct)</option>
               <option value="COMMISSION_AGENT">CFS (Commission Agents)</option>
               <option value="SALES_EXECUTIVE">Sales Executives</option>
               <option value="DISTRIBUTOR">Distributors</option>
+              <option value="INSTITUTIONAL">Institutions</option>
+              <option value="DIRECT">Direct BE Orders</option>
             </select>
           </div>
 
@@ -462,7 +539,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
           <CheckCircle2 size={36} className="mx-auto text-purple-400/50" />
           <div className="text-slate-300 font-bold text-sm">No orders matching current filter criteria.</div>
           <div className="text-xs text-slate-500">
-            No pending orders found in {effectiveCurrentBEName}&apos;s assigned Commission Agent queue.
+            No pending orders found in {effectiveCurrentBEName}&apos;s verification queue.
           </div>
         </div>
       ) : (
@@ -471,9 +548,23 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
             const retailer = retailers.find((r) => r.id === ord.retailer_id);
             const dp = dispatchPoints.find((d) => d.id === ord.dispatch_point_id);
             const assignedBE = users.find((u) => u.id === ord.billing_executive_id);
-            const exposure = calculateCreditExposure(retailer, ord.total_amount);
-            const isVerified = ord.status === 'VERIFIED' || ord.status === 'VERIFIED_BY_BILLING';
+            const exposure = resolveOrderCreditExposure({
+              order: ord,
+              retailers,
+              distributors,
+              users,
+              orders,
+              invoices,
+              payments,
+              defaultCreditLimit: activeTenantSettings?.credit_limit_default,
+            });
+            const isConfirmed = ord.status === 'CONFIRMED' || ord.status === 'PUNCHED_TO_PRINCIPAL' || ord.status === 'APPROVED';
+            const isVerified = ['VERIFIED', 'VERIFIED_BY_BILLING', 'CONFIRMED', 'APPROVED', 'PO_GENERATED', 'PUNCHED_TO_PRINCIPAL', 'PRINCIPAL_DISPATCHED'].includes(ord.status) || Boolean(ord.verified_at);
             const isCancelled = ord.status === 'CANCELLED';
+            const isInvoiced = ord.status === 'INVOICED';
+            const isNonCancellable = isVerified || isInvoiced || isCancelled || ['DISPATCHED', 'DELIVERED', 'PO_GENERATED'].includes(ord.status);
+            const isPendingVerification = !isVerified && !isCancelled && !isInvoiced && !['DISPATCHED', 'DELIVERED'].includes(ord.status);
+            const isUnassigned = isOrderUnassignedToAnyBE(ord, users, distributors);
 
             return (
               <div
@@ -485,6 +576,8 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                     ? 'border-emerald-500/40 bg-slate-900/90'
                     : isCancelled
                     ? 'border-slate-800 opacity-60'
+                    : isInvoiced
+                    ? 'border-blue-500/40'
                     : 'border-slate-800 hover:border-purple-500/30'
                 }`}
               >
@@ -499,6 +592,8 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                             ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                             : isCancelled
                             ? 'bg-rose-500/10 text-rose-300 border-rose-500/30'
+                            : isInvoiced
+                            ? 'bg-blue-500/10 text-blue-300 border-blue-500/30'
                             : exposure.isExceeded
                             ? 'bg-rose-500/20 text-rose-300 border-rose-500/40 animate-pulse'
                             : 'bg-purple-500/10 text-purple-300 border-purple-500/30'
@@ -543,7 +638,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                       ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                     </div>
                     <div className="text-[10px] text-emerald-400 font-medium">
-                      Incl. 18% GST
+                      Incl. ₹{(ord.tax_amount || 0).toLocaleString('en-IN')} GST
                     </div>
                     {ord.original_total_amount && ord.original_total_amount !== ord.total_amount && (
                       <div className="text-[10px] text-amber-400 line-through">
@@ -578,7 +673,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   <div>
                     <span className="text-slate-500 block text-[10px]">Assigned BE</span>
                     <span className="font-semibold text-purple-300 truncate block">
-                      {assignedBE?.name || 'Priya Verma (BE-1)'}
+                      {assignedBE?.name || (isUnassigned ? 'Unassigned (Exception Queue)' : 'Unassigned')}
                     </span>
                   </div>
                   <div>
@@ -589,20 +684,20 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   </div>
                 </div>
 
-                {/* Credit Exposure Warning Box */}
+                {/* Live Real-Time Credit Exposure & Fund Shortage Box */}
                 <div
-                  className={`p-3 rounded-xl border text-xs space-y-1.5 ${
+                  className={`p-3 rounded-xl border text-xs space-y-2 ${
                     exposure.isExceeded
                       ? 'bg-rose-950/30 border-rose-500/40 text-rose-200'
                       : 'bg-emerald-950/20 border-emerald-500/30 text-emerald-200'
                   }`}
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5 font-bold">
                       {exposure.isExceeded ? (
                         <>
                           <AlertTriangle size={15} className="text-rose-400 shrink-0" />
-                          <span className="text-rose-300">Credit Limit Exceeded (High Risk)</span>
+                          <span className="text-rose-300">Over-Limit Exposure • Fund Shortage</span>
                         </>
                       ) : (
                         <>
@@ -611,26 +706,42 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                         </>
                       )}
                     </div>
-                    {exposure.isExceeded && (
-                      <span className="font-mono font-bold text-rose-300 bg-rose-500/20 px-2 py-0.5 rounded text-[11px]">
-                        +₹{(exposure.variance || 0).toLocaleString('en-IN')} Over
+                    {exposure.fundShortage > 0 && (
+                      <span className="font-mono font-bold text-rose-200 bg-rose-500/25 border border-rose-500/40 px-2 py-0.5 rounded text-[11px]">
+                        Shortage: ₹{exposure.fundShortage.toLocaleString('en-IN')}
                       </span>
                     )}
                   </div>
 
-                  <div className="grid grid-cols-3 gap-2 text-[11px] pt-1 border-t border-slate-800/60 font-mono">
+                  <div className="grid grid-cols-3 gap-2 text-[11px] pt-1.5 border-t border-slate-800/60 font-mono">
                     <div>
-                      <span className="text-slate-400 block text-[10px]">Credit Limit:</span>
-                      <strong>₹{(exposure.creditLimit || 0).toLocaleString('en-IN')}</strong>
+                      <span className="text-slate-400 block text-[10px] font-sans">Credit Limit</span>
+                      <strong className="text-white">₹{exposure.creditLimit.toLocaleString('en-IN')}</strong>
                     </div>
                     <div>
-                      <span className="text-slate-400 block text-[10px]">Current Debt:</span>
-                      <strong>₹{(exposure.currentOutstanding || 0).toLocaleString('en-IN')}</strong>
+                      <span className="text-slate-400 block text-[10px] font-sans">Prior Unpaid Orders</span>
+                      <strong className="text-amber-300">₹{exposure.priorUnpaidOrders.toLocaleString('en-IN')}</strong>
                     </div>
                     <div>
-                      <span className="text-slate-400 block text-[10px]">Total Exposure:</span>
-                      <strong className={exposure.isExceeded ? 'text-rose-300' : 'text-emerald-300'}>
-                        ₹{(exposure.totalExposure || 0).toLocaleString('en-IN')}
+                      <span className="text-slate-400 block text-[10px] font-sans">New Order Value</span>
+                      <strong className="text-blue-300">₹{exposure.newOrderValue.toLocaleString('en-IN')}</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Total Liability</span>
+                      <strong className={exposure.isExceeded ? 'text-rose-300' : 'text-white'}>
+                        ₹{exposure.totalLiability.toLocaleString('en-IN')}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Remaining Credit</span>
+                      <strong className={exposure.remainingCredit === 0 && exposure.totalLiability > 0 ? 'text-amber-400' : 'text-emerald-300'}>
+                        ₹{exposure.remainingCredit.toLocaleString('en-IN')}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Fund Shortage</span>
+                      <strong className={exposure.fundShortage > 0 ? 'text-rose-400' : 'text-slate-400'}>
+                        ₹{exposure.fundShortage.toLocaleString('en-IN')}
                       </strong>
                     </div>
                   </div>
@@ -641,9 +752,18 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   <div className="text-[10px] uppercase text-slate-500 font-bold tracking-wider mb-1">
                     Ordered SKU Line Items ({(ord.lines || []).length}):
                   </div>
-                  {(ord.lines || []).map((line) => (
-                    <div key={line.id} className="flex justify-between items-center text-slate-300 py-0.5">
-                      <span className="truncate max-w-[200px] text-[11px]">{line.sku_name}</span>
+                  {(ord.lines || []).map((line) => {
+                    const matchedSku = skus.find((s) => s.id === line.sku_id);
+                    const taxRate = matchedSku?.tax_rate !== undefined ? Number(matchedSku.tax_rate) : 18;
+
+                    return (
+                      <div key={line.id} className="flex justify-between items-center text-slate-300 py-0.5">
+                        <div className="flex items-center gap-1.5 truncate max-w-[240px]">
+                          <span className="truncate text-[11px] text-slate-200">{line.sku_name}</span>
+                          <span className="shrink-0 text-[9px] font-mono px-1.5 py-0.2 rounded bg-blue-950 text-blue-300 border border-blue-800/60 font-semibold">
+                            GST {taxRate}%
+                          </span>
+                        </div>
                       <div className="flex items-center gap-2">
                         {line.is_amended && (
                           <span className="text-[9px] bg-amber-500/20 text-amber-300 px-1 rounded">Amended</span>
@@ -661,7 +781,8 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                         </span>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 {/* BE Invoicing Type Selection (Mandatory before Approval) */}
@@ -717,20 +838,28 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                 )}
 
                 {/* BE Action Panel */}
-                {!isVerified && !isCancelled && (
+                {isPendingVerification && (
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800 text-xs">
-                    {/* Action 1: Cancel Order (Red) */}
-                    <button
-                      onClick={() => {
-                        setActiveCancellingOrder(ord);
-                        setCancellationReason(`Credit limit exceeded by ₹${(exposure.variance || 0).toLocaleString('en-IN')}`);
-                      }}
-                      className="px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 rounded-xl font-bold flex items-center gap-1.5 transition-all"
-                    >
-                      <XCircle size={13} /> Cancel Order
-                    </button>
+                    {/* Action 1: Cancel Order (Red) - Strictly Gated to Pending Verification */}
+                    {!isNonCancellable ? (
+                      <button
+                        onClick={() => {
+                          setActiveCancellingOrder(ord);
+                          setCancellationReason(
+                            exposure.fundShortage > 0
+                              ? `Credit limit exceeded — Fund Shortage of ₹${exposure.fundShortage.toLocaleString('en-IN')}`
+                              : 'Order cancelled by Billing Executive'
+                          );
+                        }}
+                        className="px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 rounded-xl font-bold flex items-center gap-1.5 transition-all"
+                      >
+                        <XCircle size={13} /> Cancel Order
+                      </button>
+                    ) : (
+                      <div />
+                    )}
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 ml-auto">
                       {/* Action 2: Partial Approval / Amend Quantities (Amber) */}
                       <button
                         onClick={() => handleOpenAmendmentModal(ord)}
@@ -750,24 +879,78 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   </div>
                 )}
 
-                {/* Audit notes if already verified or cancelled */}
+                {/* Supervisor Inline BE Resolution for Unassigned Exception Orders */}
+                {isSupervisorRole && isUnassigned && (
+                  <div className="p-2.5 bg-amber-950/30 border border-amber-500/40 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="text-amber-300 font-semibold flex items-center gap-1.5">
+                      <AlertTriangle size={13} className="text-amber-400 shrink-0" />
+                      Unmapped Order — Assign Billing Executive:
+                    </span>
+                    <select
+                      defaultValue=""
+                      onChange={(e) => {
+                        if (!e.target.value) return;
+                        updateOrder(ord.id, { billing_executive_id: e.target.value });
+                      }}
+                      className="bg-slate-950 border border-amber-500/50 rounded-lg px-2 py-1 text-xs text-white font-semibold cursor-pointer"
+                    >
+                      <option value="">Select BE Desk...</option>
+                      {billingExecutives.map((be) => (
+                        <option key={be.id} value={be.id}>
+                          {be.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {/* Audit notes if already verified, confirmed, invoiced, or cancelled */}
                 {isVerified && (
-                  <div className="p-2.5 bg-emerald-950/20 border border-emerald-500/30 rounded-xl text-[11px] text-emerald-300 flex flex-wrap items-center justify-between gap-2">
+                  <div className={`p-2.5 rounded-xl text-[11px] flex flex-wrap items-center justify-between gap-2 border ${
+                    isConfirmed
+                      ? 'bg-blue-950/25 border-blue-500/35 text-blue-300'
+                      : 'bg-emerald-950/20 border-emerald-500/30 text-emerald-300'
+                  }`}>
                     <div className="flex items-center gap-1.5">
-                      <CheckCircle2 size={13} className="text-emerald-400 shrink-0" />
+                      <CheckCircle2 size={13} className={isConfirmed ? 'text-blue-400 shrink-0' : 'text-emerald-400 shrink-0'} />
                       <span>
-                        Verified & Locked as{' '}
+                        {isConfirmed ? 'Confirmed' : 'Verified & Locked'} as{' '}
                         <strong className="text-white underline decoration-emerald-500/50">
                           {ord.order_invoicing_type === 'REGISTERED_GST' ? 'Registered GST' : 'Unregistered Cash'}
                         </strong>{' '}
-                        by BE {ord.verified_by_user_id || 'Priya V.'}
+                        by BE {ord.verified_by_user_id || 'Desk'}
                       </span>
                     </div>
-                    {ord.be_approval_reason && (
-                      <span className="italic text-slate-400 max-w-[200px] truncate">
-                        "{ord.be_approval_reason}"
+                    <div className="flex items-center gap-2">
+                      {ord.be_approval_reason && (
+                        <span className="italic text-slate-400 max-w-[200px] truncate">
+                          "{ord.be_approval_reason}"
+                        </span>
+                      )}
+                      {isConfirmed ? (
+                        <span className="text-[10px] text-blue-300 font-mono bg-blue-950/70 px-2 py-0.5 rounded border border-blue-700/50">
+                          {ord.fulfillment_source === 'DEPOT_STOCK' ? 'Depot Stock' : 'Principal PO'} • Dispatch & Invoicing Ready
+                        </span>
+                      ) : (
+                        <span className="text-[10px] text-amber-300 font-mono bg-amber-950/60 px-2 py-0.5 rounded border border-amber-700/50">
+                          Awaiting Principal PO / Depot Stock • Cancel Locked
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {isInvoiced && (
+                  <div className="p-2.5 bg-blue-950/20 border border-blue-500/30 rounded-xl text-[11px] text-blue-300 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <FileSpreadsheet size={13} className="text-blue-400 shrink-0" />
+                      <span>
+                        Invoiced & Locked — Final Tax Invoice Generated. Cancellation Strictly Restricted.
                       </span>
-                    )}
+                    </div>
+                    <span className="text-[10px] text-blue-400 font-mono bg-blue-950 px-2 py-0.5 rounded border border-blue-800/40">
+                      Invoiced
+                    </span>
                   </div>
                 )}
 
@@ -826,7 +1009,12 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                         className="p-3 bg-slate-950 rounded-2xl border border-slate-800 flex items-center justify-between gap-3"
                       >
                         <div className="flex-1">
-                          <div className="font-bold text-white">{line.sku_name}</div>
+                          <div className="font-bold text-white flex items-center gap-1.5">
+                            <span>{line.sku_name}</span>
+                            <span className="text-[9px] font-mono px-1.5 py-0.2 rounded bg-blue-950 text-blue-300 border border-blue-800/60 font-semibold">
+                              GST {skus.find((s) => s.id === line.sku_id)?.tax_rate ?? 18}%
+                            </span>
+                          </div>
                           <div className="text-[11px] text-slate-400">
                             Unit Price: ₹{line.unit_price} | Original: {line.quantity} units
                           </div>
@@ -862,7 +1050,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                 </div>
               </div>
 
-              {/* Live revised totals */}
+              {/* Live revised totals & credit utilization recalculation */}
               <div className="p-3 bg-slate-950 rounded-2xl border border-slate-800 space-y-1.5 font-mono text-xs">
                 <div className="flex justify-between text-slate-400">
                   <span>Original Order Value (Incl. GST):</span>
@@ -873,17 +1061,39 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   <span>₹{amendmentStats.newProductValue.toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400 text-[11px]">
-                  <span>Revised GST (18%):</span>
+                  <span>Revised GST (Itemized):</span>
                   <span>+₹{amendmentStats.newTaxAmount.toLocaleString('en-IN')}</span>
                 </div>
                 <div className="flex justify-between text-amber-300 font-bold pt-1 border-t border-slate-800">
-                  <span>Revised Total (GST Included):</span>
+                  <span>Revised Order Total (GST Included):</span>
                   <span>₹{amendmentStats.newTotal.toLocaleString('en-IN')}</span>
                 </div>
                 {amendmentStats.difference > 0 && (
                   <div className="flex justify-between text-emerald-400 text-[11px]">
-                    <span>Credit Exposure Reduced By:</span>
+                    <span>Reserved Credit Released By:</span>
                     <span>-₹{amendmentStats.difference.toLocaleString('en-IN')}</span>
+                  </div>
+                )}
+                {amendmentStats.revisedExposure && (
+                  <div className="grid grid-cols-3 gap-2 pt-2 mt-1 border-t border-slate-800/80 text-[11px]">
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Projected Total Liability</span>
+                      <strong className={amendmentStats.revisedExposure.isExceeded ? 'text-rose-300' : 'text-white'}>
+                        ₹{amendmentStats.revisedExposure.totalLiability.toLocaleString('en-IN')}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Remaining Credit</span>
+                      <strong className="text-emerald-400">
+                        ₹{amendmentStats.revisedExposure.remainingCredit.toLocaleString('en-IN')}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px] font-sans">Fund Shortage</span>
+                      <strong className={amendmentStats.revisedExposure.fundShortage > 0 ? 'text-rose-400' : 'text-slate-400'}>
+                        ₹{amendmentStats.revisedExposure.fundShortage.toLocaleString('en-IN')}
+                      </strong>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1003,28 +1213,35 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
 
               <div>
                 <label className="block text-slate-300 font-semibold mb-1">
-                  Cancellation Reason (Will be sent to Commission Agent) *
+                  Cancellation Reason (Mandatory)*
                 </label>
                 <textarea
                   required
                   rows={3}
                   value={cancellationReason}
                   onChange={(e) => setCancellationReason(e.target.value)}
+                  placeholder="Enter the specific reason for order cancellation..."
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-rose-500"
                 />
+                {!cancellationReason.trim() && (
+                  <p className="text-[11px] text-rose-400 mt-1 font-medium">
+                    A cancellation reason must be provided before cancelling this order.
+                  </p>
+                )}
               </div>
 
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
                   onClick={() => setActiveCancellingOrder(null)}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl font-bold text-xs"
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl font-bold text-xs cursor-pointer"
                 >
                   Dismiss
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-bold text-xs shadow-md flex items-center gap-1.5"
+                  disabled={!cancellationReason.trim()}
+                  className="px-4 py-2 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-bold text-xs shadow-md flex items-center gap-1.5 cursor-pointer"
                 >
                   <XCircle size={14} /> Cancel Order & Send Alert
                 </button>

@@ -1,4 +1,4 @@
-import { Beat, Order, Retailer, User, WorkflowNotification, DistributorInstitution } from '../types';
+import { Beat, Order, Retailer, User, WorkflowNotification, DistributorInstitution, SKU } from '../types';
 
 /**
  * Result structure returned by credit limit validation calculation
@@ -9,28 +9,30 @@ export interface CreditValidationResult {
   currentOutstanding: number;
   newOrderValue: number;
   totalExposure: number;
-  variance: number; // Amount exceeded (totalExposure - creditLimit) or 0
+  remainingCredit: number;
+  fundShortage: number;
+  variance: number; // Alias for fundShortage = Max(0, totalExposure - creditLimit)
   recommendation: 'APPROVE' | 'FLAG_HIGH_RISK';
 }
 
 /**
  * Calculates financial credit exposure for an order:
- * Total Exposure = Current Outstanding Balance + New Order Gross Value
- * 
- * If Total Exposure > Retailer Credit Limit:
- * Flag with High-Risk Red Flag and compute variance.
+ * Total Liability = Current Unpaid Orders + New Order Value
+ * Remaining Credit = Max(0, Credit Limit - Total Liability)
+ * Fund Shortage = Max(0, Total Liability - Credit Limit)
  */
 export function calculateCreditExposure(
-  retailer: Retailer | null | undefined,
+  retailer: Pick<Retailer, 'credit_limit' | 'current_outstanding'> | null | undefined,
   newOrderGrossValue: number,
   fallbackCreditLimit: number = 50000
 ): CreditValidationResult {
-  const creditLimit = retailer ? Number(retailer.credit_limit) || 0 : fallbackCreditLimit;
-  const currentOutstanding = retailer ? Number(retailer.current_outstanding) || 0 : 0;
+  const creditLimit = retailer ? Math.max(0, Number(retailer.credit_limit) || 0) : fallbackCreditLimit;
+  const currentOutstanding = retailer ? Math.max(0, Number(retailer.current_outstanding) || 0) : 0;
   const newOrderValue = Math.max(0, Number(newOrderGrossValue) || 0);
-  const totalExposure = currentOutstanding + newOrderValue;
-  const isExceeded = totalExposure > creditLimit;
-  const variance = isExceeded ? totalExposure - creditLimit : 0;
+  const totalExposure = Math.round((currentOutstanding + newOrderValue) * 100) / 100;
+  const remainingCredit = Math.max(0, Math.round((creditLimit - totalExposure) * 100) / 100);
+  const fundShortage = Math.max(0, Math.round((totalExposure - creditLimit) * 100) / 100);
+  const isExceeded = fundShortage > 0;
 
   return {
     isExceeded,
@@ -38,7 +40,9 @@ export function calculateCreditExposure(
     currentOutstanding,
     newOrderValue,
     totalExposure,
-    variance,
+    remainingCredit,
+    fundShortage,
+    variance: fundShortage,
     recommendation: isExceeded ? 'FLAG_HIGH_RISK' : 'APPROVE',
   };
 }
@@ -55,7 +59,7 @@ export function applyCAMappingsToOrder(
   clientDistributor?: DistributorInstitution | null
 ): {
   dispatch_point_id: string;
-  billing_executive_id: string;
+  billing_executive_id: string | null;
   commission_agent_id: string;
   commission_agent_name: string;
   order_source_role?: string;
@@ -71,12 +75,8 @@ export function applyCAMappingsToOrder(
   // DP lookup: order DP or default (Depot is associated with Company)
   const dpId = order.dispatch_point_id || defaultDpId;
 
-  // BE lookup: User profile fixed BE, or distributor mapped BE, or order mapped BE, or default BE
-  let beId = agentUser?.billing_executive_id || clientDistributor?.billing_executive_id || order.billing_executive_id;
-  if (!beId) {
-    const defaultBE = allUsers.find((u) => u.role === 'BILLING' && u.is_active !== false);
-    beId = defaultBE?.id || 'usr_billing_1';
-  }
+  // Strict BE lookup: User profile fixed BE, or distributor mapped BE, or explicit order BE (no fallback to primary BE)
+  const beId = agentUser?.billing_executive_id || clientDistributor?.billing_executive_id || order.billing_executive_id || null;
 
   const roleTag = isSE ? 'SALES_EXECUTIVE' : isDist ? 'DISTRIBUTOR' : 'COMMISSION_AGENT';
 
@@ -186,10 +186,14 @@ export function isOrderAssignedToBE(
     }
   }
 
-  // 3. Check if order is for or from a Distributor entity with mapped BE
+  // 3. Check if order.retailer_id references a Distributor entity OR a mobile User profile with mapped BE
   if (order.retailer_id) {
     const matchedDistributor = allDistributors.find((d) => d.id === order.retailer_id);
     if (matchedDistributor && matchedDistributor.billing_executive_id === beId) {
+      return true;
+    }
+    const matchedUserByRetailerId = allUsers.find((u) => u.id === order.retailer_id);
+    if (matchedUserByRetailerId && matchedUserByRetailerId.billing_executive_id === beId) {
       return true;
     }
   }
@@ -208,6 +212,20 @@ export function isOrderAssignedToBE(
   }
 
   return false;
+}
+
+/**
+ * Identifies unmapped/orphaned orders that do not resolve to any active Billing Executive.
+ * These orders are routed strictly to the Admin / Sub-Admin Unassigned Exception Queue.
+ */
+export function isOrderUnassignedToAnyBE(
+  order: Order,
+  allUsers: User[],
+  allDistributors: DistributorInstitution[] = []
+): boolean {
+  const activeBEs = allUsers.filter((u) => u.role === 'BILLING' && u.is_active !== false);
+  if (activeBEs.length === 0) return true;
+  return !activeBEs.some((be) => isOrderAssignedToBE(order, be.id, allUsers, allDistributors));
 }
 
 /**
@@ -276,32 +294,40 @@ export interface OrderFinancialSummary {
  * - Applicable GST (18%)
  * - Total Order Amount (Product Value + GST)
  */
-export function getOrderFinancialSummary(order: Partial<Order> | null | undefined): OrderFinancialSummary {
+export function getOrderFinancialSummary(
+  order: Partial<Order> | null | undefined,
+  skus: SKU[] = []
+): OrderFinancialSummary {
   if (!order) {
     return { productValue: 0, gstAmount: 0, totalAmountWithGst: 0 };
   }
 
   // 1. Calculate product value from lines
   let productValue = 0;
+  let computedLineTax = 0;
   if (order.lines && order.lines.length > 0) {
     productValue = order.lines.reduce((sum, l) => {
       const lineTotal =
         l.total != null && !isNaN(Number(l.total))
           ? Number(l.total)
           : Number(l.quantity || 0) * Number(l.unit_price || 0);
+      const matchedSku = skus.find((s) => s.id === l.sku_id);
+      const taxRate = matchedSku?.tax_rate !== undefined ? Number(matchedSku.tax_rate) : 18;
+      computedLineTax += lineTotal * (taxRate / 100);
       return sum + lineTotal;
     }, 0);
   } else {
     productValue = Number(order.total_amount) || 0;
+    computedLineTax = productValue * 0.18;
   }
   productValue = Math.round(productValue * 100) / 100;
 
-  // 2. Calculate GST amount (18% FMCG standard rate, or use order.tax_amount)
+  // 2. Calculate GST amount (use order.tax_amount if present, otherwise itemized SKU tax)
   let gstAmount = 0;
   if (order.tax_amount != null && !isNaN(Number(order.tax_amount)) && Number(order.tax_amount) > 0) {
     gstAmount = Number(order.tax_amount);
   } else {
-    gstAmount = Math.round(productValue * 0.18 * 100) / 100;
+    gstAmount = Math.round(computedLineTax * 100) / 100;
   }
   gstAmount = Math.round(gstAmount * 100) / 100;
 
@@ -422,3 +448,56 @@ export function getBeatsForBE(
 
   return allBeats.filter((b) => assignedBeatIdSet.has(b.id));
 }
+
+export const FIELD_ACCESS_SCOPED_ROLES: ReadonlyArray<User['role']> = [
+  'COMMISSION_AGENT',
+  'SALES_EXECUTIVE',
+  'DISTRIBUTOR',
+];
+
+export function isFieldScopedRole(role?: User['role'] | string | null): boolean {
+  if (!role) return false;
+  return FIELD_ACCESS_SCOPED_ROLES.includes(role as User['role']);
+}
+
+/**
+ * Returns Principal Companies visible to a user under Zero-Trust Access Matrix rules.
+ * - Field roles (COMMISSION_AGENT, SALES_EXECUTIVE, DISTRIBUTOR): strictly restricted to user.company_scope.
+ *   If company_scope is empty/undefined, returns [] (0 companies).
+ * - Office/Admin roles: returns all provided companies.
+ */
+export function getAllowedCompaniesForUser<T extends { id: string }>(
+  user: User | null | undefined,
+  companies: T[] = []
+): T[] {
+  if (!user || !isFieldScopedRole(user.role)) {
+    return companies;
+  }
+  const scope = Array.isArray(user.company_scope) ? user.company_scope : [];
+  if (scope.length === 0) return [];
+  const scopeSet = new Set(scope);
+  return companies.filter((c) => scopeSet.has(c.id));
+}
+
+/**
+ * Returns SKUs visible to a user based on their allowed Principal Companies (Zero-Trust).
+ */
+export function getAllowedSkusForUser(
+  user: User | null | undefined,
+  companies: { id: string }[] = [],
+  skus: SKU[] = []
+): SKU[] {
+  if (!user || !isFieldScopedRole(user.role)) {
+    return skus;
+  }
+  const allowedCompanies = getAllowedCompaniesForUser(user, companies);
+  const allowedIds = new Set(allowedCompanies.map((c) => c.id));
+  if (allowedIds.size === 0) return [];
+  return skus.filter((s) => allowedIds.has(s.company_id));
+}
+
+export function isFieldUserAccessLocked(user: User | null | undefined): boolean {
+  if (!user || !isFieldScopedRole(user.role)) return false;
+  return !Array.isArray(user.company_scope) || user.company_scope.length === 0;
+}
+
