@@ -68,12 +68,48 @@ function stripUndefinedDeep<T>(value: T): T {
   return value;
 }
 
+export const UNMAPPED_DISPATCH_POINT_ID = 'UNMAPPED_DISPATCH_POINT';
+export const UNMAPPED_DISPATCH_POINT_LABEL = 'Unmapped Dispatch Point';
+
+export function isUnmappedDispatchPointId(
+  dpId?: string | null,
+  dispatchPoints?: Pick<DispatchPoint, 'id'>[]
+): boolean {
+  if (!dpId || dpId === UNMAPPED_DISPATCH_POINT_ID) return true;
+  if (Array.isArray(dispatchPoints) && dispatchPoints.length > 0) {
+    return !dispatchPoints.some((d) => d.id === dpId);
+  }
+  return false;
+}
+
+export function getDispatchPointDisplayLabel(
+  dpId: string | null | undefined,
+  dispatchPoints: Pick<DispatchPoint, 'id' | 'name' | 'code'>[] = []
+): string {
+  if (!dpId || dpId === UNMAPPED_DISPATCH_POINT_ID) {
+    return UNMAPPED_DISPATCH_POINT_LABEL;
+  }
+  const matched = dispatchPoints.find((d) => d.id === dpId);
+  if (matched) {
+    return matched.code ? `${matched.name} (${matched.code})` : matched.name;
+  }
+  return UNMAPPED_DISPATCH_POINT_LABEL;
+}
+
 export function getCompanyIdsForDispatchPoint(
   dpId: string,
-  companies: Pick<Company, 'id' | 'dispatch_point_id'>[] = []
+  companies: Pick<Company, 'id' | 'dispatch_point_id'>[] = [],
+  dispatchPoints?: Pick<DispatchPoint, 'id'>[]
 ): Set<string> {
   if (!dpId || dpId === 'ALL') {
     return new Set(companies.map((c) => c.id));
+  }
+  if (dpId === UNMAPPED_DISPATCH_POINT_ID) {
+    return new Set(
+      companies
+        .filter((c) => isUnmappedDispatchPointId(c.dispatch_point_id, dispatchPoints))
+        .map((c) => c.id)
+    );
   }
   return new Set(companies.filter((c) => c.dispatch_point_id === dpId).map((c) => c.id));
 }
@@ -94,13 +130,44 @@ export function getEffectiveLineCompanyId(
 export function resolveDispatchPointIdForCompany(
   companyId: string,
   companies: Pick<Company, 'id' | 'dispatch_point_id'>[] = [],
-  fallbackDpId: string = 'dp_central'
+  dispatchPoints?: Pick<DispatchPoint, 'id'>[]
 ): string {
   if (companyId) {
     const comp = companies.find((c) => c.id === companyId);
-    if (comp?.dispatch_point_id) return comp.dispatch_point_id;
+    if (comp?.dispatch_point_id) {
+      if (Array.isArray(dispatchPoints) && dispatchPoints.length > 0) {
+        return dispatchPoints.some((d) => d.id === comp.dispatch_point_id)
+          ? comp.dispatch_point_id
+          : UNMAPPED_DISPATCH_POINT_ID;
+      }
+      return comp.dispatch_point_id;
+    }
   }
-  return fallbackDpId;
+  return UNMAPPED_DISPATCH_POINT_ID;
+}
+
+export function resolveOrderPrimaryDispatchPointId(
+  order: Partial<Order>,
+  companies: Pick<Company, 'id' | 'dispatch_point_id'>[] = [],
+  skus: Pick<SKU, 'id' | 'company_id'>[] = [],
+  dispatchPoints?: Pick<DispatchPoint, 'id'>[]
+): string {
+  const lines = order.lines || [];
+  for (const line of lines) {
+    const compId = getEffectiveLineCompanyId(line, order, skus);
+    const dpId = resolveDispatchPointIdForCompany(compId, companies, dispatchPoints);
+    if (dpId !== UNMAPPED_DISPATCH_POINT_ID) {
+      return dpId;
+    }
+  }
+  const singleCompId =
+    order.company_id && order.company_id !== 'MULTI'
+      ? order.company_id
+      : order.company_ids?.[0] || '';
+  if (singleCompId) {
+    return resolveDispatchPointIdForCompany(singleCompId, companies, dispatchPoints);
+  }
+  return UNMAPPED_DISPATCH_POINT_ID;
 }
 
 export function doesOrderLineBelongToDispatchPoint(
@@ -108,35 +175,34 @@ export function doesOrderLineBelongToDispatchPoint(
   order: Partial<Order>,
   dpId: string,
   companies: Pick<Company, 'id' | 'dispatch_point_id'>[] = [],
-  skus: Pick<SKU, 'id' | 'company_id'>[] = []
+  skus: Pick<SKU, 'id' | 'company_id'>[] = [],
+  dispatchPoints?: Pick<DispatchPoint, 'id'>[]
 ): boolean {
   if (!dpId || dpId === 'ALL') return true;
   const compId = getEffectiveLineCompanyId(line, order, skus);
-  if (compId) {
-    const comp = companies.find((c) => c.id === compId);
-    if (comp?.dispatch_point_id) {
-      return comp.dispatch_point_id === dpId;
-    }
-  }
-  return order.dispatch_point_id === dpId;
+  const resolvedDpId = resolveDispatchPointIdForCompany(compId, companies, dispatchPoints);
+  return resolvedDpId === dpId;
 }
 
 export function doesOrderBelongToDispatchPoint(
   order: Order,
   dpId: string,
   companies: Pick<Company, 'id' | 'dispatch_point_id'>[] = [],
-  skus: Pick<SKU, 'id' | 'company_id'>[] = []
+  skus: Pick<SKU, 'id' | 'company_id'>[] = [],
+  dispatchPoints?: Pick<DispatchPoint, 'id'>[]
 ): boolean {
   if (!dpId || dpId === 'ALL') return true;
   const lines = order.lines || [];
   if (lines.length > 0) {
-    return lines.some((l) => doesOrderLineBelongToDispatchPoint(l, order, dpId, companies, skus));
+    return lines.some((l) =>
+      doesOrderLineBelongToDispatchPoint(l, order, dpId, companies, skus, dispatchPoints)
+    );
   }
-  if (order.company_id && order.company_id !== 'MULTI') {
-    const comp = companies.find((c) => c.id === order.company_id);
-    if (comp?.dispatch_point_id) return comp.dispatch_point_id === dpId;
-  }
-  return order.dispatch_point_id === dpId;
+  const singleCompId =
+    order.company_id && order.company_id !== 'MULTI'
+      ? order.company_id
+      : order.company_ids?.[0] || '';
+  return resolveDispatchPointIdForCompany(singleCompId, companies, dispatchPoints) === dpId;
 }
 
 function recalculateLinesFinancials(
@@ -223,23 +289,22 @@ export function splitOrderByDispatchPoint(
   skus: SKU[] = [],
   dispatchPoints: DispatchPoint[] = []
 ): Order[] {
-  const fallbackDpId = order.dispatch_point_id || dispatchPoints[0]?.id || 'dp_central';
   const lines = order.lines || [];
 
   // Already explicitly split child order or empty lines: keep as single normalized order
   if (order.parent_order_id || lines.length === 0) {
     const singleCompId = order.company_id && order.company_id !== 'MULTI' ? order.company_id : order.company_ids?.[0] || '';
     const resolvedDpId = singleCompId
-      ? resolveDispatchPointIdForCompany(singleCompId, companies, fallbackDpId)
-      : fallbackDpId;
+      ? resolveDispatchPointIdForCompany(singleCompId, companies, dispatchPoints)
+      : UNMAPPED_DISPATCH_POINT_ID;
     return [stripUndefinedDeep({ ...order, dispatch_point_id: resolvedDpId })];
   }
 
-  // Group lines by resolved Dispatch Point ID
+  // Group lines strictly by resolved Principal Company -> Dispatch Point ID
   const groupsMap = new Map<string, OrderLine[]>();
   for (const line of lines) {
     const compId = getEffectiveLineCompanyId(line, order, skus);
-    const targetDpId = resolveDispatchPointIdForCompany(compId, companies, fallbackDpId);
+    const targetDpId = resolveDispatchPointIdForCompany(compId, companies, dispatchPoints);
     const list = groupsMap.get(targetDpId) || [];
     list.push({
       ...line,
@@ -251,9 +316,9 @@ export function splitOrderByDispatchPoint(
 
   const dpEntries = Array.from(groupsMap.entries());
 
-  // All lines map to a single Dispatch Point: align dispatch_point_id cleanly without suffixing
+  // All lines map to a single Dispatch Point (or all unmapped): align dispatch_point_id cleanly without suffixing
   if (dpEntries.length <= 1) {
-    const targetDpId = dpEntries[0]?.[0] || fallbackDpId;
+    const targetDpId = dpEntries[0]?.[0] || UNMAPPED_DISPATCH_POINT_ID;
     const targetLines = dpEntries[0]?.[1] || lines;
     const companySet = new Set<string>();
     targetLines.forEach((l) => {
@@ -278,7 +343,10 @@ export function splitOrderByDispatchPoint(
     const childId = `${order.id}_dp_${idx + 1}`;
     const childOrderNumber = `${order.order_number}-DP${idx + 1}`;
     const dpObj = dispatchPoints.find((d) => d.id === dpId);
-    const dpLabel = dpObj ? `${dpObj.name} (${dpObj.code})` : dpId;
+    const dpLabel =
+      dpId === UNMAPPED_DISPATCH_POINT_ID || !dpObj
+        ? UNMAPPED_DISPATCH_POINT_LABEL
+        : `${dpObj.name} (${dpObj.code})`;
 
     const {
       lines: financialsLines,
@@ -352,7 +420,7 @@ export function getDispatchPickupBreakdown(
   for (const ord of orders) {
     const lines = ord.lines || [];
     if (lines.length === 0) {
-      const dpId = ord.dispatch_point_id || dispatchPoints[0]?.id || 'dp_central';
+      const dpId = resolveOrderPrimaryDispatchPointId(ord, companies, skus, dispatchPoints);
       const bucket = byDpId.get(dpId) || {
         dpId,
         orderId: ord.id,
@@ -375,11 +443,7 @@ export function getDispatchPickupBreakdown(
 
     for (const line of lines) {
       const compId = getEffectiveLineCompanyId(line, ord, skus);
-      const dpId = resolveDispatchPointIdForCompany(
-        compId,
-        companies,
-        ord.dispatch_point_id || dispatchPoints[0]?.id || 'dp_central'
-      );
+      const dpId = resolveDispatchPointIdForCompany(compId, companies, dispatchPoints);
       const bucket = byDpId.get(dpId) || {
         dpId,
         orderId: ord.id,
@@ -413,6 +477,7 @@ export function getDispatchPickupBreakdown(
 
   return Array.from(byDpId.values()).map((bucket) => {
     const dp = dispatchPoints.find((d) => d.id === bucket.dpId);
+    const isUnmapped = !dp || bucket.dpId === UNMAPPED_DISPATCH_POINT_ID;
     const comps = Array.from(bucket.companyIds).map((cid) => {
       const c = companies.find((comp) => comp.id === cid);
       return {
@@ -423,9 +488,9 @@ export function getDispatchPickupBreakdown(
     });
 
     return {
-      dispatchPointId: bucket.dpId,
-      dispatchPointName: dp?.name || bucket.dpId,
-      dispatchPointCode: dp?.code || 'DP',
+      dispatchPointId: isUnmapped ? UNMAPPED_DISPATCH_POINT_ID : bucket.dpId,
+      dispatchPointName: isUnmapped ? UNMAPPED_DISPATCH_POINT_LABEL : dp!.name,
+      dispatchPointCode: isUnmapped ? 'UNMAPPED' : dp!.code || 'DP',
       address: dp?.address || '',
       phone: dp?.phone || '',
       supervisorName: resolveDispatchPointSupervisor(dp).supervisorName,
@@ -488,10 +553,13 @@ export function buildDispatchSkuPartyMatrix(
   users: User[] = [],
   dispatchPoints: DispatchPoint[] = []
 ): DispatchSkuPartyMatrix {
-  const dpObj = dispatchPoints.find((d) => d.id === dispatchPointId);
+  const isUnmappedBucket = dispatchPointId === UNMAPPED_DISPATCH_POINT_ID;
+  const dpObj = isUnmappedBucket ? undefined : dispatchPoints.find((d) => d.id === dispatchPointId);
   const mappedCompanies =
     dispatchPointId === 'ALL'
       ? companies
+      : isUnmappedBucket
+      ? companies.filter((c) => isUnmappedDispatchPointId(c.dispatch_point_id, dispatchPoints))
       : companies.filter((c) => c.dispatch_point_id === dispatchPointId);
   const mappedCompanyIds = mappedCompanies.map((c) => c.id);
   const mappedCompanyIdSet = new Set(mappedCompanyIds);
@@ -508,9 +576,12 @@ export function buildDispatchSkuPartyMatrix(
 
       // Strict Principal Company -> Dispatch Point scoping
       if (dispatchPointId !== 'ALL') {
-        if (compId && mappedCompanyIdSet.size > 0) {
+        const lineDpId = resolveDispatchPointIdForCompany(compId, companies, dispatchPoints);
+        if (isUnmappedBucket) {
+          if (lineDpId !== UNMAPPED_DISPATCH_POINT_ID) continue;
+        } else if (compId && mappedCompanyIdSet.size > 0) {
           if (!mappedCompanyIdSet.has(compId)) continue;
-        } else if (!doesOrderLineBelongToDispatchPoint(line, ord, dispatchPointId, companies, skus)) {
+        } else if (lineDpId !== dispatchPointId) {
           continue;
         }
       }
@@ -592,11 +663,15 @@ export function buildDispatchSkuPartyMatrix(
     dispatchPointName:
       dispatchPointId === 'ALL'
         ? 'All Dispatch Points'
-        : dpObj?.name || dispatchPointId,
+        : isUnmappedBucket || !dpObj
+        ? UNMAPPED_DISPATCH_POINT_LABEL
+        : dpObj.name,
     dispatchPointCode:
       dispatchPointId === 'ALL'
         ? 'ALL'
-        : dpObj?.code || 'DP',
+        : isUnmappedBucket || !dpObj
+        ? 'UNMAPPED'
+        : dpObj.code || 'DP',
     mappedCompanyIds,
     mappedCompanyNames: mappedCompanies.map((c) => c.name),
     parties,

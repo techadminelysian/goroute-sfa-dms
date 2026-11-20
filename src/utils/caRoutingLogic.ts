@@ -55,7 +55,7 @@ export function applyCAMappingsToOrder(
   order: Partial<Order>,
   agentUser: User | null | undefined,
   allUsers: User[],
-  defaultDpId: string = 'dp_central',
+  defaultDpId: string = '',
   clientDistributor?: DistributorInstitution | null
 ): {
   dispatch_point_id: string;
@@ -72,8 +72,8 @@ export function applyCAMappingsToOrder(
   const raiserId = agentUser?.id || order.created_by_user_id || order.commission_agent_id || 'usr_agent_1';
   const raiserName = agentUser?.name || order.order_raiser_name || order.commission_agent_name || (isSE ? 'Sales Executive' : isDist ? 'Distributor' : 'Commission Agent');
 
-  // DP lookup: order DP or default (Depot is associated with Company)
-  const dpId = order.dispatch_point_id || defaultDpId;
+  // DP lookup: order DP or agent DP or supplied default (never a hardcoded fake DP ID; Principal Company -> DP resolves on split)
+  const dpId = order.dispatch_point_id || agentUser?.dispatch_point_id || defaultDpId || '';
 
   // Strict BE lookup: User profile fixed BE, or distributor mapped BE, or explicit order BE (no fallback to primary BE)
   const beId = agentUser?.billing_executive_id || clientDistributor?.billing_executive_id || order.billing_executive_id || null;

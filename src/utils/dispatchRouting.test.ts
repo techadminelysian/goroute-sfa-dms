@@ -2,10 +2,14 @@ import {
   buildDispatchSkuPartyMatrix,
   doesOrderBelongToDispatchPoint,
   getDispatchPickupBreakdown,
+  resolveDispatchPointIdForCompany,
   resolveDispatchPointSupervisor,
+  resolveOrderPrimaryDispatchPointId,
   serializeDispatchMatrixToCsv,
   splitOrderByDispatchPoint,
   syncDispatchPointsForUsers,
+  UNMAPPED_DISPATCH_POINT_ID,
+  UNMAPPED_DISPATCH_POINT_LABEL,
 } from './dispatchRouting';
 import {
   MOBILE_ONLY_ROLES,
@@ -36,6 +40,14 @@ import {
 } from './creditLedger';
 import { calculateCreditExposure } from './caRoutingLogic';
 import { normalizeFirestoreUser } from '../firebase/firestoreService';
+import {
+  buildDispatchBatchHistorySummaries,
+  computeNextDayDispatchAssignment,
+  getISTDateString,
+  getOrderEffectiveDispatchDate,
+  isOrderStageEligibleForDispatchQueue,
+  partitionDispatchOrdersForDate,
+} from './dispatchBatching';
 import { Company, DispatchPoint, DistributorInstitution, Invoice, Order, Payment, Retailer, SKU, User } from '../types';
 
 export function runDispatchRoutingTestSuite() {
@@ -987,6 +999,312 @@ export function runDispatchRoutingTestSuite() {
       breakdownWithVerifiedPayAndCN.remainingCredit === 15000 &&
       breakdownWithVerifiedPayAndCN.fundShortage === 0,
     `PendingPay=${JSON.stringify(breakdownWithPendingPay)}, VerifiedAndCN=${JSON.stringify(breakdownWithVerifiedPayAndCN)}`
+  );
+
+  // =========================================================================
+  // SCENARIO K: DAILY FRESH DISPATCH BATCHING (IST D+1), STAGE GATE & BACKLOG ISOLATION
+  // =========================================================================
+
+  // K1: IST Midnight Cutoff & Dynamic Confirmation-Date Scheduling (ignores original order_date)
+  const preMidnightIST = '2026-11-19T18:20:00Z'; // 2026-11-19 23:50 IST -> D = 2026-11-19, D+1 = 2026-11-20
+  const postMidnightIST = '2026-11-19T18:45:00Z'; // 2026-11-20 00:15 IST -> D = 2026-11-20, D+1 = 2026-11-21
+  const assignPre = computeNextDayDispatchAssignment(preMidnightIST);
+  const assignPost = computeNextDayDispatchAssignment(postMidnightIST);
+
+  assert(
+    'K1: IST Confirmation Cutoff Assigns Next-Day (D+1) Dispatch Date Dynamically Across 00:00 IST Boundary',
+    getISTDateString(preMidnightIST) === '2026-11-19' &&
+      assignPre.dispatch_date === '2026-11-20' &&
+      assignPre.dispatch_batch_id === 'BATCH-2026-11-20' &&
+      getISTDateString(postMidnightIST) === '2026-11-20' &&
+      assignPost.dispatch_date === '2026-11-21',
+    `Pre=${JSON.stringify(assignPre)}, Post=${JSON.stringify(assignPost)}`
+  );
+
+  // K2: Delayed Order Confirmed Today (created D-2, confirmed on 2026-11-19 IST) -> queues for 2026-11-20 (Tomorrow)
+  const delayedFreshOrder: Order = {
+    id: 'ord_k_fresh',
+    tenant_id: 't1',
+    order_number: 'ORD-K-FRESH',
+    channel: 'GT',
+    company_id: 'comp_a',
+    company_ids: ['comp_a'],
+    retailer_id: 'ret_k1',
+    retailer_name_raw: 'Fresh Mart',
+    beat_name: 'Beat 1',
+    dispatch_point_id: 'dp_a',
+    created_by_user_id: 'usr_ca1',
+    order_source_role: 'COMMISSION_AGENT',
+    order_raiser_name: 'Ramesh CFS',
+    order_date: '2026-11-17T06:00:00Z', // Created 2 days prior
+    delivery_date: '',
+    status: 'CONFIRMED',
+    fulfillment_source: 'PRINCIPAL_PO',
+    confirmed_at: assignPre.confirmed_at, // Confirmed on 2026-11-19 IST
+    dispatch_date: assignPre.dispatch_date, // 2026-11-20
+    dispatch_batch_id: assignPre.dispatch_batch_id,
+    total_amount: 5000,
+    tax_amount: 0,
+    has_below_cost_lines: false,
+    lines: [
+      {
+        id: 'lk1',
+        tenant_id: 't1',
+        order_id: 'ord_k_fresh',
+        sku_id: 'sku_a1',
+        sku_name: 'Milk Powder 1L',
+        company_id: 'comp_a',
+        quantity: 25,
+        unit_price: 200,
+        landing_price: 160,
+        total: 5000,
+        is_below_cost: false,
+        expected_claim_total: 0,
+      },
+    ],
+  };
+
+  const pendingVerifBlocked: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_k_pending_verif',
+    order_number: 'ORD-K-PEND',
+    status: 'PENDING_VERIFICATION',
+    confirmed_at: null,
+    dispatch_date: null,
+    dispatch_batch_id: null,
+  };
+
+  const verifiedUnconfirmedBlocked: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_k_verified_only',
+    order_number: 'ORD-K-VER',
+    status: 'VERIFIED',
+    confirmed_at: null,
+    dispatch_date: null,
+    dispatch_batch_id: null,
+  };
+
+  const priorBacklogOrder: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_k_prior_backlog',
+    order_number: 'ORD-K-OLD',
+    retailer_name_raw: 'Legacy Backlog Store',
+    order_date: '2026-11-15T06:00:00Z',
+    confirmed_at: '2026-11-16T08:00:00Z',
+    dispatch_date: '2026-11-17',
+    dispatch_batch_id: 'BATCH-2026-11-17',
+    status: 'CONFIRMED',
+    dispatched_at: null,
+  };
+
+  const legacyNoDispatchDateOrder: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_k_legacy_nodate',
+    order_number: 'ORD-K-LEG',
+    retailer_name_raw: 'No-Date Legacy Store',
+    order_date: '2026-11-16T06:00:00Z',
+    verified_at: '2026-11-16T10:00:00Z',
+    confirmed_at: null,
+    dispatch_date: null,
+    status: 'CONFIRMED',
+    dispatched_at: null,
+  };
+
+  const invoicedUndispatchedTomorrowOrder: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_k_inv_undisp',
+    order_number: 'ORD-K-INV',
+    retailer_id: 'ret_k2',
+    retailer_name_raw: 'Billed Fresh Store',
+    status: 'INVOICED',
+    invoiced_at: '2026-11-19T12:00:00Z',
+    dispatched_at: null,
+    dispatch_date: '2026-11-20',
+  };
+
+  const alreadyDispatchedTomorrowOrder: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_k_already_disp',
+    order_number: 'ORD-K-DONE',
+    retailer_name_raw: 'Already Loaded Store',
+    status: 'DISPATCHED',
+    dispatched_at: '2026-11-19T15:00:00Z',
+    dispatch_date: '2026-11-20',
+  };
+
+  const allScenarioKOrders = [
+    delayedFreshOrder,
+    pendingVerifBlocked,
+    verifiedUnconfirmedBlocked,
+    priorBacklogOrder,
+    legacyNoDispatchDateOrder,
+    invoicedUndispatchedTomorrowOrder,
+    alreadyDispatchedTomorrowOrder,
+  ];
+
+  const partitionedK = partitionDispatchOrdersForDate(allScenarioKOrders, '2026-11-20');
+
+  assert(
+    'K2: Stage Gate Blocks PENDING_VERIFICATION & Unconfirmed VERIFIED While Isolating Prior Backlog From Tomorrow Matrix',
+    isOrderStageEligibleForDispatchQueue(pendingVerifBlocked) === false &&
+      isOrderStageEligibleForDispatchQueue(verifiedUnconfirmedBlocked) === false &&
+      partitionedK.freshBatchOrders.map((o) => o.id).sort().join(',') === 'ord_k_fresh,ord_k_inv_undisp' &&
+      partitionedK.priorBacklogOrders.map((o) => o.id).sort().join(',') === 'ord_k_legacy_nodate,ord_k_prior_backlog' &&
+      partitionedK.dispatchedForDateOrders.map((o) => o.id).join(',') === 'ord_k_already_disp' &&
+      getOrderEffectiveDispatchDate(legacyNoDispatchDateOrder) === '2026-11-17',
+    `Fresh=${partitionedK.freshBatchOrders.map((o) => o.id)}, Backlog=${partitionedK.priorBacklogOrders.map((o) => o.id)}`
+  );
+
+  const dpK: DispatchPoint = {
+    id: 'dp_a',
+    tenant_id: 't1',
+    name: 'North Hub Depot',
+    code: 'DP-NTH',
+    address: 'Plot 12, Industrial Sector',
+    phone: '9800000001',
+    supervisor_name: 'Vikram Supervisor',
+  };
+  const compK: Company = {
+    id: 'comp_a',
+    tenant_id: 't1',
+    name: 'Amul Foods',
+    code: 'AMUL',
+    relationship_type: 'SS',
+    gstin: '27AAACA1234A1Z1',
+    dispatch_point_id: 'dp_a',
+    contact_person: 'Vikram',
+    email: 'amul@test.in',
+    phone: '9800000001',
+  };
+  const skuK: SKU = {
+    id: 'sku_a1',
+    tenant_id: 't1',
+    company_id: 'comp_a',
+    code: 'SKU-A1',
+    name: 'Milk Powder 1L',
+    category: 'Dairy',
+    hsn_code: '0402',
+    mrp: 240,
+    landing_price: 160,
+    selling_price: 200,
+    tax_rate: 5,
+    pack_size: '1x12',
+    below_cost_flag: false,
+    expected_claim_per_unit: 0,
+  };
+
+  // K3: Fresh SKU-vs-Party CSV Contains Strictly Fresh Tomorrow Orders (Column A = SKU Name, Row 1 = Party Names)
+  const freshMatrixK = buildDispatchSkuPartyMatrix(
+    partitionedK.freshBatchOrders,
+    'dp_a',
+    [compK],
+    [skuK],
+    [],
+    [dpK]
+  );
+  const freshCsvK = serializeDispatchMatrixToCsv(freshMatrixK);
+  const freshCsvFirstLine = freshCsvK.split('\n')[0] || '';
+  const freshCsvSecondLine = freshCsvK.split('\n')[1] || '';
+
+  assert(
+    'K3: Fresh Tomorrow Matrix CSV Excludes Backlog & Formats Column A = SKU Name and Row 1 = Party Names',
+    freshMatrixK.parties.length === 2 &&
+      !freshCsvK.includes('Legacy Backlog Store') &&
+      !freshCsvK.includes('No-Date Legacy Store') &&
+      freshCsvFirstLine.startsWith('"SKU Name","Billed Fresh Store') &&
+      freshCsvFirstLine.includes('Fresh Mart (CFS: Ramesh CFS)') &&
+      freshCsvSecondLine.startsWith('"Milk Powder 1L",25,25,50'),
+    `CSV:\n${freshCsvK}`
+  );
+
+  // K4: Dispatch Batch History Summarizes Batches Accurately (FINALIZED vs PARTIAL vs QUEUED)
+  const batchHistorySummaries = buildDispatchBatchHistorySummaries(
+    allScenarioKOrders,
+    [dpK],
+    [compK],
+    [skuK]
+  );
+  const batchNov20 = batchHistorySummaries.find((b) => b.dispatchDate === '2026-11-20');
+  const batchNov17 = batchHistorySummaries.find((b) => b.dispatchDate === '2026-11-17');
+
+  assert(
+    'K4: Dispatch Batch History Aggregates Daily Batches With Accurate Dispatched/Pending Counts & Status',
+    batchHistorySummaries.length === 2 &&
+      batchNov20?.totalOrders === 3 &&
+      batchNov20?.dispatchedCount === 1 &&
+      batchNov20?.pendingCount === 2 &&
+      batchNov20?.status === 'PARTIAL' &&
+      batchNov17?.totalOrders === 2 &&
+      batchNov17?.pendingCount === 2 &&
+      batchNov17?.status === 'QUEUED',
+    `Batches=${JSON.stringify(batchHistorySummaries.map((b) => ({ d: b.dispatchDate, t: b.totalOrders, dC: b.dispatchedCount, p: b.pendingCount, s: b.status })))}`
+  );
+
+  // Scenario L: Strict Principal Company -> Dispatch Point Mapping & Unmapped Dispatch Point Flagging
+  const unmappedCompany: Company = {
+    id: 'comp_unmapped_1',
+    tenant_id: 't1',
+    name: 'Unmapped Dairy Co',
+    code: 'UNMAP',
+    relationship_type: 'SS',
+    gstin: '27AAACU1234A1Z1',
+    dispatch_point_id: null,
+    contact_person: 'Nikhil',
+    email: 'unmap@test.in',
+    phone: '9800000099',
+  };
+  const unmappedSku: SKU = {
+    ...skuK,
+    id: 'sku_unmap_1',
+    company_id: 'comp_unmapped_1',
+    code: 'SKU-UNM-1',
+    name: 'Unmapped Curd 500g',
+  };
+  const unmappedOrder: Order = {
+    ...delayedFreshOrder,
+    id: 'ord_unmapped_dp',
+    order_number: 'ORD-UNMAP-01',
+    company_id: 'comp_unmapped_1',
+    company_ids: ['comp_unmapped_1'],
+    dispatch_point_id: '',
+    status: 'CONFIRMED',
+    dispatch_date: '2026-11-20',
+    confirmed_at: '2026-11-19T06:00:00.000Z',
+    lines: [
+      {
+        id: 'ol_unmap_1',
+        tenant_id: 't1',
+        order_id: 'ord_unmapped_dp',
+        sku_id: 'sku_unmap_1',
+        sku_name: 'Unmapped Curd 500g',
+        quantity: 12,
+        unit_price: 100,
+        landing_price: 80,
+        total: 1200,
+        is_below_cost: false,
+        expected_claim_total: 0,
+        company_id: 'comp_unmapped_1',
+      },
+    ],
+  };
+
+  const resolvedUnmappedCompDp = resolveDispatchPointIdForCompany('comp_unmapped_1', [compK, unmappedCompany], [dpK]);
+  const resolvedUnmappedOrderDp = resolveOrderPrimaryDispatchPointId(unmappedOrder, [compK, unmappedCompany], [skuK, unmappedSku], [dpK]);
+  const splitUnmapped = splitOrderByDispatchPoint(unmappedOrder, [compK, unmappedCompany], [skuK, unmappedSku], [dpK]);
+  const unmappedPickups = getDispatchPickupBreakdown(splitUnmapped, [compK, unmappedCompany], [skuK, unmappedSku], [dpK]);
+  const unmappedMatrix = buildDispatchSkuPartyMatrix(splitUnmapped, UNMAPPED_DISPATCH_POINT_ID, [compK, unmappedCompany], [skuK, unmappedSku], [], [dpK]);
+  const mappedMatrixEmptyForUnmapped = buildDispatchSkuPartyMatrix(splitUnmapped, 'dp_a', [compK, unmappedCompany], [skuK, unmappedSku], [], [dpK]);
+
+  assert(
+    'L1: Unmapped Principal Company Never Substitutes Fake DP ID & Flags Unmapped Dispatch Point',
+    resolvedUnmappedCompDp === UNMAPPED_DISPATCH_POINT_ID &&
+      resolvedUnmappedOrderDp === UNMAPPED_DISPATCH_POINT_ID &&
+      splitUnmapped[0]?.dispatch_point_id === UNMAPPED_DISPATCH_POINT_ID &&
+      unmappedPickups[0]?.dispatchPointName === UNMAPPED_DISPATCH_POINT_LABEL &&
+      unmappedMatrix.dispatchPointName === UNMAPPED_DISPATCH_POINT_LABEL &&
+      unmappedMatrix.rows.length === 1 &&
+      mappedMatrixEmptyForUnmapped.rows.length === 0,
+    `resolvedComp=${resolvedUnmappedCompDp}, splitDp=${splitUnmapped[0]?.dispatch_point_id}, pickup=${unmappedPickups[0]?.dispatchPointName}`
   );
 
   const passedCount = results.filter((r) => r.passed).length;

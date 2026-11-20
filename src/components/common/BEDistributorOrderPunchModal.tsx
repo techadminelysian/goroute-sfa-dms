@@ -531,7 +531,7 @@ export const BEDistributorOrderPunchModal: React.FC<BEDistributorOrderPunchModal
     const defaultResolvedDp = resolveDispatchPointIdForCompany(
       firstCompanyId,
       companies,
-      selectedDispatchPointId || selectedClient.dispatch_point_id || dispatchPoints[0]?.id || 'dp_central'
+      dispatchPoints
     );
 
     const newOrder: Order = {

@@ -11,6 +11,10 @@ import {
   OrderDepotEvaluation,
 } from '../../utils/stockAvailability';
 import {
+  resolveOrderPrimaryDispatchPointId,
+  UNMAPPED_DISPATCH_POINT_ID,
+} from '../../utils/dispatchRouting';
+import {
   validateGSTIN,
   validatePhoneNumber,
   validateStoreName,
@@ -147,33 +151,8 @@ export const OrderCapture: React.FC = () => {
   const [isEditMode, setIsEditMode] = useState(false);
   const [editLines, setEditLines] = useState<{ sku_id: string; quantity: number; unit_price: number }[]>([]);
 
-  // Audit Logs State
-  const [auditLogs, setAuditLogs] = useState<AuditBatchLog[]>([
-    {
-      id: 'log_101',
-      timestamp: '2026-08-09 15:30',
-      company_name: 'Britannia Industries Ltd',
-      company_code: 'BRIT',
-      order_count: 8,
-      sku_count: 14,
-      total_quantity: 1250,
-      total_value: 385000,
-      exported_by: 'Order Puncher (Rahul S.)',
-      file_name: 'Britannia_Verified_Primary_PO_2026-08-09.csv',
-    },
-    {
-      id: 'log_102',
-      timestamp: '2026-08-08 17:15',
-      company_name: 'Marico Ltd',
-      company_code: 'MARI',
-      order_count: 5,
-      sku_count: 8,
-      total_quantity: 620,
-      total_value: 194000,
-      exported_by: 'Order Puncher (Rahul S.)',
-      file_name: 'Marico_Verified_Primary_PO_2026-08-08.csv',
-    },
-  ]);
+  // Audit Logs State (session exports only)
+  const [auditLogs, setAuditLogs] = useState<AuditBatchLog[]>([]);
 
   // New Retailer Form State
   const [onboardedStoreSuccess, setOnboardedStoreSuccess] = useState<Retailer | null>(null);
@@ -1030,32 +1009,8 @@ export const OrderCapture: React.FC = () => {
         </div>
       )}
 
-      {/* Primary Sub-Navigation Tabs */}
+      {/* Primary Sub-Navigation Tabs (Streamlined 3-Tab PO & B2B Desk) */}
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs font-semibold">
-        <button
-          onClick={() => setActiveTab('DISTRIBUTORS_INSTITUTIONS')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
-            activeTab === 'DISTRIBUTORS_INSTITUTIONS'
-              ? 'bg-purple-600 text-white font-bold'
-              : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-          }`}
-        >
-          <Building2 size={15} />
-          {activeRole === 'BILLING' ? '★ ' : ''}Distributors & Institutions ({distributorOrdersCount})
-        </button>
-
-        <button
-          onClick={() => setActiveTab('REVIEW_QUEUE')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
-            activeTab === 'REVIEW_QUEUE'
-              ? 'bg-blue-600 text-white font-bold'
-              : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-          }`}
-        >
-          <Layers size={15} />
-          1. Consolidated Review Queue ({filteredOrders.length})
-        </button>
-
         <button
           onClick={() => setActiveTab('COMPANY_COMPILATION')}
           className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
@@ -1065,7 +1020,7 @@ export const OrderCapture: React.FC = () => {
           }`}
         >
           <FileSpreadsheet size={15} />
-          2. SKU-Wise Principle PO Consolidation
+          1. Depot Stock & Principal PO Compilation
         </button>
 
         <button
@@ -1077,24 +1032,24 @@ export const OrderCapture: React.FC = () => {
           }`}
         >
           <Building size={15} />
-          3. Principle Purchase Orders (POs) ({purchaseOrders.length})
+          2. Submitted Principal POs ({purchaseOrders.length})
         </button>
 
         <button
-          onClick={() => setActiveTab('AUDIT_LOGS')}
+          onClick={() => setActiveTab('DISTRIBUTORS_INSTITUTIONS')}
           className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
-            activeTab === 'AUDIT_LOGS'
-              ? 'bg-blue-600 text-white font-bold'
+            activeTab === 'DISTRIBUTORS_INSTITUTIONS'
+              ? 'bg-purple-600 text-white font-bold'
               : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
           }`}
         >
-          <FileText size={15} />
-          4. Portal History ({auditLogs.length})
+          <Building2 size={15} />
+          {activeRole === 'BILLING' ? '★ ' : ''}3. Distributors & Institutions ({distributorOrdersCount})
         </button>
       </div>
 
-      {/* TAB 1: CONSOLIDATED ORDER REVIEW QUEUE */}
-      {activeTab === 'REVIEW_QUEUE' && (
+      {/* TAB 1 LEGACY REVIEW QUEUE REMOVED (BE Verifies in Billing Desk; Delivery managed in Dispatch & Depot) */}
+      {false && activeTab === 'REVIEW_QUEUE' && (
         <div className="space-y-4">
           {/* Filters & Search Bar */}
           <div className="bg-slate-900 border border-slate-800 p-3 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -1489,13 +1444,6 @@ export const OrderCapture: React.FC = () => {
 
             <div className="flex flex-wrap items-center gap-2">
               <button
-                onClick={handlePunchAllCompaniesBatch}
-                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-lg shadow-indigo-900/40"
-                title="Mark ALL compiled store orders across ALL principal companies as PUNCHED TO PRINCIPAL COMPANY in one click"
-              >
-                <CheckSquare size={15} /> Punch ALL Compiled Orders to Principal
-              </button>
-              <button
                 onClick={handleExportAllCompaniesMasterCsv}
                 className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-blue-900/30"
                 title="Export single CSV containing primary POs for all companies & update statuses"
@@ -1576,7 +1524,8 @@ export const OrderCapture: React.FC = () => {
                 comp.id,
                 stockLedger,
                 orders,
-                skus
+                skus,
+                companies
               );
               const fullStockOrderCount = Object.values(depotEvals).filter((e) => e.status === 'FULL_STOCK').length;
               const partialStockOrderCount = Object.values(depotEvals).filter((e) => e.status === 'PARTIAL_STOCK').length;
@@ -1588,9 +1537,16 @@ export const OrderCapture: React.FC = () => {
                 { skuId: string; code: string; name: string; pack: string; quantity: number; unit_price: number; total: number; depotAvail: number }
               > = {};
 
-              // Pre-compute combined available depot stock across depots represented in companyOrders
+              // Pre-compute combined available depot stock across depots represented in companyOrders / comp.dispatch_point_id
               const representedDepots = Array.from(
-                new Set(companyOrders.map((o) => o.dispatch_point_id || 'dp_sahibabad'))
+                new Set(
+                  [
+                    comp.dispatch_point_id || '',
+                    ...companyOrders.map((o) =>
+                      resolveOrderPrimaryDispatchPointId(o, companies, skus, dispatchPoints)
+                    ),
+                  ].filter((dpId) => dpId && dpId !== UNMAPPED_DISPATCH_POINT_ID)
+                )
               );
               const skuDepotAvailSum: Record<string, number> = {};
               representedDepots.forEach((dpId) => {
@@ -1656,36 +1612,7 @@ export const OrderCapture: React.FC = () => {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        onClick={() => {
-                          const items = skuList.map((item) => {
-                            const skuObj = skus.find((s) => s.name === item.name || s.code === item.code);
-                            const landing = skuObj?.landing_price || item.unit_price * 0.85;
-                            return {
-                              sku_id: skuObj?.id || item.code,
-                              sku_code: item.code,
-                              sku_name: item.name,
-                              pack_size: item.pack,
-                              total_quantity: item.quantity,
-                              master_landing_price: landing,
-                              store_avg_price: item.unit_price,
-                              total_landing_amount: item.quantity * landing,
-                              verified: true,
-                            };
-                          });
-                          setRateVerifyModal({
-                            company: comp,
-                            orders: verifiedCompanyOrders.length > 0 ? verifiedCompanyOrders : companyOrders,
-                            items,
-                          });
-                        }}
-                        className="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-indigo-900/30"
-                        title="Audit rates, margins, and quantities before submitting PO to Principal Company"
-                      >
-                        <ShieldCheck size={14} /> Verify Rates & Quantities (Gate)
-                      </button>
-
-                      {/* Feature Addition: Fast-Track Confirmation from Existing Depot Stock */}
+                      {/* Fast-Track Confirmation from Existing Depot Stock */}
                       <button
                         onClick={() => {
                           if (verifiedCompanyOrders.length === 0) {
@@ -2093,20 +2020,13 @@ export const OrderCapture: React.FC = () => {
 
                         <div className="flex flex-wrap items-center gap-2">
                           {po.status === 'SUBMITTED_TO_PRINCIPLE' && (
-                            <button
-                              onClick={() => {
-                                updatePurchaseOrderStatus(po.id, 'DISPATCHED_BY_PRINCIPLE');
-                                alert(`🚚 Principle Company ${po.company_name} factory dispatch simulated!\n\nStatus is now DISPATCHED_BY_PRINCIPLE.\nParallel alert sent to Dispatcher for Inward Docking.`);
-                              }}
-                              className="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-indigo-900/30"
-                              title="Simulate manufacturer dispatching goods truck to depot"
-                            >
-                              <Truck size={14} /> Simulate Principle Factory Dispatch
-                            </button>
+                            <span className="text-xs font-semibold text-indigo-300 flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-950/60 border border-indigo-500/30">
+                              <CheckCircle2 size={13} /> Queued on Dispatch Sheet (D+1) • Ready for Depot Inward
+                            </span>
                           )}
                           {po.status === 'DISPATCHED_BY_PRINCIPLE' && (
                             <span className="text-xs font-semibold text-indigo-300 flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-950/60 border border-indigo-500/30">
-                              <Clock size={13} className="animate-spin" /> In-Transit (Dispatcher can Inward at Dock)
+                              <Clock size={13} /> In-Transit (Ready for Depot Inward)
                             </span>
                           )}
                           {po.status === 'INWARDED_AT_DEPOT' && (

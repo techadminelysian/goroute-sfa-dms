@@ -53,7 +53,14 @@ import {
 } from '../utils/creditLedger';
 import { isFieldScopedRole } from '../utils/caRoutingLogic';
 import { getDepotAvailableStockMap, buildSplitOrdersForDepotAndPO } from '../utils/stockAvailability';
-import { splitOrderByDispatchPoint, syncDispatchPointsForUsers } from '../utils/dispatchRouting';
+import {
+  splitOrderByDispatchPoint,
+  syncDispatchPointsForUsers,
+  resolveDispatchPointIdForCompany,
+  resolveOrderPrimaryDispatchPointId,
+  UNMAPPED_DISPATCH_POINT_ID,
+} from '../utils/dispatchRouting';
+import { computeNextDayDispatchAssignment, getTomorrowISTDateString } from '../utils/dispatchBatching';
 import {
   sanitizeMobileNumber,
   isValidMobileNumber,
@@ -174,11 +181,12 @@ const loadStore = (): StoreData => {
       const rawLoadedDps: DispatchPoint[] = Array.isArray(parsed.dispatchPoints) ? parsed.dispatchPoints : [];
       const loadedDps: DispatchPoint[] = syncDispatchPointsForUsers(rawLoadedDps, mergedUsers).updatedDispatchPoints;
       const loadedCompanies: Company[] = Array.isArray(parsed.companies) ? parsed.companies : [];
+      const loadedSkus: SKU[] = Array.isArray(parsed.skus) ? parsed.skus : [];
+      const validDpIds = new Set(loadedDps.map((dp) => dp.id));
 
       const normalizedCompanies: Company[] = loadedCompanies.map((c) => {
-        if (!c.dispatch_point_id && loadedDps.length > 0) {
-          const fallbackDp = loadedDps.find((dp) => dp.tenant_id === c.tenant_id)?.id || loadedDps[0]?.id || null;
-          return { ...c, dispatch_point_id: fallbackDp };
+        if (validDpIds.size > 0 && c.dispatch_point_id && !validDpIds.has(c.dispatch_point_id)) {
+          return { ...c, dispatch_point_id: null };
         }
         return c;
       });
@@ -188,7 +196,7 @@ const loadStore = (): StoreData => {
         tenantSettings: parsed.tenantSettings || {},
         companies: normalizedCompanies,
         dispatchPoints: loadedDps,
-        skus: Array.isArray(parsed.skus) ? parsed.skus : [],
+        skus: loadedSkus,
         beats: Array.isArray(parsed.beats) ? parsed.beats : [],
         retailers: Array.isArray(parsed.retailers)
           ? parsed.retailers.map((r: any) => ({
@@ -198,18 +206,27 @@ const loadStore = (): StoreData => {
             }))
           : [],
         distributors: Array.isArray(parsed.distributors) ? parsed.distributors : [],
-        orders: savedOrders.map((o: any) => ({
-          ...o,
-          total_amount: Number(o.total_amount) || (Array.isArray(o.lines) ? o.lines.reduce((s: number, l: any) => s + (Number(l?.total) || 0), 0) : 0),
-          lines: Array.isArray(o.lines)
-            ? o.lines.map((l: any) => ({
-                ...l,
-                quantity: Number(l?.quantity) || 0,
-                unit_price: Number(l?.unit_price) || 0,
-                total: Number(l?.total) != null && !isNaN(Number(l?.total)) ? Number(l.total) : (Number(l?.quantity) || 0) * (Number(l?.unit_price) || 0),
-              }))
-            : [],
-        })),
+        orders: savedOrders.map((o: any) => {
+          const baseOrder: Order = {
+            ...o,
+            total_amount: Number(o.total_amount) || (Array.isArray(o.lines) ? o.lines.reduce((s: number, l: any) => s + (Number(l?.total) || 0), 0) : 0),
+            lines: Array.isArray(o.lines)
+              ? o.lines.map((l: any) => ({
+                  ...l,
+                  quantity: Number(l?.quantity) || 0,
+                  unit_price: Number(l?.unit_price) || 0,
+                  total: Number(l?.total) != null && !isNaN(Number(l?.total)) ? Number(l.total) : (Number(l?.quantity) || 0) * (Number(l?.unit_price) || 0),
+                }))
+              : [],
+          };
+          const resolvedDp = resolveOrderPrimaryDispatchPointId(baseOrder, normalizedCompanies, loadedSkus, loadedDps);
+          if (resolvedDp !== UNMAPPED_DISPATCH_POINT_ID) {
+            baseOrder.dispatch_point_id = resolvedDp;
+          } else if (!baseOrder.dispatch_point_id || (validDpIds.size > 0 && !validDpIds.has(baseOrder.dispatch_point_id))) {
+            baseOrder.dispatch_point_id = UNMAPPED_DISPATCH_POINT_ID;
+          }
+          return baseOrder;
+        }),
         purchaseOrders: Array.isArray(parsed.purchaseOrders) ? parsed.purchaseOrders : [],
         workflowNotifications: Array.isArray(parsed.workflowNotifications) ? parsed.workflowNotifications : [],
         stockLedger: Array.isArray(parsed.stockLedger) ? parsed.stockLedger : [],
@@ -390,6 +407,22 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
           const dpSync = syncDispatchPointsForUsers(memoryStore.dispatchPoints, memoryStore.users);
           memoryStore.dispatchPoints = dpSync.updatedDispatchPoints;
         }
+        const validDpIdsInit = new Set(memoryStore.dispatchPoints.map((dp) => dp.id));
+        memoryStore.orders = memoryStore.orders.map((ord) => {
+          const resolvedDp = resolveOrderPrimaryDispatchPointId(
+            ord,
+            memoryStore.companies,
+            memoryStore.skus,
+            memoryStore.dispatchPoints
+          );
+          if (resolvedDp !== UNMAPPED_DISPATCH_POINT_ID) {
+            return ord.dispatch_point_id === resolvedDp ? ord : { ...ord, dispatch_point_id: resolvedDp };
+          }
+          if (!ord.dispatch_point_id || (validDpIdsInit.size > 0 && !validDpIdsInit.has(ord.dispatch_point_id))) {
+            return { ...ord, dispatch_point_id: UNMAPPED_DISPATCH_POINT_ID };
+          }
+          return ord;
+        });
 
         memoryStore.firebaseStatus = 'CONNECTED';
         memoryStore.firebaseErrorMessage = null;
@@ -508,6 +541,22 @@ export const initFirestoreIntegration = async (forceRefetch = false) => {
         changed = true;
       }
         if (changed) {
+          const validLiveDpIds = new Set(memoryStore.dispatchPoints.map((dp) => dp.id));
+          memoryStore.orders = memoryStore.orders.map((ord) => {
+            const resolvedDp = resolveOrderPrimaryDispatchPointId(
+              ord,
+              memoryStore.companies,
+              memoryStore.skus,
+              memoryStore.dispatchPoints
+            );
+            if (resolvedDp !== UNMAPPED_DISPATCH_POINT_ID) {
+              return ord.dispatch_point_id === resolvedDp ? ord : { ...ord, dispatch_point_id: resolvedDp };
+            }
+            if (!ord.dispatch_point_id || (validLiveDpIds.size > 0 && !validLiveDpIds.has(ord.dispatch_point_id))) {
+              return { ...ord, dispatch_point_id: UNMAPPED_DISPATCH_POINT_ID };
+            }
+            return ord;
+          });
           memoryStore.lastSyncedAt = new Date().toISOString();
           persist();
         }
@@ -730,6 +779,82 @@ const syncPartyCreditAndWriteLedger = (params: {
   return matchedParty;
 };
 
+// Automatically deducts Depot Stock from stockLedger once per DEPOT_STOCK order upon billing or dispatch
+const recordDepotStockDispatchOutIfMissing = (
+  order: Order,
+  params: {
+    refDocId: string;
+    refDocType: StockLedgerEntry['reference_doc_type'];
+    actorName?: string;
+    vehicleNumber?: string;
+  }
+): StockLedgerEntry[] => {
+  if (!order || order.fulfillment_source !== 'DEPOT_STOCK') return [];
+  const alreadyDeducted = (memoryStore.stockLedger || []).some(
+    (st) => st.entry_type === 'DISPATCH_OUT' && st.linked_order_id === order.id
+  );
+  if (alreadyDeducted) return [];
+
+  const now = new Date().toISOString();
+  const createdEntries: StockLedgerEntry[] = [];
+
+  (order.lines || []).forEach((line, idx) => {
+    const qty = line.verified_quantity != null ? Number(line.verified_quantity) : Number(line.quantity) || 0;
+    if (qty <= 0 || !line.sku_id) return;
+
+    const sku = memoryStore.skus.find((s) => s.id === line.sku_id);
+    const compId = line.company_id || sku?.company_id || order.company_id;
+    const dpId = resolveDispatchPointIdForCompany(
+      compId,
+      memoryStore.companies,
+      memoryStore.dispatchPoints
+    );
+
+    const entry: StockLedgerEntry = {
+      id: `stk_depot_out_${order.id}_${line.id || idx}_${Date.now()}`,
+      tenant_id: order.tenant_id || memoryStore.activeTenantId,
+      dispatch_point_id: dpId,
+      company_id: compId,
+      sku_id: line.sku_id,
+      entry_type: 'DISPATCH_OUT',
+      quantity: qty,
+      expected_quantity: qty,
+      variance_quantity: 0,
+      reference_doc_type: params.refDocType,
+      reference_doc_id: params.refDocId,
+      vehicle_number: params.vehicleNumber || 'DEPOT-DISPATCH',
+      recipient_type:
+        order.channel === 'DISTRIBUTOR'
+          ? 'SUB_DISTRIBUTOR'
+          : order.channel === 'INSTITUTIONAL'
+          ? 'INSTITUTION'
+          : 'COMMISSION_AGENT',
+      recipient_id: order.retailer_id || undefined,
+      recipient_name: order.retailer_name_raw,
+      linked_order_id: order.id,
+      timestamp: now,
+      performed_by_user_id: memoryStore.currentUserId || 'usr_billing_1',
+      dispatcher_name: params.actorName || 'Depot Fulfillment',
+      notes: `Auto-adjusted Depot Stock (${params.refDocType === 'ORDER' ? 'Billed' : 'Dispatched'}) for #${order.order_number} (${params.refDocId})`,
+      ack_status: 'PENDING',
+      ack_type: 'DIGITAL_SIGNATURE',
+    };
+
+    createdEntries.push(entry);
+  });
+
+  if (createdEntries.length > 0) {
+    memoryStore.stockLedger = [...createdEntries, ...(memoryStore.stockLedger || [])];
+    if (isFirebaseConfigured()) {
+      createdEntries.forEach((entry) => {
+        saveRecordToFirestore(COLLECTIONS.STOCK_LEDGER, entry.id, entry);
+      });
+    }
+  }
+
+  return createdEntries;
+};
+
 // Module-level Fast-Track Confirmation from Existing Depot Stock (safe to invoke from hook & split fallback)
 const confirmOrdersFromDepotStockAction = (
   orderIds: string[],
@@ -748,7 +873,12 @@ const confirmOrdersFromDepotStockAction = (
   const rejectedReasons: string[] = [];
 
   for (const ord of targetOrders) {
-    const dpId = ord.dispatch_point_id || 'dp_sahibabad';
+    const dpId = resolveOrderPrimaryDispatchPointId(
+      ord,
+      memoryStore.companies,
+      memoryStore.skus,
+      memoryStore.dispatchPoints
+    );
     if (!remainingByDepot[dpId]) {
       const stockMap = getDepotAvailableStockMap(dpId, memoryStore.stockLedger, memoryStore.orders);
       const rem: Record<string, number> = {};
@@ -786,6 +916,7 @@ const confirmOrdersFromDepotStockAction = (
   }
 
   const now = new Date().toISOString();
+  const dispatchAssignment = computeNextDayDispatchAssignment(now);
   const validSet = new Set(validOrders.map((o) => o.id));
   const updatedOrders: Order[] = [];
 
@@ -796,7 +927,10 @@ const confirmOrdersFromDepotStockAction = (
         status: 'CONFIRMED',
         fulfillment_source: 'DEPOT_STOCK',
         is_locked: true,
-        notes: `${o.notes ? `${o.notes} | ` : ''}Fast-track confirmed from Depot Stock by ${confirmedByName} on ${now.split('T')[0]}`,
+        confirmed_at: dispatchAssignment.confirmed_at,
+        dispatch_date: dispatchAssignment.dispatch_date,
+        dispatch_batch_id: dispatchAssignment.dispatch_batch_id,
+        notes: `${o.notes ? `${o.notes} | ` : ''}Fast-track confirmed from Depot Stock by ${confirmedByName} on ${now.split('T')[0]} (Dispatch: ${dispatchAssignment.dispatch_date})`,
       };
       updatedOrders.push(next);
       return next;
@@ -810,7 +944,7 @@ const confirmOrdersFromDepotStockAction = (
     created_at: now,
     tenant_id: ord.tenant_id,
     title: `Order #${ord.order_number} Confirmed from Depot Stock`,
-    message: `Order #${ord.order_number} (${ord.retailer_name_raw}) fast-track confirmed from existing Depot Stock. Auto-queued for Dispatch & Invoicing.`,
+    message: `Order #${ord.order_number} (${ord.retailer_name_raw}) fast-track confirmed from existing Depot Stock. Scheduled for dispatch batch ${dispatchAssignment.dispatch_date}.`,
     type: 'ORDER_CONFIRMED_DEPOT_STOCK',
     target_roles: ['BILLING', 'DISPATCHER', 'COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR', 'ADMIN'],
     target_user_id: ord.created_by_user_id || ord.commission_agent_id || undefined,
@@ -834,6 +968,9 @@ const confirmOrdersFromDepotStockAction = (
           status: 'CONFIRMED',
           fulfillment_source: 'DEPOT_STOCK',
           is_locked: true,
+          confirmed_at: ord.confirmed_at,
+          dispatch_date: ord.dispatch_date,
+          dispatch_batch_id: ord.dispatch_batch_id,
           notes: ord.notes,
         }),
       }).catch((err) => console.warn('[DB SYNC] Failed to confirm depot stock order on server:', err));
@@ -848,8 +985,8 @@ const confirmOrdersFromDepotStockAction = (
     success: true,
     confirmedCount: updatedOrders.length,
     message: rejectedReasons.length > 0
-      ? `Confirmed ${updatedOrders.length} order(s) from Depot Stock. Skipped shortage order(s): ${rejectedReasons.join('; ')}`
-      : `Confirmed ${updatedOrders.length} order(s) directly from Depot Stock.`,
+      ? `Confirmed ${updatedOrders.length} order(s) from Depot Stock for ${dispatchAssignment.dispatch_date}. Skipped shortage order(s): ${rejectedReasons.join('; ')}`
+      : `Confirmed ${updatedOrders.length} order(s) directly from Depot Stock (Dispatch Date: ${dispatchAssignment.dispatch_date}).`,
   };
 };
 
@@ -1247,7 +1384,7 @@ export const useAppStore = () => {
           passwordValid = true;
         }
       }
-      if (!passwordValid && (password === 'Fmcg@2025' || password === 'Admin@123' || password === 'Password@123')) {
+      if (!passwordValid && (password === 'Fmcg@2025')) {
         passwordValid = true;
       }
 
@@ -2249,23 +2386,55 @@ export const useAppStore = () => {
       }
     },
 
-    updateOrderStatus: (orderId: string, status: Order['status']) => {
+    updateOrderStatus: (
+      orderId: string,
+      status: Order['status'],
+      options?: { skipAutoStockDeduction?: boolean; preserveInvoicedStatus?: boolean }
+    ) => {
       const prevOrder = memoryStore.orders.find((o) => o.id === orderId);
       const now = new Date().toISOString();
       const extraPatch: Partial<Order> = {};
-      if (status === 'DISPATCHED') {
+      let resolvedStatus: Order['status'] = status;
+
+      if (status === 'CONFIRMED') {
+        const dispatchAssignment = computeNextDayDispatchAssignment(now);
+        extraPatch.confirmed_at = prevOrder?.confirmed_at || dispatchAssignment.confirmed_at;
+        extraPatch.dispatch_date = prevOrder?.dispatch_date || dispatchAssignment.dispatch_date;
+        extraPatch.dispatch_batch_id = prevOrder?.dispatch_batch_id || dispatchAssignment.dispatch_batch_id;
+        extraPatch.is_locked = true;
+      } else if (status === 'DISPATCHED') {
         extraPatch.dispatched_at = prevOrder?.dispatched_at || now;
+        if (options?.preserveInvoicedStatus && prevOrder?.status === 'INVOICED') {
+          resolvedStatus = 'INVOICED';
+        }
+        if (!options?.skipAutoStockDeduction && prevOrder && prevOrder.fulfillment_source === 'DEPOT_STOCK') {
+          recordDepotStockDispatchOutIfMissing(prevOrder, {
+            refDocId: prevOrder.order_number,
+            refDocType: 'GATE_PASS',
+            actorName: 'Dispatch Finalizer',
+          });
+        }
+      } else if (status === 'DELIVERED') {
+        extraPatch.dispatched_at = prevOrder?.dispatched_at || now;
+        extraPatch.delivered_at = prevOrder?.delivered_at || now;
+        if (!options?.skipAutoStockDeduction && prevOrder && prevOrder.fulfillment_source === 'DEPOT_STOCK') {
+          recordDepotStockDispatchOutIfMissing(prevOrder, {
+            refDocId: prevOrder.order_number,
+            refDocType: 'GATE_PASS',
+            actorName: 'Delivery Confirmation',
+          });
+        }
       } else if (status === 'INVOICED') {
         extraPatch.invoiced_at = prevOrder?.invoiced_at || now;
       }
 
       memoryStore.orders = memoryStore.orders.map((o) =>
-        o.id === orderId ? { ...o, status, ...extraPatch } : o
+        o.id === orderId ? { ...o, status: resolvedStatus, ...extraPatch } : o
       );
 
       const fullOrder = memoryStore.orders.find((o) => o.id === orderId);
       if (prevOrder && fullOrder) {
-        if (prevOrder.status !== 'CANCELLED' && status === 'CANCELLED') {
+        if (prevOrder.status !== 'CANCELLED' && resolvedStatus === 'CANCELLED') {
           syncPartyCreditAndWriteLedger({
             tenantId: fullOrder.tenant_id,
             partyId: fullOrder.retailer_id,
@@ -2291,12 +2460,287 @@ export const useAppStore = () => {
       fetch(`/api/orders/${orderId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status, ...extraPatch }),
+        body: JSON.stringify({ status: resolvedStatus, ...extraPatch }),
       }).catch((err) => console.warn('[DB SYNC] Failed to patch order status in server database:', err));
 
       if (isFirebaseConfigured() && fullOrder) {
         saveRecordToFirestore(COLLECTIONS.ORDERS, orderId, fullOrder);
       }
+    },
+
+    carryForwardOrdersToDispatchDate: (
+      orderIds: string[],
+      targetDispatchDate?: string,
+      actorName: string = 'Admin / Dispatcher'
+    ): { success: boolean; updatedCount: number; targetDate: string; message: string } => {
+      const targetDate = targetDispatchDate || getTomorrowISTDateString();
+      const batchId = `BATCH-${targetDate}`;
+      const now = new Date().toISOString();
+      const idSet = new Set(orderIds);
+      const updatedOrders: Order[] = [];
+
+      memoryStore.orders = memoryStore.orders.map((o) => {
+        if (
+          idSet.has(o.id) &&
+          o.status !== 'CANCELLED' &&
+          o.status !== 'DISPATCHED' &&
+          o.status !== 'DELIVERED' &&
+          !o.dispatched_at
+        ) {
+          const next: Order = {
+            ...o,
+            dispatch_date: targetDate,
+            dispatch_batch_id: batchId,
+            confirmed_at: o.confirmed_at || now,
+            notes: `${o.notes ? `${o.notes} | ` : ''}Carried forward to ${targetDate} by ${actorName}`,
+          };
+          updatedOrders.push(next);
+          return next;
+        }
+        return o;
+      });
+
+      if (updatedOrders.length === 0) {
+        return {
+          success: false,
+          updatedCount: 0,
+          targetDate,
+          message: 'No eligible un-dispatched backlog orders found to carry forward.',
+        };
+      }
+
+      persist();
+
+      updatedOrders.forEach((ord) => {
+        fetch(`/api/orders/${ord.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dispatch_date: ord.dispatch_date,
+            dispatch_batch_id: ord.dispatch_batch_id,
+            confirmed_at: ord.confirmed_at,
+            notes: ord.notes,
+          }),
+        }).catch((err) => console.warn('[DB SYNC] Failed to carry forward order:', err));
+
+        if (isFirebaseConfigured()) {
+          saveRecordToFirestore(COLLECTIONS.ORDERS, ord.id, ord);
+        }
+      });
+
+      return {
+        success: true,
+        updatedCount: updatedOrders.length,
+        targetDate,
+        message: `Carried forward ${updatedOrders.length} order(s) to Dispatch Batch ${targetDate}.`,
+      };
+    },
+
+    finalizeDispatchBatch: (
+      orderIds: string[],
+      actorName: string = 'Dispatch Finalizer'
+    ): { success: boolean; dispatchedCount: number; message: string } => {
+      const now = new Date().toISOString();
+      const idSet = new Set(orderIds);
+      const updatedOrders: Order[] = [];
+
+      memoryStore.orders = memoryStore.orders.map((o) => {
+        if (
+          idSet.has(o.id) &&
+          o.status !== 'CANCELLED' &&
+          o.status !== 'DELIVERED' &&
+          o.status !== 'DISPATCHED' &&
+          !o.dispatched_at
+        ) {
+          const nextStatus: Order['status'] = o.status === 'INVOICED' ? 'INVOICED' : 'DISPATCHED';
+          const next: Order = {
+            ...o,
+            status: nextStatus,
+            dispatched_at: now,
+            notes: `${o.notes ? `${o.notes} | ` : ''}Batch finalized & marked Dispatched by ${actorName} on ${now.split('T')[0]}`,
+          };
+          updatedOrders.push(next);
+          return next;
+        }
+        return o;
+      });
+
+      if (updatedOrders.length === 0) {
+        return {
+          success: false,
+          dispatchedCount: 0,
+          message: 'No un-dispatched orders selected to finalize.',
+        };
+      }
+
+      // Automatically deduct DEPOT_STOCK inventory in stockLedger once dispatched
+      updatedOrders.forEach((ord) => {
+        if (ord.fulfillment_source === 'DEPOT_STOCK') {
+          recordDepotStockDispatchOutIfMissing(ord, {
+            refDocId: ord.order_number,
+            refDocType: 'GATE_PASS',
+            actorName,
+          });
+        }
+      });
+
+      persist();
+
+      updatedOrders.forEach((ord) => {
+        fetch(`/api/orders/${ord.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            status: ord.status,
+            dispatched_at: ord.dispatched_at,
+            notes: ord.notes,
+          }),
+        }).catch((err) => console.warn('[DB SYNC] Failed to finalize dispatch batch order:', err));
+
+        if (isFirebaseConfigured()) {
+          saveRecordToFirestore(COLLECTIONS.ORDERS, ord.id, ord);
+        }
+      });
+
+      return {
+        success: true,
+        dispatchedCount: updatedOrders.length,
+        message: `Finalized batch: ${updatedOrders.length} order(s) marked Dispatched and cleared from pending queue.`,
+      };
+    },
+
+    // Offline Paper-Sheet (BE/Office) OR Online Mobile Dispatcher Delivery Entry -> unlocks Invoicing
+    markOrdersDelivered: (params: {
+      orderIds: string[];
+      deliveredByName?: string;
+      deliveredAt?: string;
+      proofRef?: string;
+      notes?: string;
+      cratesIssued?: number;
+      cratesReturned?: number;
+    }): { success: boolean; deliveredCount: number; message: string } => {
+      const now = params.deliveredAt ? new Date(params.deliveredAt).toISOString() : new Date().toISOString();
+      const idSet = new Set(params.orderIds || []);
+      const actor = (params.deliveredByName || 'Billing Executive / Dispatcher').trim();
+      const proofRef = (params.proofRef || '').trim();
+      const deliveryNotes = (params.notes || '').trim();
+      const eligibleStatuses: Order['status'][] = [
+        'CONFIRMED',
+        'DISPATCHED',
+        'PUNCHED_TO_PRINCIPAL',
+        'PRINCIPAL_DISPATCHED',
+        'APPROVED',
+      ];
+      const updatedOrders: Order[] = [];
+
+      memoryStore.orders = memoryStore.orders.map((o) => {
+        if (idSet.has(o.id) && eligibleStatuses.includes(o.status)) {
+          const noteSuffix = [
+            `Delivered by ${actor} on ${now.split('T')[0]}`,
+            proofRef ? `Proof/Challan: ${proofRef}` : '',
+            deliveryNotes || '',
+          ]
+            .filter(Boolean)
+            .join(' • ');
+
+          const next: Order = {
+            ...o,
+            status: 'DELIVERED',
+            dispatched_at: o.dispatched_at || now,
+            delivered_at: now,
+            delivered_by: actor,
+            delivery_proof_ref: proofRef || o.delivery_proof_ref || null,
+            delivery_notes: deliveryNotes || o.delivery_notes || null,
+            crates_issued:
+              params.orderIds.length === 1 && params.cratesIssued !== undefined
+                ? Math.max(0, Number(params.cratesIssued) || 0)
+                : o.crates_issued,
+            crates_returned:
+              params.orderIds.length === 1 && params.cratesReturned !== undefined
+                ? Math.max(0, Number(params.cratesReturned) || 0)
+                : o.crates_returned,
+            notes: `${o.notes ? `${o.notes} | ` : ''}${noteSuffix}`,
+          };
+          updatedOrders.push(next);
+          return next;
+        }
+        return o;
+      });
+
+      if (updatedOrders.length === 0) {
+        return {
+          success: false,
+          deliveredCount: 0,
+          message: 'No eligible Confirmed / Dispatched orders found to mark Delivered.',
+        };
+      }
+
+      // Deduct depot stock once if DEPOT_STOCK order hasn't had DISPATCH_OUT recorded yet
+      updatedOrders.forEach((ord) => {
+        if (ord.fulfillment_source === 'DEPOT_STOCK') {
+          recordDepotStockDispatchOutIfMissing(ord, {
+            refDocId: proofRef || ord.order_number,
+            refDocType: 'GATE_PASS',
+            actorName: actor,
+          });
+        }
+      });
+
+      // Update crate custody ledger for single-order delivery with crate movement
+      if (
+        updatedOrders.length === 1 &&
+        ((Number(params.cratesIssued) || 0) > 0 || (Number(params.cratesReturned) || 0) > 0)
+      ) {
+        const ord = updatedOrders[0];
+        const ci = Math.max(0, Number(params.cratesIssued) || 0);
+        const cr = Math.max(0, Number(params.cratesReturned) || 0);
+        if (ord.retailer_id) {
+          const targetRetailer = memoryStore.retailers.find((r) => r.id === ord.retailer_id);
+          if (targetRetailer) {
+            const newBal = Math.max(0, (targetRetailer.crate_custody_balance || 0) + ci - cr);
+            memoryStore.retailers = memoryStore.retailers.map((r) =>
+              r.id === ord.retailer_id
+                ? {
+                    ...r,
+                    crate_custody_balance: newBal,
+                    last_crate_issue_date: ci > 0 ? now : r.last_crate_issue_date,
+                    last_crate_return_date: cr > 0 ? now : r.last_crate_return_date,
+                  }
+                : r
+            );
+          }
+        }
+      }
+
+      persist();
+
+      updatedOrders.forEach((ord) => {
+        fetch(`/api/orders/${ord.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            status: 'DELIVERED',
+            dispatched_at: ord.dispatched_at,
+            delivered_at: ord.delivered_at,
+            delivered_by: ord.delivered_by,
+            delivery_proof_ref: ord.delivery_proof_ref,
+            delivery_notes: ord.delivery_notes,
+            crates_issued: ord.crates_issued,
+            crates_returned: ord.crates_returned,
+            notes: ord.notes,
+          }),
+        }).catch((err) => console.warn('[DB SYNC] Failed to mark order delivered on server:', err));
+
+        if (isFirebaseConfigured()) {
+          saveRecordToFirestore(COLLECTIONS.ORDERS, ord.id, ord);
+        }
+      });
+
+      return {
+        success: true,
+        deliveredCount: updatedOrders.length,
+        message: `Marked ${updatedOrders.length} order(s) DELIVERED — unlocked for final invoicing.`,
+      };
     },
 
     // Pillar 1 & 2: Verify Order with Parallel Alert broadcast to Order Puncher & Dispatcher
@@ -2341,10 +2785,12 @@ export const useAppStore = () => {
     addPurchaseOrder: (po: PrinciplePurchaseOrder) => {
       memoryStore.purchaseOrders = [po, ...(memoryStore.purchaseOrders || [])];
       const now = new Date().toISOString();
+      const dispatchAssignment = computeNextDayDispatchAssignment(po.submitted_at || now);
       const linkedIds = po.linked_order_ids || [];
       const updatedOrders: Order[] = [];
 
       // Transition linked orders from VERIFIED -> CONFIRMED (fulfillment_source: 'PRINCIPAL_PO')
+      // and stamp next-day dispatch_date (D + 1 IST) based strictly on confirmation timestamp
       if (linkedIds.length > 0) {
         memoryStore.orders = memoryStore.orders.map((o) => {
           if (linkedIds.includes(o.id)) {
@@ -2353,6 +2799,9 @@ export const useAppStore = () => {
               status: 'CONFIRMED',
               fulfillment_source: 'PRINCIPAL_PO',
               is_locked: true,
+              confirmed_at: dispatchAssignment.confirmed_at,
+              dispatch_date: dispatchAssignment.dispatch_date,
+              dispatch_batch_id: dispatchAssignment.dispatch_batch_id,
             };
             updatedOrders.push(nextOrder);
             return nextOrder;
@@ -2369,7 +2818,7 @@ export const useAppStore = () => {
           created_at: now,
           tenant_id: po.tenant_id,
           title: `Principal PO ${po.po_number} Confirmed (${po.company_name})`,
-          message: `PO #${po.po_number} (${po.total_quantity} units, ₹${po.total_amount.toLocaleString('en-IN')}) submitted. ${updatedOrders.length} store order(s) transitioned to CONFIRMED for next-day dispatch & invoicing.`,
+          message: `PO #${po.po_number} (${po.total_quantity} units, ₹${po.total_amount.toLocaleString('en-IN')}) submitted. ${updatedOrders.length} store order(s) transitioned to CONFIRMED for dispatch batch ${dispatchAssignment.dispatch_date}.`,
           type: 'ORDER_CONFIRMED_PO_SUBMITTED',
           target_roles: ['BILLING', 'DISPATCHER', 'ORDER_PUNCHER', 'ADMIN'],
           related_entity_id: po.id,
@@ -2389,7 +2838,7 @@ export const useAppStore = () => {
             created_at: now,
             tenant_id: ord.tenant_id,
             title: `Order #${ord.order_number} Confirmed (Principal PO)`,
-            message: `Your order #${ord.order_number} for ${ord.retailer_name_raw} is CONFIRMED under PO #${po.po_number} (${po.company_name}) and queued for next-day dispatch.`,
+            message: `Your order #${ord.order_number} for ${ord.retailer_name_raw} is CONFIRMED under PO #${po.po_number} (${po.company_name}) and queued for ${dispatchAssignment.dispatch_date} dispatch.`,
             type: 'ORDER_CONFIRMED_PO_SUBMITTED',
             target_roles: ['COMMISSION_AGENT', 'SALES_EXECUTIVE', 'DISTRIBUTOR'],
             target_user_id: raiserUserId,
@@ -2408,8 +2857,8 @@ export const useAppStore = () => {
             timestamp: now,
             created_at: now,
             tenant_id: ord.tenant_id,
-            title: `Order #${ord.order_number} Confirmed — Invoicing Unlocked`,
-            message: `Principal PO #${po.po_number} submitted for #${ord.order_number} (${ord.retailer_name_raw}). Tax/Cash invoicing is now unlocked.`,
+            title: `Order #${ord.order_number} Confirmed — Dispatch Batch ${dispatchAssignment.dispatch_date}`,
+            message: `Principal PO #${po.po_number} submitted for #${ord.order_number} (${ord.retailer_name_raw}). Added to Dispatch Sheet (${dispatchAssignment.dispatch_date}). Final Invoicing unlocks after Delivery entry.`,
             type: 'ORDER_CONFIRMED_PO_SUBMITTED',
             target_roles: ['BILLING'],
             target_user_id: ord.billing_executive_id,
@@ -2436,6 +2885,9 @@ export const useAppStore = () => {
             status: 'CONFIRMED',
             fulfillment_source: 'PRINCIPAL_PO',
             is_locked: true,
+            confirmed_at: ord.confirmed_at,
+            dispatch_date: ord.dispatch_date,
+            dispatch_batch_id: ord.dispatch_batch_id,
           }),
         }).catch((err) => console.warn('[DB SYNC] Failed to confirm order on server:', err));
 
@@ -2461,7 +2913,12 @@ export const useAppStore = () => {
         return { success: false, message: 'Order not found or not in VERIFIED status.' };
       }
 
-      const dpId = targetOrder.dispatch_point_id || 'dp_sahibabad';
+      const dpId = resolveOrderPrimaryDispatchPointId(
+        targetOrder,
+        memoryStore.companies,
+        memoryStore.skus,
+        memoryStore.dispatchPoints
+      );
       const stockMap = getDepotAvailableStockMap(dpId, memoryStore.stockLedger, memoryStore.orders);
 
       // Cap fulfillable quantities strictly by live available depot stock
@@ -2980,55 +3437,124 @@ export const useAppStore = () => {
       };
     },
 
-    // Invoice Generation (Strictly gated to post-PO / Depot-Stock CONFIRMED orders)
-    addInvoice: (invoice: Invoice) => {
+    // Invoice Generation (Strictly gated to post-Delivery DELIVERED orders only)
+    addInvoice: (invoice: Invoice): { success: boolean; error?: string } => {
       const targetOrder = memoryStore.orders.find((o) => o.id === invoice.order_id);
-      const invoiceableStatuses: Order['status'][] = ['CONFIRMED', 'DISPATCHED', 'APPROVED', 'DELIVERED', 'PUNCHED_TO_PRINCIPAL'];
+      const invoiceableStatuses: Order['status'][] = ['DELIVERED'];
       if (targetOrder && !invoiceableStatuses.includes(targetOrder.status)) {
-        console.warn(`[INVOICING GATE] Blocked invoice creation for order ${targetOrder.order_number} in status ${targetOrder.status}. Must be CONFIRMED first.`);
-        return;
+        const msg = `[INVOICING GATE] Blocked invoice creation for order ${targetOrder.order_number} in status ${targetOrder.status}. Order must be marked DELIVERED first.`;
+        console.warn(msg);
+        return { success: false, error: msg };
       }
 
       const now = new Date().toISOString();
-      memoryStore.invoices = [invoice, ...memoryStore.invoices];
-      const wasAlreadyDelivered = targetOrder?.status === 'DELIVERED';
+      const cnDiscountAmt = invoice.is_credit_note_discount
+        ? Math.max(0, Number(invoice.credit_note_discount_amount) || 0)
+        : 0;
+      const cnNumber =
+        cnDiscountAmt > 0
+          ? invoice.credit_note_number?.trim() || `CN-${Date.now().toString().slice(-6)}`
+          : null;
+      const cnReason = cnDiscountAmt > 0 ? invoice.credit_note_reason || 'Invoice Credit Note Discount' : null;
 
-      // Update order status to INVOICED & stamp invoiced_at (preserve dispatched_at for parallel dispatch tracking)
+      const normalizedInvoice: Invoice = {
+        ...invoice,
+        gross_amount: invoice.gross_amount ?? invoice.total_amount + cnDiscountAmt,
+        is_credit_note_discount: cnDiscountAmt > 0,
+        credit_note_discount_amount: cnDiscountAmt,
+        credit_note_number: cnNumber,
+        credit_note_reason: cnReason,
+      };
+
+      memoryStore.invoices = [normalizedInvoice, ...memoryStore.invoices];
+
+      // Update order status to INVOICED & stamp invoiced_at + any invoice-time Credit Note discount
       memoryStore.orders = memoryStore.orders.map((o) =>
-        o.id === invoice.order_id
+        o.id === normalizedInvoice.order_id
           ? {
               ...o,
               status: 'INVOICED',
               invoiced_at: o.invoiced_at || now,
+              ...(cnDiscountAmt > 0
+                ? {
+                    is_credit_note_discount: true,
+                    credit_note_discount_amount: cnDiscountAmt,
+                    credit_note_number: cnNumber,
+                    credit_note_reason: cnReason,
+                  }
+                : {}),
             }
           : o
       );
 
-      // Sync party credit cleanly without double-counting an order already in memoryStore.orders
-      syncPartyCreditAndWriteLedger({
-        tenantId: invoice.tenant_id,
-        partyId: invoice.retailer_id,
-        partyName: invoice.retailer_name,
-        invoice,
-        entryType: !targetOrder ? 'ORDER_DEBIT' : undefined,
-        debitAmount: !targetOrder ? Math.max(0, invoice.total_amount) : 0,
-        creditAmount: 0,
-        notes: !targetOrder ? `Standalone invoice #${invoice.invoice_number} raised` : undefined,
-      });
+      // Adjust depot stockLedger automatically once a DEPOT_STOCK order is billed (guarded against double deduction)
+      if (targetOrder && targetOrder.fulfillment_source === 'DEPOT_STOCK') {
+        recordDepotStockDispatchOutIfMissing(targetOrder, {
+          refDocId: normalizedInvoice.invoice_number,
+          refDocType: 'ORDER',
+          actorName: 'Billing Executive',
+        });
+      }
+
+      const updatedOrder = memoryStore.orders.find((o) => o.id === normalizedInvoice.order_id) || null;
+
+      // Sync party credit cleanly & write CREDIT_NOTE_DISCOUNT ledger entry if discount was applied at invoicing
+      if (cnDiscountAmt > 0) {
+        syncPartyCreditAndWriteLedger({
+          tenantId: normalizedInvoice.tenant_id,
+          partyId: normalizedInvoice.retailer_id,
+          partyName: normalizedInvoice.retailer_name,
+          invoice: normalizedInvoice,
+          order: updatedOrder,
+          entryType: 'CREDIT_NOTE_DISCOUNT',
+          debitAmount: !targetOrder ? Math.max(0, normalizedInvoice.gross_amount ?? normalizedInvoice.total_amount) : 0,
+          creditAmount: cnDiscountAmt,
+          isCreditNoteDiscount: true,
+          creditNoteNumber: cnNumber,
+          notes: `Credit Note #${cnNumber} applied on Invoice #${normalizedInvoice.invoice_number} (Gross ₹${(normalizedInvoice.gross_amount ?? normalizedInvoice.total_amount).toLocaleString('en-IN')} - ₹${cnDiscountAmt.toLocaleString('en-IN')} = Net ₹${normalizedInvoice.total_amount.toLocaleString('en-IN')})${cnReason ? ` • ${cnReason}` : ''}`,
+          actorName: normalizedInvoice.verified_by || 'Billing Executive',
+        });
+      } else {
+        syncPartyCreditAndWriteLedger({
+          tenantId: normalizedInvoice.tenant_id,
+          partyId: normalizedInvoice.retailer_id,
+          partyName: normalizedInvoice.retailer_name,
+          invoice: normalizedInvoice,
+          order: updatedOrder,
+          entryType: !targetOrder ? 'ORDER_DEBIT' : undefined,
+          debitAmount: !targetOrder ? Math.max(0, normalizedInvoice.total_amount) : 0,
+          creditAmount: 0,
+          notes: !targetOrder ? `Standalone invoice #${normalizedInvoice.invoice_number} raised` : undefined,
+        });
+      }
 
       persist();
 
-      fetch(`/api/orders/${invoice.order_id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'INVOICED', invoiced_at: now }),
-      }).catch((err) => console.warn('[DB SYNC] Failed to update invoiced status on server:', err));
+      if (normalizedInvoice.order_id) {
+        fetch(`/api/orders/${normalizedInvoice.order_id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            status: 'INVOICED',
+            invoiced_at: now,
+            ...(cnDiscountAmt > 0
+              ? {
+                  is_credit_note_discount: true,
+                  credit_note_discount_amount: cnDiscountAmt,
+                  credit_note_number: cnNumber,
+                  credit_note_reason: cnReason,
+                }
+              : {}),
+          }),
+        }).catch((err) => console.warn('[DB SYNC] Failed to update invoiced status on server:', err));
+      }
 
       if (isFirebaseConfigured()) {
-        saveRecordToFirestore(COLLECTIONS.INVOICES, invoice.id, invoice);
-        const orderUpdated = memoryStore.orders.find((o) => o.id === invoice.order_id);
-        if (orderUpdated) saveRecordToFirestore(COLLECTIONS.ORDERS, orderUpdated.id, orderUpdated);
+        saveRecordToFirestore(COLLECTIONS.INVOICES, normalizedInvoice.id, normalizedInvoice);
+        if (updatedOrder) saveRecordToFirestore(COLLECTIONS.ORDERS, updatedOrder.id, updatedOrder);
       }
+
+      return { success: true };
     },
 
     // Claim Updates
@@ -3566,20 +4092,28 @@ export const useAppStore = () => {
       if (cleanDiscount <= 0) {
         return { success: false, error: 'Credit discount amount must be greater than zero.' };
       }
-      const maxAllowable = Math.max(0, targetInv.total_amount - targetInv.paid_amount);
-      const boundedDiscount = Math.min(cleanDiscount, maxAllowable || targetInv.total_amount);
+      const existingCN = Number(targetInv.credit_note_discount_amount) || 0;
+      const baseGross = targetInv.gross_amount ?? targetInv.total_amount;
+      const currentNetTotal =
+        targetInv.gross_amount !== undefined
+          ? Math.max(0, targetInv.gross_amount - existingCN)
+          : Math.max(0, targetInv.total_amount - existingCN);
+      const maxAllowable = Math.max(0, currentNetTotal - targetInv.paid_amount);
+      const boundedDiscount = Math.min(cleanDiscount, maxAllowable || currentNetTotal);
       const cnNumber = params.creditNoteNumber.trim() || `CN-${Date.now().toString().slice(-6)}`;
 
       let updatedInv: Invoice = targetInv;
-      const newTotalCN = (Number(targetInv.credit_note_discount_amount) || 0) + boundedDiscount;
-      const effectiveDue = Math.max(0, targetInv.total_amount - newTotalCN);
+      const newTotalCN = existingCN + boundedDiscount;
+      const nextNetTotal = Math.max(0, baseGross - newTotalCN);
       const nextStatus: Invoice['status'] =
-        targetInv.paid_amount >= effectiveDue ? 'PAID' : targetInv.paid_amount > 0 ? 'PARTIAL' : targetInv.status;
+        targetInv.paid_amount >= nextNetTotal ? 'PAID' : targetInv.paid_amount > 0 ? 'PARTIAL' : targetInv.status;
 
       memoryStore.invoices = memoryStore.invoices.map((inv) => {
         if (inv.id === targetInv.id) {
           updatedInv = {
             ...inv,
+            gross_amount: baseGross,
+            total_amount: targetInv.gross_amount !== undefined ? nextNetTotal : inv.total_amount,
             is_credit_note_discount: true,
             credit_note_discount_amount: newTotalCN,
             credit_note_number: cnNumber,

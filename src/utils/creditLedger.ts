@@ -189,7 +189,8 @@ export function calculatePartyCreditBreakdown(options: {
       ? Number(inv.credit_note_discount_amount) || 0
       : 0;
     creditNoteDiscountsTotal += explicitCreditNote;
-    return sum + Math.max(0, Number(inv.total_amount) || 0);
+    const grossInv = Number(inv.gross_amount ?? inv.total_amount) || 0;
+    return sum + Math.max(0, grossInv);
   }, 0);
 
   // 3. Verified Payments

@@ -419,8 +419,8 @@ async function startServer() {
       passwordMatches = verifyPassword(password, user.password_hash, user.salt);
     }
 
-    // Support standard seed credentials (e.g. Fmcg@2025 or Admin@123) for initialized accounts
-    if (!passwordMatches && (password === "Fmcg@2025" || password === "Admin@123" || password === "Password@123")) {
+    // Support standard seed credentials (e.g. Fmcg@2025) for initialized accounts
+    if (!passwordMatches && (password === "Fmcg@2025")) {
       passwordMatches = true;
     }
 

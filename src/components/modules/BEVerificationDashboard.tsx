@@ -3,6 +3,13 @@ import { useAppStore } from '../../data/store';
 import { Order, Retailer, User, DispatchPoint, OrderInvoicingType } from '../../types';
 import { isOrderAssignedToBE, isOrderUnassignedToAnyBE } from '../../utils/caRoutingLogic';
 import { resolveOrderCreditExposure } from '../../utils/creditLedger';
+import {
+  doesOrderBelongToDispatchPoint,
+  getDispatchPointDisplayLabel,
+  resolveOrderPrimaryDispatchPointId,
+  UNMAPPED_DISPATCH_POINT_ID,
+  UNMAPPED_DISPATCH_POINT_LABEL,
+} from '../../utils/dispatchRouting';
 import { TestRunnerModal } from '../common/TestRunnerModal';
 import {
   CheckCircle2,
@@ -42,6 +49,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
     retailers = [],
     distributors = [],
     dispatchPoints = [],
+    companies = [],
     skus = [],
     activeTenantSettings,
     currentUser,
@@ -170,9 +178,9 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
         if (resolvedRole !== selectedRaiserRoleFilter) return false;
       }
 
-      // 2. DP Filter
+      // 2. DP Filter (Strictly resolved via Principal Company -> Dispatch Point)
       if (selectedDPFilter !== 'ALL') {
-        if (o.dispatch_point_id !== selectedDPFilter) return false;
+        if (!doesOrderBelongToDispatchPoint(o, selectedDPFilter, companies, skus, dispatchPoints)) return false;
       }
 
       // 3. Status Filter
@@ -513,6 +521,7 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   {dp.name} ({dp.code})
                 </option>
               ))}
+              <option value={UNMAPPED_DISPATCH_POINT_ID}>⚠ Unmapped Dispatch Point</option>
             </select>
           </div>
 
@@ -546,7 +555,10 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {filteredOrders.map((ord, idx) => {
             const retailer = retailers.find((r) => r.id === ord.retailer_id);
-            const dp = dispatchPoints.find((d) => d.id === ord.dispatch_point_id);
+            const resolvedDpId = resolveOrderPrimaryDispatchPointId(ord, companies, skus, dispatchPoints);
+            const dp = resolvedDpId !== UNMAPPED_DISPATCH_POINT_ID
+              ? dispatchPoints.find((d) => d.id === resolvedDpId)
+              : undefined;
             const assignedBE = users.find((u) => u.id === ord.billing_executive_id);
             const exposure = resolveOrderCreditExposure({
               order: ord,
@@ -678,8 +690,12 @@ export const BEVerificationDashboard: React.FC<BEVerificationDashboardProps> = (
                   </div>
                   <div>
                     <span className="text-slate-500 block text-[10px]">Dispatch Point</span>
-                    <span className="font-semibold text-blue-300 truncate block">
-                      {dp?.name || 'Central Warehouse'}
+                    <span
+                      className={`font-semibold truncate block ${
+                        dp ? 'text-blue-300' : 'text-amber-300'
+                      }`}
+                    >
+                      {dp ? getDispatchPointDisplayLabel(dp.id, dispatchPoints) : UNMAPPED_DISPATCH_POINT_LABEL}
                     </span>
                   </div>
                 </div>

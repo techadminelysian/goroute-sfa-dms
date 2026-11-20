@@ -32,7 +32,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
     retailers = []
   } = useAppStore();
 
-  const pendingOrdersCount = (orders || []).filter((o) => o.status === 'PUNCHED').length;
+  const pendingOrdersCount = (orders || []).filter(
+    (o) => o.status === 'PENDING_VERIFICATION' || o.status === 'PUNCHED'
+  ).length;
+  const pendingDeliveryCount = (orders || []).filter(
+    (o) => o.status === 'CONFIRMED' || o.status === 'DISPATCHED'
+  ).length;
   const flaggedClaimsCount = (claims || []).filter((c) => c.is_leakage_flagged || c.status === 'RAISED').length;
   const overLimitRetailersCount = (retailers || []).filter((r) => r.current_outstanding > r.credit_limit).length;
 
@@ -62,10 +67,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     {
       id: 'inventory',
-      label: 'Inventory',
+      label: 'Dispatch & Depot',
       icon: Boxes,
-      allowedRoles: ['ADMIN', 'SUB_ADMIN'],
-      badge: 'Hard Gate',
+      allowedRoles: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER'],
+      badge: pendingDeliveryCount > 0 ? `${pendingDeliveryCount}` : null,
       badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
     },
     {

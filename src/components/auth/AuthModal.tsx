@@ -188,7 +188,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 type="tel"
                 maxLength={10}
                 value={mobileNumber}
-                onChange={(e) => setMobileNumber(e.target.value.replace(/\D/g, ''))}
+                onChange={(e) => {
+                  if (errorMessage) setErrorMessage(null);
+                  setMobileNumber(e.target.value.replace(/\D/g, ''));
+                }}
                 placeholder="e.g. 9810012345"
                 className="w-full pl-20 pr-4 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white placeholder-slate-500 font-mono tracking-wide focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
                 autoFocus
@@ -196,7 +199,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               />
             </div>
             <p className="text-[11px] text-slate-500 mt-1">
-              Enter your 10-digit registered mobile number assigned by Distributor Admin.
+              Enter your 10-digit registered mobile number.
             </p>
           </div>
 
@@ -223,7 +226,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <input
                 type={showPassword ? 'text' : 'password'}
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  if (errorMessage) setErrorMessage(null);
+                  setPassword(e.target.value);
+                }}
                 placeholder="••••••••••••"
                 className="w-full pl-10 pr-10 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
                 required
@@ -281,13 +287,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               </>
             )}
           </button>
-          {/* Web Console Role Policy Notice */}
-          <div className="p-2.5 bg-slate-950/70 border border-slate-800/90 rounded-xl text-[11px] text-slate-400 flex items-start gap-2">
-            <Shield size={13} className="text-blue-400 shrink-0 mt-0.5" />
-            <span>
-              Web Portal sign-in is restricted to office console roles (Admin, Sub-Admin, Billing, Order Puncher, Accountant). Field roles & Dispatchers must use the Mobile App.
-            </span>
-          </div>
         </form>
 
         {/* Modal Footer Security Banner */}

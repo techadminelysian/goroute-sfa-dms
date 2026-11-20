@@ -520,7 +520,14 @@ export interface Order {
   parent_order_id?: string | null;
   split_sequence?: number;
   dispatched_at?: string | null;
+  delivered_at?: string | null;
+  delivered_by?: string | null;
+  delivery_proof_ref?: string | null;
+  delivery_notes?: string | null;
   invoiced_at?: string | null;
+  confirmed_at?: string | null;
+  dispatch_date?: string | null;
+  dispatch_batch_id?: string | null;
   is_credit_note_discount?: boolean;
   credit_note_discount_amount?: number;
   credit_note_number?: string | null;
@@ -581,6 +588,9 @@ export interface Invoice {
   cgst: number;
   sgst: number;
   igst: number;
+  gross_amount?: number;
+  discount_type?: 'NONE' | 'FLAT' | 'PERCENT';
+  discount_value?: number;
   total_amount: number;
   paid_amount: number;
   status: InvoiceStatus;

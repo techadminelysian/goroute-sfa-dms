@@ -7,10 +7,20 @@ import {
   buildDispatchSkuPartyMatrix,
   doesOrderBelongToDispatchPoint,
   doesOrderLineBelongToDispatchPoint,
+  getDispatchPointDisplayLabel,
   getEffectiveLineCompanyId,
+  isUnmappedDispatchPointId,
   resolveDispatchPointIdForCompany,
-  serializeDispatchMatrixToCsv
+  serializeDispatchMatrixToCsv,
+  UNMAPPED_DISPATCH_POINT_ID,
+  UNMAPPED_DISPATCH_POINT_LABEL
 } from '../../utils/dispatchRouting';
+import {
+  getTodayISTDateString,
+  getTomorrowISTDateString,
+  partitionDispatchOrdersForDate,
+  getOrderEffectiveDispatchDate
+} from '../../utils/dispatchBatching';
 import { buildPartyCreditRecords, PartyCreditRecord } from '../../utils/creditLedger';
 import { KPICard } from '../common/KPICard';
 import { BEVerificationDashboard } from './BEVerificationDashboard';
@@ -84,11 +94,16 @@ export const BillingInvoicing: React.FC = () => {
     issueCreditNoteDiscount,
     toggleLockInvoice,
     updateInvoiceMetadata,
+    carryForwardOrdersToDispatchDate,
+    finalizeDispatchBatch,
   } = useAppStore();
 
-  const [activeTab, setActiveTab] = useState<'VERIFY_ORDERS' | 'DISPATCH_SHEET' | 'INVOICES' | 'PAYMENTS' | 'CREDIT_AUDIT'>('VERIFY_ORDERS');
-  
-  // Morning Dispatcher Sheet State
+  const [activeTab, setActiveTab] = useState<'VERIFY_ORDERS' | 'DISPATCH_SHEET' | 'READY_TO_INVOICE' | 'INVOICES' | 'PAYMENTS'>('VERIFY_ORDERS');
+
+  // Morning Dispatcher Sheet State (Defaults strictly to Tomorrow IST fresh batch)
+  const todayIST = getTodayISTDateString();
+  const tomorrowIST = getTomorrowISTDateString();
+  const [dispatchDateFilter, setDispatchDateFilter] = useState<string>(tomorrowIST);
   const [dispatchGroupBy, setDispatchGroupBy] = useState<'PARTY' | 'AGENT' | 'BEAT'>('PARTY');
   const [dispatchPointFilter, setDispatchPointFilter] = useState<string>('ALL');
   const [dispatchCompanyFilter, setDispatchCompanyFilter] = useState<string>('ALL');
@@ -96,11 +111,27 @@ export const BillingInvoicing: React.FC = () => {
   const [dispatchViewMode, setDispatchViewMode] = useState<'MATRIX' | 'GROUPED'>('MATRIX');
   const [dispatchFeedback, setDispatchFeedback] = useState<string | null>(null);
   const [expandedGroupKey, setExpandedGroupKey] = useState<string | null>(null);
+  const [showPriorBacklog, setShowPriorBacklog] = useState<boolean>(true);
+  const [selectedBacklogOrderIds, setSelectedBacklogOrderIds] = useState<string[]>([]);
+  const [confirmFinalizeOpen, setConfirmFinalizeOpen] = useState<boolean>(false);
 
-  // Filter States
+  // All Invoices Filter States
   const [filterType, setFilterType] = useState<string>('ALL');
+  const [filterStatus, setFilterStatus] = useState<string>('ALL');
+  const [filterParty, setFilterParty] = useState<string>('ALL');
+  const [filterDateFrom, setFilterDateFrom] = useState<string>('');
+  const [filterDateTo, setFilterDateTo] = useState<string>('');
+  const [filterInvoiceDp, setFilterInvoiceDp] = useState<string>('ALL');
   const [paymentFilterStatus, setPaymentFilterStatus] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Generate Invoice & Credit Note Discount Modal State (Strictly for DELIVERED orders)
+  const [invoiceModalOrder, setInvoiceModalOrder] = useState<Order | null>(null);
+  const [invModalType, setInvModalType] = useState<InvoiceType>('REGISTERED_GST');
+  const [invDiscountType, setInvDiscountType] = useState<'NONE' | 'FLAT' | 'PERCENT'>('NONE');
+  const [invDiscountValue, setInvDiscountValue] = useState<string>('');
+  const [invCreditNoteNum, setInvCreditNoteNum] = useState<string>('');
+  const [invCreditNoteReason, setInvCreditNoteReason] = useState<string>('');
 
   // Modals
   const [isRecordPaymentOpen, setIsRecordPaymentOpen] = useState(false);
@@ -188,27 +219,27 @@ export const BillingInvoicing: React.FC = () => {
     return true;
   });
 
-  // Orders confirmed via Principal PO or Depot Stock Fast-Track
+  // Orders confirmed via Principal PO or Depot Stock Fast-Track (un-dispatched active queue)
   const confirmedOrders = orders.filter(
-    (o) => o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL'
+    (o) =>
+      !o.dispatched_at &&
+      (o.status === 'CONFIRMED' ||
+        o.status === 'PUNCHED_TO_PRINCIPAL' ||
+        o.status === 'APPROVED' ||
+        o.status === 'INVOICED')
   );
 
-  // Orders ready for Tax / Cash Invoicing (Strictly locked until CONFIRMED via Principal PO or Depot Stock)
+  // Orders ready for Final Invoicing (Strictly locked until status === 'DELIVERED')
   const readyToInvoiceOrders = orders.filter((o) => {
-    const isPostConfirmed =
-      o.status === 'CONFIRMED' ||
-      o.status === 'DISPATCHED' ||
-      o.status === 'APPROVED' ||
-      o.status === 'PUNCHED_TO_PRINCIPAL';
-    if (!isPostConfirmed) return false;
+    if (o.status !== 'DELIVERED') return false;
     if (activeRole === 'BILLING' || currentUser?.role === 'BILLING') {
       return isOrderAssignedToBE(o, effectiveBEId, users, distributors);
     }
     return true;
   });
 
-  // Morning Dispatcher Sheet Orders Filtering (Strictly post-PO / Depot Stock CONFIRMED+; pre-PO VERIFIED is blocked)
-  const dispatchManifestOrders = orders.filter((o) => {
+  // Scope orders first by Dispatch Point & Principal Company filters
+  const dpAndCompanyScopedOrders = orders.filter((o) => {
     if (dispatchPointFilter !== 'ALL' && !doesOrderBelongToDispatchPoint(o, dispatchPointFilter, companies, skus)) {
       return false;
     }
@@ -219,20 +250,26 @@ export const BillingInvoicing: React.FC = () => {
         (o.lines || []).some((l) => getEffectiveLineCompanyId(l, o, skus) === dispatchCompanyFilter);
       if (!matchesOrderCompany) return false;
     }
-    const isConfirmedReady =
-      o.status === 'CONFIRMED' ||
-      o.status === 'PUNCHED_TO_PRINCIPAL' ||
-      (o.status === 'INVOICED' && !o.dispatched_at && isOrderAwaitingPhysicalDispatch(o, stockLedger));
-    if (dispatchStatusScope === 'CONFIRMED_ONLY') {
-      return isConfirmedReady;
-    }
-    return isConfirmedReady || o.status === 'APPROVED' || o.status === 'DISPATCHED';
+    return true;
   });
+
+  // Strictly partition confirmed orders by selected Dispatch Batch Date (Tomorrow IST by default)
+  // Older un-dispatched orders stay isolated in priorBacklogOrders and never pollute the fresh matrix.
+  const {
+    freshBatchOrders: freshDispatchOrders,
+    priorBacklogOrders,
+    dispatchedForDateOrders,
+  } = partitionDispatchOrdersForDate(dpAndCompanyScopedOrders, dispatchDateFilter);
+
+  const dispatchManifestOrders =
+    dispatchStatusScope === 'CONFIRMED_ONLY'
+      ? freshDispatchOrders
+      : [...freshDispatchOrders, ...dispatchedForDateOrders];
 
   // Compute DP-segregated SKU-vs-Party Matrices (each DP strictly pulls only SKUs from its mapped Principal Companies)
   const activeMatrixDispatchPointIds = dispatchPointFilter !== 'ALL'
     ? [dispatchPointFilter]
-    : dispatchPoints.map((dp) => dp.id);
+    : [...dispatchPoints.map((dp) => dp.id), UNMAPPED_DISPATCH_POINT_ID];
 
   const scopedCompaniesForMatrix = dispatchCompanyFilter === 'ALL'
     ? companies
@@ -274,7 +311,6 @@ export const BillingInvoicing: React.FC = () => {
       return;
     }
 
-    const today = new Date().toISOString().split('T')[0];
     const exportedNames: string[] = [];
 
     dpIdsToExport.forEach((dpId) => {
@@ -289,13 +325,13 @@ export const BillingInvoicing: React.FC = () => {
       if (matrix.rows.length === 0) return;
       const csvContent = serializeDispatchMatrixToCsv(matrix);
       const safeCode = (matrix.dispatchPointCode || dpId).replace(/[^A-Za-z0-9_-]/g, '_');
-      const filename = `Dispatch_Matrix_${safeCode}_${today}.csv`;
+      const filename = `Dispatch_Matrix_${safeCode}_${dispatchDateFilter}.csv`;
       downloadCsvFile(csvContent, filename);
       exportedNames.push(`${matrix.dispatchPointName} (${filename})`);
     });
 
     if (exportedNames.length > 0) {
-      setDispatchFeedback(`Exported SKU-vs-Party Dispatch Matrix: ${exportedNames.join(', ')}`);
+      setDispatchFeedback(`Exported SKU-vs-Party Dispatch Matrix (${dispatchDateFilter}): ${exportedNames.join(', ')}`);
     } else {
       setDispatchFeedback('No SKU rows available for the selected Dispatch Point.');
     }
@@ -339,12 +375,13 @@ export const BillingInvoicing: React.FC = () => {
           return;
         }
         const comp = companies.find((c) => c.id === compId);
-        const dpId = resolveDispatchPointIdForCompany(compId, companies, o.dispatch_point_id);
-        const dpObj = dispatchPoints.find((d) => d.id === dpId);
+        const dpId = resolveDispatchPointIdForCompany(compId, companies, dispatchPoints);
+        const dpObj = dpId !== UNMAPPED_DISPATCH_POINT_ID ? dispatchPoints.find((d) => d.id === dpId) : undefined;
+        const dpName = dpObj?.name || UNMAPPED_DISPATCH_POINT_LABEL;
         const skuObj = skus.find((s) => s.id === l.sku_id);
         rows.push(
           [
-            `"${(dpObj?.name || dpId).replace(/"/g, '""')}"`,
+            `"${dpName.replace(/"/g, '""')}"`,
             `"${agentName.replace(/"/g, '""')}"`,
             `"${o.retailer_name_raw.replace(/"/g, '""')}"`,
             `"${o.beat_name.replace(/"/g, '""')}"`,
@@ -364,16 +401,48 @@ export const BillingInvoicing: React.FC = () => {
     });
 
     const csvContent = [headers.join(','), ...rows].join('\n');
-    const today = new Date().toISOString().split('T')[0];
-    const filename = `Morning_Dispatcher_Consignment_Sheet_${today}.csv`;
+    const filename = `Morning_Dispatcher_Consignment_Sheet_${dispatchDateFilter}.csv`;
     downloadCsvFile(csvContent, filename);
     setDispatchFeedback(`Generated detailed load sheet (${filename}) with ${rows.length} line items.`);
+  };
+
+  // Finalize Selected Dispatch Date Batch (Marks pending orders DISPATCHED & adjusts Depot Stock ledger)
+  const handleFinalizeSelectedDateBatch = () => {
+    const targetIds = freshDispatchOrders.map((o) => o.id);
+    if (targetIds.length === 0) {
+      setDispatchFeedback(`No pending un-dispatched orders in batch ${dispatchDateFilter} to finalize.`);
+      setConfirmFinalizeOpen(false);
+      return;
+    }
+    const res = finalizeDispatchBatch(targetIds, currentUser?.name || 'Dispatch Manager');
+    setConfirmFinalizeOpen(false);
+    setDispatchFeedback(res.message);
+  };
+
+  // Carry Forward Prior Backlog Orders to Tomorrow's Fresh Batch
+  const handleCarryForwardBacklog = (orderIds: string[]) => {
+    if (orderIds.length === 0) return;
+    const res = carryForwardOrdersToDispatchDate(
+      orderIds,
+      tomorrowIST,
+      currentUser?.name || 'Dispatch Manager'
+    );
+    setSelectedBacklogOrderIds((prev) => prev.filter((id) => !orderIds.includes(id)));
+    setDispatchFeedback(res.message);
+  };
+
+  // Clear / Mark Dispatched Prior Backlog Orders
+  const handleClearBacklogAsDispatched = (orderIds: string[]) => {
+    if (orderIds.length === 0) return;
+    const res = finalizeDispatchBatch(orderIds, currentUser?.name || 'Dispatch Manager');
+    setSelectedBacklogOrderIds((prev) => prev.filter((id) => !orderIds.includes(id)));
+    setDispatchFeedback(res.message);
   };
 
   // Automated Dispatch Sync Info (CONFIRMED orders auto-populate MobileDispatcherApp)
   const handleSendManifestToDispatcher = () => {
     setDispatchFeedback(
-      `Morning Dispatch Sheet is auto-synced with Mobile Dispatcher App for ${dispatchManifestOrders.length} CONFIRMED order(s). No manual push required.`
+      `Dispatch Batch ${dispatchDateFilter} is synced with Mobile Dispatcher App for ${freshDispatchOrders.length} fresh order(s). (${priorBacklogOrders.length} prior backlog order(s) isolated.)`
     );
   };
 
@@ -435,7 +504,20 @@ export const BillingInvoicing: React.FC = () => {
     };
   };
 
-  // Filtered Invoices
+  const getInvoiceNetTotal = (inv: Invoice): number => {
+    if (inv.gross_amount !== undefined) {
+      return Math.max(0, Number(inv.total_amount) || 0);
+    }
+    const cn = inv.is_credit_note_discount ? Number(inv.credit_note_discount_amount) || 0 : 0;
+    return Math.max(0, (Number(inv.total_amount) || 0) - cn);
+  };
+
+  // Distinct parties for All Invoices Party filter
+  const invoicePartyNames = Array.from(
+    new Set(invoices.map((i) => i.retailer_name).filter(Boolean))
+  ).sort();
+
+  // Filtered Invoices (All Invoices Permanent Register)
   const filteredInvoices = invoices.filter((inv) => {
     const payInfo = getInvoicePaymentInfo(inv);
 
@@ -444,13 +526,21 @@ export const BillingInvoicing: React.FC = () => {
     if (filterType === 'CASH' && payInfo.category !== 'CASH') return false;
     if (filterType === 'ONLINE' && payInfo.category !== 'ONLINE' && payInfo.category !== 'MIXED') return false;
     if (filterType === 'UNPAID' && inv.status === 'PAID') return false;
+    if (filterType === 'WITH_CREDIT_NOTE' && !inv.is_credit_note_discount) return false;
     if (filterType === 'ZOHO_PENDING' && inv.zoho_synced) return false;
+
+    if (filterStatus !== 'ALL' && inv.status !== filterStatus) return false;
+    if (filterParty !== 'ALL' && inv.retailer_name !== filterParty) return false;
+    if (filterInvoiceDp !== 'ALL' && inv.dispatch_point_id !== filterInvoiceDp) return false;
+    if (filterDateFrom && inv.invoice_date < filterDateFrom) return false;
+    if (filterDateTo && inv.invoice_date > filterDateTo) return false;
 
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       return (
         (inv.invoice_number || '').toLowerCase().includes(q) ||
         (inv.retailer_name || '').toLowerCase().includes(q) ||
+        (inv.credit_note_number || '').toLowerCase().includes(q) ||
         (inv.e_way_bill_no || '').toLowerCase().includes(q)
       );
     }
@@ -599,13 +689,38 @@ export const BillingInvoicing: React.FC = () => {
   // Parties Exceeding Approved Credit Limit (Fund Shortage > 0)
   const creditExceededParties = partyCreditRecords.filter((p) => p.fund_shortage > 0);
 
-  // Generate Invoice Handler (Strictly gated to post-PO / Depot Stock CONFIRMED orders)
-  const handleCreateInvoiceFromOrder = (ord: Order, type: InvoiceType) => {
-    const allowedStatuses: Order['status'][] = ['CONFIRMED', 'DISPATCHED', 'APPROVED', 'PUNCHED_TO_PRINCIPAL', 'DELIVERED'];
-    if (!allowedStatuses.includes(ord.status)) {
+  // Open Invoice Modal for a DELIVERED Order
+  const handleOpenInvoiceModal = (ord: Order) => {
+    if (ord.status !== 'DELIVERED') {
       showBillingBanner(
         'error',
-        `Invoicing Blocked: Order ${ord.order_number} is in "${ord.status}" status. Move to CONFIRMED first.`
+        `Invoicing Blocked: Order ${ord.order_number} is currently "${ord.status}". Stock must be marked DELIVERED first.`
+      );
+      return;
+    }
+    setInvoiceModalOrder(ord);
+    setInvModalType(ord.order_invoicing_type === 'UNREGISTERED_CASH' ? 'CASH_NON_GST' : 'REGISTERED_GST');
+    setInvDiscountType('NONE');
+    setInvDiscountValue('');
+    setInvCreditNoteNum(`CN-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`);
+    setInvCreditNoteReason('');
+  };
+
+  // Generate Invoice Handler (Strictly gated to DELIVERED orders; supports Flat/Percent Discount -> Auto Credit Note)
+  const handleCreateInvoiceFromOrder = (
+    ord: Order,
+    type: InvoiceType,
+    discountOpts?: {
+      discountType: 'NONE' | 'FLAT' | 'PERCENT';
+      discountValue: number;
+      creditNoteNumber?: string;
+      creditNoteReason?: string;
+    }
+  ) => {
+    if (ord.status !== 'DELIVERED') {
+      showBillingBanner(
+        'error',
+        `Invoicing Blocked: Order ${ord.order_number} is in "${ord.status}" status. Mark it DELIVERED first.`
       );
       return;
     }
@@ -613,12 +728,29 @@ export const BillingInvoicing: React.FC = () => {
     const fin = getOrderFinancialSummary(ord, skus);
     const subtotal = fin.productValue || Math.round(ord.total_amount);
     const tax = type === 'REGISTERED_GST' ? fin.gstAmount : 0;
-    const grandTotal = type === 'REGISTERED_GST' ? fin.totalAmountWithGst : subtotal;
+    const grossTotal = type === 'REGISTERED_GST' ? fin.totalAmountWithGst : subtotal;
+
+    let discountAmt = 0;
+    const dType = discountOpts?.discountType || 'NONE';
+    const dVal = Math.max(0, Number(discountOpts?.discountValue) || 0);
+    if (dType === 'FLAT') {
+      discountAmt = Math.min(grossTotal, Math.round(dVal * 100) / 100);
+    } else if (dType === 'PERCENT') {
+      discountAmt = Math.min(grossTotal, Math.round(((grossTotal * dVal) / 100) * 100) / 100);
+    }
+    const netTotal = Math.max(0, Math.round((grossTotal - discountAmt) * 100) / 100);
+    const hasCN = discountAmt > 0;
+    const cnNumber = hasCN
+      ? discountOpts?.creditNoteNumber?.trim() || `CN-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`
+      : null;
 
     const newInv: Invoice = {
       id: `inv_${Date.now()}`,
       tenant_id: activeTenant.id,
-      invoice_number: type === 'REGISTERED_GST' ? `INV-GST-${Math.floor(1000 + Math.random() * 9000)}` : `INV-CASH-${Math.floor(1000 + Math.random() * 9000)}`,
+      invoice_number:
+        type === 'REGISTERED_GST'
+          ? `INV-GST-${Math.floor(1000 + Math.random() * 9000)}`
+          : `INV-CASH-${Math.floor(1000 + Math.random() * 9000)}`,
       invoice_type: type,
       order_id: ord.id,
       company_id: ord.company_id,
@@ -629,18 +761,38 @@ export const BillingInvoicing: React.FC = () => {
       cgst: type === 'REGISTERED_GST' ? Math.round((tax / 2) * 100) / 100 : 0,
       sgst: type === 'REGISTERED_GST' ? Math.round((tax / 2) * 100) / 100 : 0,
       igst: 0,
-      total_amount: grandTotal,
+      gross_amount: grossTotal,
+      discount_type: dType,
+      discount_value: dVal,
+      total_amount: netTotal,
       paid_amount: 0,
-      status: 'UNPAID',
+      status: netTotal === 0 ? 'PAID' : 'UNPAID',
       invoice_date: new Date().toISOString().split('T')[0],
       due_date: new Date(Date.now() + activeTenantSettings.credit_days_threshold * 86400000).toISOString().split('T')[0],
       e_way_bill_no: type === 'REGISTERED_GST' ? `EWB-2710-${Math.floor(100000 + Math.random() * 900000)}` : undefined,
       irn_no: type === 'REGISTERED_GST' ? `irn_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}` : undefined,
       is_locked: false,
+      verified_by: currentUser?.name || 'Billing Executive',
+      verified_at: new Date().toISOString(),
+      is_credit_note_discount: hasCN,
+      credit_note_discount_amount: discountAmt,
+      credit_note_number: cnNumber,
+      credit_note_reason: hasCN ? discountOpts?.creditNoteReason?.trim() || 'Invoice Discount Credit Note' : null,
     };
 
-    addInvoice(newInv);
-    showBillingBanner('success', `Invoice ${newInv.invoice_number} generated. Order updated to INVOICED.`);
+    const res = addInvoice(newInv);
+    if (res && !res.success) {
+      showBillingBanner('error', res.error || 'Failed to generate invoice.');
+      return;
+    }
+
+    setInvoiceModalOrder(null);
+    showBillingBanner(
+      'success',
+      hasCN
+        ? `Invoice ${newInv.invoice_number} (Net ₹${netTotal.toLocaleString('en-IN')}) & Credit Note #${cnNumber} (-₹${discountAmt.toLocaleString('en-IN')}) posted! Visible in All Invoices & Party Ledger.`
+        : `Invoice ${newInv.invoice_number} (₹${netTotal.toLocaleString('en-IN')}) generated and added to All Invoices.`
+    );
   };
 
   // Open Edit Order Modal
@@ -915,8 +1067,9 @@ export const BillingInvoicing: React.FC = () => {
     document.body.removeChild(link);
   };
 
-  // Export GST Sales Invoices Register for Zoho / Tally ERP 9
+  // Export Sales Invoices Register (respecting All Invoices active filters when non-empty)
   const handleExportZohoSalesRegister = () => {
+    const sourceList = filteredInvoices.length > 0 ? filteredInvoices : invoices;
     const headers = [
       'Invoice Date',
       'Invoice Number',
@@ -927,7 +1080,10 @@ export const BillingInvoicing: React.FC = () => {
       'CGST (9%)',
       'SGST (9%)',
       'IGST (18%)',
-      'Total Amount (INR)',
+      'Gross Amount (INR)',
+      'Credit Note Discount (INR)',
+      'Credit Note Number',
+      'Net Payable Total (INR)',
       'Paid Amount (INR)',
       'Outstanding Balance (INR)',
       'Invoice Status',
@@ -936,12 +1092,15 @@ export const BillingInvoicing: React.FC = () => {
       'Reconciled & Locked'
     ];
 
-    const rows = invoices.map((inv) => {
+    const rows = sourceList.map((inv) => {
       const ret = retailers.find((r) => r.id === inv.retailer_id);
       const dist = distributors.find((d) => d.id === inv.retailer_id);
       const partyGstin = ret?.gstin || dist?.gstin || '';
       const gstin = partyGstin || (inv.invoice_type === 'REGISTERED_GST' ? 'PENDING_GSTIN' : 'URP (Unregistered)');
-      const remaining = inv.total_amount - inv.paid_amount;
+      const cnAmt = inv.is_credit_note_discount ? Number(inv.credit_note_discount_amount) || 0 : 0;
+      const grossAmt = inv.gross_amount ?? inv.total_amount;
+      const netAmt = getInvoiceNetTotal(inv);
+      const remaining = Math.max(0, netAmt - inv.paid_amount);
 
       return [
         `"${inv.invoice_date}"`,
@@ -953,7 +1112,10 @@ export const BillingInvoicing: React.FC = () => {
         inv.cgst,
         inv.sgst,
         inv.igst,
-        inv.total_amount,
+        grossAmt,
+        cnAmt,
+        `"${inv.credit_note_number || ''}"`,
+        netAmt,
         inv.paid_amount,
         remaining,
         `"${inv.status}"`,
@@ -968,7 +1130,7 @@ export const BillingInvoicing: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `Zoho_Tally_Sales_Register_Export_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute('download', `All_Invoices_Register_${new Date().toISOString().split('T')[0]}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -1010,7 +1172,7 @@ export const BillingInvoicing: React.FC = () => {
       retailer_id: ret.id,
       retailer_name_raw: ret.name,
       beat_name: ret.beat_name || 'Central Beat',
-      dispatch_point_id: resolveDispatchPointIdForCompany(targetSku.company_id, companies, dispatchPoints[0]?.id || 'dp_central'),
+      dispatch_point_id: resolveDispatchPointIdForCompany(targetSku.company_id, companies, dispatchPoints),
       created_by_user_id: currentUser?.id || 'usr_billing_1',
       commission_agent_id: (ret as any).commission_agent_id || users?.find((u) => u.role === 'COMMISSION_AGENT')?.id || 'usr_agent_1',
       commission_agent_name: (ret as any).commission_agent_id
@@ -1139,7 +1301,7 @@ export const BillingInvoicing: React.FC = () => {
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <CheckCircle2 size={15} /> Order Verification Queue ({pendingVerificationOrders.length})
+          <CheckCircle2 size={15} /> Verify Orders ({pendingVerificationOrders.length})
         </button>
         <button
           onClick={() => setActiveTab('DISPATCH_SHEET')}
@@ -1149,10 +1311,25 @@ export const BillingInvoicing: React.FC = () => {
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <Truck size={15} /> Morning Dispatcher Consignments ({confirmedOrders.length})
+          <Truck size={15} /> Dispatch Sheet ({confirmedOrders.length})
           {confirmedOrders.length > 0 && (
             <span className="bg-indigo-500 text-white text-[10px] px-1.5 py-0.2 rounded-full font-extrabold">
               {confirmedOrders.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('READY_TO_INVOICE')}
+          className={`px-4 py-2.5 font-bold flex items-center gap-2 border-b-2 transition-all whitespace-nowrap ${
+            activeTab === 'READY_TO_INVOICE'
+              ? 'border-amber-500 text-amber-300 bg-amber-500/10'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Receipt size={15} /> Ready to Invoice ({readyToInvoiceOrders.length})
+          {readyToInvoiceOrders.length > 0 && (
+            <span className="bg-amber-500 text-slate-950 text-[10px] px-1.5 py-0.2 rounded-full font-extrabold">
+              {readyToInvoiceOrders.length}
             </span>
           )}
         </button>
@@ -1164,7 +1341,7 @@ export const BillingInvoicing: React.FC = () => {
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <FileText size={15} /> Tax Invoices Ledger ({invoices.length})
+          <FileText size={15} /> All Invoices ({invoices.length})
         </button>
         <button
           onClick={() => setActiveTab('PAYMENTS')}
@@ -1174,78 +1351,131 @@ export const BillingInvoicing: React.FC = () => {
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <DollarSign size={15} /> Agent Collections & Bank Reconciliation ({payments.length})
+          <DollarSign size={15} /> Payments &amp; UTRs ({payments.length})
           {pendingPaymentsCount > 0 && (
             <span className="bg-amber-500 text-black text-[10px] px-1.5 py-0.2 rounded-full font-extrabold">
               {pendingPaymentsCount}
             </span>
           )}
         </button>
-        <button
-          onClick={() => setActiveTab('CREDIT_AUDIT')}
-          className={`px-4 py-2.5 font-bold flex items-center gap-2 border-b-2 transition-all whitespace-nowrap ${
-            activeTab === 'CREDIT_AUDIT'
-              ? 'border-rose-500 text-rose-400 bg-rose-500/10'
-              : 'border-transparent text-slate-400 hover:text-slate-200'
-          }`}
-        >
-          <ShieldAlert size={15} /> Credit Limit & Overdue Debt Audit ({creditExceededParties.length})
-        </button>
       </div>
 
-      {/* TAB 1: ORDER VERIFICATION & INVOICING QUEUE (BILLING EXECUTIVE PRIMARY) */}
+      {/* TAB 1: ORDER VERIFICATION QUEUE (BILLING EXECUTIVE PRIMARY) */}
       {activeTab === 'VERIFY_ORDERS' && (
         <div className="space-y-6">
           <BEVerificationDashboard />
+        </div>
+      )}
 
-          {/* Section: Confirmed Orders Ready for Direct Invoice Generation */}
-          {readyToInvoiceOrders.length > 0 && (
-            <div className="pt-4 border-t border-slate-800 space-y-3">
-              <h2 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <FileText size={14} className="text-blue-400" />
-                Confirmed Orders Ready for Tax / Cash Invoicing ({readyToInvoiceOrders.length})
+      {/* TAB: READY TO INVOICE (STRICTLY DELIVERED ORDERS ONLY) */}
+      {activeTab === 'READY_TO_INVOICE' && (
+        <div className="space-y-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                <Receipt size={17} className="text-amber-400" />
+                Ready to Invoice — Delivered Orders Only ({readyToInvoiceOrders.length})
               </h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {readyToInvoiceOrders.map((ord, idx) => (
-                  <div key={`${ord.id || ord.order_number}_${idx}`} className="p-3 bg-slate-900 border border-slate-800 rounded-xl space-y-2 text-xs">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <div className="font-bold text-white flex items-center gap-1.5">
-                          {ord.order_number}
-                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${
-                            ord.fulfillment_source === 'DEPOT_STOCK'
-                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                              : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
-                          }`}>
-                            {ord.fulfillment_source === 'DEPOT_STOCK' ? 'DEPOT STOCK' : 'PRINCIPAL PO'}
-                          </span>
-                        </div>
-                        <div className="text-slate-400">{ord.retailer_name_raw}</div>
-                      </div>
-                      <span className="font-mono font-bold text-emerald-400">₹{(ord.total_amount || 0).toLocaleString('en-IN')}</span>
-                    </div>
-                    <div className="flex justify-between items-center gap-1.5 pt-2 border-t border-slate-800">
-                      <span className="text-[10px] font-mono text-slate-400">{ord.status}</span>
-                      <div className="flex items-center gap-1.5">
-                        {ord.order_invoicing_type === 'UNREGISTERED_CASH' ? (
-                          <button
-                            onClick={() => handleCreateInvoiceFromOrder(ord, 'CASH_NON_GST')}
-                            className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded text-[11px]"
-                          >
-                            Issue Cash Invoice
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => handleCreateInvoiceFromOrder(ord, 'REGISTERED_GST')}
-                            className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded text-[11px]"
-                          >
-                            Issue GST Tax Invoice
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ))}
+              <p className="text-xs text-slate-400 mt-0.5">
+                Orders unlock here only after physical delivery is recorded in <strong className="text-white">Dispatch &amp; Depot &rarr; Delivery Entry</strong> or the <strong className="text-white">Dispatcher Mobile App</strong>. You can apply an optional flat (₹) or percentage (%) discount during invoice creation — it deducts directly from the invoice total and posts an automatic Credit Note to the Party Ledger.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveTab('INVOICES')}
+              className="px-3.5 py-2 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/40 text-blue-300 font-bold text-xs flex items-center gap-1.5"
+            >
+              <FileText size={14} /> View All Invoices ({invoices.length}) &rarr;
+            </button>
+          </div>
+
+          {readyToInvoiceOrders.length === 0 ? (
+            <div className="p-10 text-center bg-slate-900 border border-dashed border-slate-800 rounded-2xl space-y-2 text-xs text-slate-400">
+              <CheckCircle2 size={28} className="mx-auto text-slate-600" />
+              <div className="text-sm font-bold text-slate-200">No Delivered Orders Awaiting Invoicing</div>
+              <p className="max-w-lg mx-auto text-slate-400">
+                Once Confirmed or Dispatched orders are marked <strong className="text-emerald-300">DELIVERED</strong> (either offline by BE/Office in <em>Dispatch &amp; Depot</em> or online by Dispatcher), they will immediately appear here ready for final GST/Cash invoicing.
+              </p>
+            </div>
+          ) : (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs text-slate-300">
+                  <thead className="bg-slate-950 text-slate-400 font-semibold border-b border-slate-800 uppercase text-[10px] tracking-wider">
+                    <tr>
+                      <th className="py-3 px-4">Order # &amp; Delivery Date</th>
+                      <th className="py-3 px-4">Party / Outlet</th>
+                      <th className="py-3 px-4">Dispatch Point &amp; Source</th>
+                      <th className="py-3 px-4">Delivery Proof / By</th>
+                      <th className="py-3 px-4 text-center">Billing Type</th>
+                      <th className="py-3 px-4 text-right">Order Gross Value</th>
+                      <th className="py-3 px-4 text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {readyToInvoiceOrders.map((ord) => {
+                      const fin = getOrderFinancialSummary(ord, skus);
+                      const dpObj = dispatchPoints.find((d) => d.id === ord.dispatch_point_id);
+                      const isCash = ord.order_invoicing_type === 'UNREGISTERED_CASH';
+
+                      return (
+                        <tr key={ord.id} className="hover:bg-slate-800/40">
+                          <td className="py-3 px-4">
+                            <div className="font-mono font-bold text-white">{ord.order_number}</div>
+                            <div className="text-[10px] text-emerald-400">
+                              Delivered: {ord.delivered_at ? ord.delivered_at.split('T')[0] : ord.order_date}
+                            </div>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="font-semibold text-white">{ord.retailer_name_raw}</div>
+                            <div className="text-[10px] text-slate-400">{ord.channel} • {(ord.lines || []).length} SKUs</div>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="text-slate-200 font-medium">{dpObj?.name || 'Dispatch Point'}</div>
+                            <span
+                              className={`inline-block mt-0.5 px-1.5 py-0.2 rounded text-[9px] font-bold border ${
+                                ord.fulfillment_source === 'DEPOT_STOCK'
+                                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                  : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                              }`}
+                            >
+                              {ord.fulfillment_source === 'DEPOT_STOCK' ? 'DEPOT STOCK' : 'PRINCIPAL PO'}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="text-slate-200">{ord.delivered_by || 'Dispatcher / Office'}</div>
+                            {ord.delivery_proof_ref && (
+                              <div className="text-[10px] font-mono text-slate-400">Ref: {ord.delivery_proof_ref}</div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-center">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                isCash
+                                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                                  : 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+                              }`}
+                            >
+                              {isCash ? 'Cash Non-GST' : 'Registered GST'}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono font-bold text-emerald-400">
+                            ₹{(isCash ? fin.productValue : fin.totalAmountWithGst).toLocaleString('en-IN')}
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleOpenInvoiceModal(ord)}
+                              className="px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-sm"
+                            >
+                              <Receipt size={13} /> Generate Invoice
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
             </div>
           )}
@@ -1263,11 +1493,14 @@ export const BillingInvoicing: React.FC = () => {
               </div>
               <div>
                 <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-indigo-400">
-                  Morning Dispatch & Consignment Manifest
+                  Daily Fresh Dispatch Batch ({dispatchDateFilter})
                 </div>
                 <h3 className="text-sm font-bold text-white mt-0.5">
                   Dispatch Point Segregated SKU-vs-Party Matrix & Consolidated Load Sheet
                 </h3>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Orders verified &amp; confirmed today (00:00–23:59 IST) automatically queue for Tomorrow ({tomorrowIST}). Prior un-dispatched orders stay isolated below.
+                </p>
               </div>
             </div>
 
@@ -1290,14 +1523,53 @@ export const BillingInvoicing: React.FC = () => {
               </button>
               <button
                 type="button"
+                disabled={freshDispatchOrders.length === 0}
+                onClick={() => setConfirmFinalizeOpen(true)}
+                className="px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-amber-900/30"
+                title="Mark all pending orders on the selected dispatch date as Dispatched and close this batch"
+              >
+                <CheckCircle2 size={14} /> Mark Selected Date Dispatched / Finalize Batch ({freshDispatchOrders.length})
+              </button>
+              <button
+                type="button"
                 onClick={handleSendManifestToDispatcher}
                 className="px-3.5 py-2 rounded-xl bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 font-bold text-xs flex items-center gap-1.5"
-                title="CONFIRMED orders are automatically live in the Dispatcher Mobile App"
+                title="CONFIRMED orders for the active dispatch date are live in the Dispatcher Mobile App"
               >
-                <CheckCircle2 size={14} /> Auto-Synced ({dispatchManifestOrders.length})
+                <CheckCircle2 size={14} /> Auto-Synced ({freshDispatchOrders.length})
               </button>
             </div>
           </div>
+
+          {/* Inline Batch Finalization Confirmation Banner */}
+          {confirmFinalizeOpen && (
+            <div className="p-3.5 bg-amber-950/60 border border-amber-500/40 rounded-xl text-xs text-amber-100 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <AlertOctagon size={16} className="text-amber-400 shrink-0" />
+                <span>
+                  Finalize Dispatch Batch <strong>{dispatchDateFilter}</strong>? This will mark{' '}
+                  <strong>{freshDispatchOrders.length}</strong> pending order(s) as{' '}
+                  <strong>DISPATCHED</strong>, auto-adjust depot inventory for Depot Stock orders, and clear them from the fresh load sheet.
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmFinalizeOpen(false)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleFinalizeSelectedDateBatch}
+                  className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold"
+                >
+                  Confirm &amp; Finalize Batch
+                </button>
+              </div>
+            </div>
+          )}
 
           {dispatchFeedback && (
             <div className="p-3 bg-emerald-950/60 border border-emerald-500/40 rounded-xl text-xs text-emerald-200 flex items-center justify-between gap-2">
@@ -1315,7 +1587,7 @@ export const BillingInvoicing: React.FC = () => {
             </div>
           )}
 
-          {/* View Mode, Dispatch Point & Filter Controls Bar */}
+          {/* View Mode, Batch Date, Dispatch Point & Filter Controls Bar */}
           <div className="bg-slate-900 border border-slate-800 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-3 flex-wrap">
               <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
@@ -1341,6 +1613,39 @@ export const BillingInvoicing: React.FC = () => {
                 >
                   <Layers size={13} /> Grouped Load Cards
                 </button>
+              </div>
+
+              {/* Dispatch Date Quick Presets & Date Picker */}
+              <div className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setDispatchDateFilter(tomorrowIST)}
+                  className={`px-2.5 py-1 rounded-md font-semibold text-xs flex items-center gap-1 transition-colors ${
+                    dispatchDateFilter === tomorrowIST
+                      ? 'bg-emerald-600 text-white font-bold shadow-sm'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <Calendar size={12} /> Tomorrow ({tomorrowIST})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDispatchDateFilter(todayIST)}
+                  className={`px-2.5 py-1 rounded-md font-semibold text-xs transition-colors ${
+                    dispatchDateFilter === todayIST
+                      ? 'bg-blue-600 text-white font-bold shadow-sm'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Today ({todayIST})
+                </button>
+                <input
+                  type="date"
+                  value={dispatchDateFilter}
+                  onChange={(e) => e.target.value && setDispatchDateFilter(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-xs text-white font-mono"
+                  aria-label="Dispatch batch date"
+                />
               </div>
 
               {dispatchViewMode === 'GROUPED' && (
@@ -1401,6 +1706,7 @@ export const BillingInvoicing: React.FC = () => {
                       </option>
                     );
                   })}
+                  <option value={UNMAPPED_DISPATCH_POINT_ID}>⚠ Unmapped Dispatch Point</option>
                 </select>
               </div>
 
@@ -1411,8 +1717,8 @@ export const BillingInvoicing: React.FC = () => {
                   onChange={(e) => setDispatchStatusScope(e.target.value as any)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white"
                 >
-                  <option value="CONFIRMED_ONLY">Confirmed Post-PO / Depot Stock ({confirmedOrders.length})</option>
-                  <option value="ALL_POST_PO">All Confirmed & Dispatched ({orders.filter(o => o.status === 'CONFIRMED' || o.status === 'PUNCHED_TO_PRINCIPAL' || o.status === 'APPROVED' || o.status === 'DISPATCHED' || (o.status === 'INVOICED' && !o.dispatched_at)).length})</option>
+                  <option value="CONFIRMED_ONLY">Fresh Un-dispatched ({freshDispatchOrders.length})</option>
+                  <option value="ALL_POST_PO">Include Dispatched on Date ({freshDispatchOrders.length + dispatchedForDateOrders.length})</option>
                 </select>
               </div>
 
@@ -1454,10 +1760,23 @@ export const BillingInvoicing: React.FC = () => {
                     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
-                          <Warehouse size={16} className="text-cyan-400" />
-                          <h4 className="text-sm font-bold text-white">
+                          <Warehouse
+                            size={16}
+                            className={matrix.dispatchPointId === UNMAPPED_DISPATCH_POINT_ID ? 'text-rose-400' : 'text-cyan-400'}
+                          />
+                          <h4
+                            className={`text-sm font-bold ${
+                              matrix.dispatchPointId === UNMAPPED_DISPATCH_POINT_ID ? 'text-rose-300' : 'text-white'
+                            }`}
+                          >
                             {matrix.dispatchPointName}{' '}
-                            <span className="font-mono text-xs text-cyan-400">({matrix.dispatchPointCode})</span>
+                            <span
+                              className={`font-mono text-xs ${
+                                matrix.dispatchPointId === UNMAPPED_DISPATCH_POINT_ID ? 'text-amber-300' : 'text-cyan-400'
+                              }`}
+                            >
+                              ({matrix.dispatchPointCode})
+                            </span>
                           </h4>
                           <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-bold">
                             {matrix.rows.length} SKUs × {matrix.parties.length} Parties
@@ -1467,12 +1786,20 @@ export const BillingInvoicing: React.FC = () => {
                           </span>
                         </div>
                         <div className="text-[11px] text-slate-400">
-                          Mapped Principal Companies:{' '}
-                          <span className="text-slate-200 font-semibold">
-                            {matrix.mappedCompanyNames.length > 0
-                              ? matrix.mappedCompanyNames.join(', ')
-                              : 'None mapped'}
-                          </span>
+                          {matrix.dispatchPointId === UNMAPPED_DISPATCH_POINT_ID ? (
+                            <span className="text-amber-300 font-semibold">
+                              Exception: Map Principal Company ➔ Dispatch Point in Setup to route these SKUs to an active hub.
+                            </span>
+                          ) : (
+                            <>
+                              Mapped Principal Companies:{' '}
+                              <span className="text-slate-200 font-semibold">
+                                {matrix.mappedCompanyNames.length > 0
+                                  ? matrix.mappedCompanyNames.join(', ')
+                                  : 'None mapped'}
+                              </span>
+                            </>
+                          )}
                         </div>
                       </div>
 
@@ -1770,6 +2097,189 @@ export const BillingInvoicing: React.FC = () => {
               })()}
             </div>
           )}
+
+          {/* COLLAPSIBLE PRIOR UN-DISPATCHED BACKLOG SECTION (STRICTLY ISOLATED FROM TOMORROW'S MATRIX) */}
+          {priorBacklogOrders.length > 0 && (
+            <div className="bg-slate-900 border border-amber-500/35 rounded-2xl overflow-hidden shadow-sm">
+              <div className="p-4 bg-amber-950/25 border-b border-amber-500/20 flex flex-wrap items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowPriorBacklog((prev) => !prev)}
+                  className="flex items-center gap-2.5 text-left"
+                >
+                  <div className="p-2 rounded-xl bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    <Clock size={16} />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h4 className="text-sm font-bold text-amber-200">
+                        Prior Un-dispatched Backlog ({priorBacklogOrders.length})
+                      </h4>
+                      <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-bold">
+                        ISOLATED FROM {dispatchDateFilter} FRESH MATRIX
+                      </span>
+                      {showPriorBacklog ? (
+                        <ChevronUp size={15} className="text-amber-300" />
+                      ) : (
+                        <ChevronDown size={15} className="text-amber-300" />
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Confirmed orders scheduled before {dispatchDateFilter} that have not been marked Dispatched yet. Carry them forward to Tomorrow or mark them Dispatched/Cleared.
+                    </p>
+                  </div>
+                </button>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleCarryForwardBacklog(
+                        selectedBacklogOrderIds.length > 0
+                          ? selectedBacklogOrderIds
+                          : priorBacklogOrders.map((o) => o.id)
+                      )
+                    }
+                    className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5"
+                  >
+                    <ArrowRight size={13} />
+                    {selectedBacklogOrderIds.length > 0
+                      ? `Carry Forward Selected (${selectedBacklogOrderIds.length}) to Tomorrow`
+                      : `Carry Forward All (${priorBacklogOrders.length}) to Tomorrow`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleClearBacklogAsDispatched(
+                        selectedBacklogOrderIds.length > 0
+                          ? selectedBacklogOrderIds
+                          : priorBacklogOrders.map((o) => o.id)
+                      )
+                    }
+                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5"
+                  >
+                    <CheckCircle2 size={13} />
+                    {selectedBacklogOrderIds.length > 0
+                      ? `Mark Selected (${selectedBacklogOrderIds.length}) Dispatched / Clear`
+                      : `Mark All (${priorBacklogOrders.length}) Dispatched / Clear`}
+                  </button>
+                </div>
+              </div>
+
+              {showPriorBacklog && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase text-[10px] font-semibold">
+                        <th className="py-2.5 px-3 w-8">
+                          <input
+                            type="checkbox"
+                            checked={
+                              priorBacklogOrders.length > 0 &&
+                              priorBacklogOrders.every((o) => selectedBacklogOrderIds.includes(o.id))
+                            }
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedBacklogOrderIds(priorBacklogOrders.map((o) => o.id));
+                              } else {
+                                setSelectedBacklogOrderIds([]);
+                              }
+                            }}
+                            aria-label="Select all prior backlog orders"
+                          />
+                        </th>
+                        <th className="py-2.5 px-3">Order #</th>
+                        <th className="py-2.5 px-3">Scheduled Date</th>
+                        <th className="py-2.5 px-3">Party / Outlet</th>
+                        <th className="py-2.5 px-3">Dispatch Point</th>
+                        <th className="py-2.5 px-3">Source</th>
+                        <th className="py-2.5 px-3">Status</th>
+                        <th className="py-2.5 px-3 text-right">Amount</th>
+                        <th className="py-2.5 px-3 text-right">Backlog Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70 text-slate-200">
+                      {priorBacklogOrders.map((ord) => {
+                        const dpObj = dispatchPoints.find((d) => d.id === ord.dispatch_point_id);
+                        const effDispatchDate = getOrderEffectiveDispatchDate(ord);
+                        const isSelected = selectedBacklogOrderIds.includes(ord.id);
+                        return (
+                          <tr key={ord.id} className="hover:bg-slate-800/40">
+                            <td className="py-2.5 px-3">
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedBacklogOrderIds((prev) => [...prev, ord.id]);
+                                  } else {
+                                    setSelectedBacklogOrderIds((prev) => prev.filter((id) => id !== ord.id));
+                                  }
+                                }}
+                                aria-label={`Select backlog order ${ord.order_number}`}
+                              />
+                            </td>
+                            <td className="py-2.5 px-3 font-mono font-bold text-indigo-300">{ord.order_number}</td>
+                            <td className="py-2.5 px-3 font-mono text-amber-300">{effDispatchDate}</td>
+                            <td className="py-2.5 px-3">
+                              <div className="font-semibold text-white">{ord.retailer_name_raw}</div>
+                              <div className="text-[10px] text-slate-400">{ord.beat_name}</div>
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-300">
+                              {isUnmappedDispatchPointId(ord.dispatch_point_id, dispatchPoints) ? (
+                                <span className="px-2 py-0.5 rounded bg-amber-950/70 text-amber-300 border border-amber-500/40 font-semibold text-[10px]">
+                                  {UNMAPPED_DISPATCH_POINT_LABEL}
+                                </span>
+                              ) : (
+                                getDispatchPointDisplayLabel(ord.dispatch_point_id, dispatchPoints)
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+                                  ord.fulfillment_source === 'DEPOT_STOCK'
+                                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                    : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                                }`}
+                              >
+                                {ord.fulfillment_source === 'DEPOT_STOCK' ? 'DEPOT STOCK' : 'PRINCIPAL PO'}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-200 font-bold text-[10px]">
+                                {ord.status}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400">
+                              ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                            </td>
+                            <td className="py-2.5 px-3 text-right">
+                              <div className="flex items-center justify-end gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => handleCarryForwardBacklog([ord.id])}
+                                  className="px-2 py-1 rounded-lg bg-indigo-600/80 hover:bg-indigo-500 text-white font-bold text-[10px]"
+                                >
+                                  Carry Forward to Tomorrow
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleClearBacklogAsDispatched([ord.id])}
+                                  className="px-2 py-1 rounded-lg bg-emerald-600/80 hover:bg-emerald-500 text-white font-bold text-[10px]"
+                                >
+                                  Mark Dispatched / Clear
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1827,259 +2337,336 @@ export const BillingInvoicing: React.FC = () => {
             </div>
           </div>
 
-          {/* Controls & Action Toolbar */}
-          <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 p-3 rounded-2xl border border-slate-800 text-xs">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-slate-400 font-medium text-[11px]">Filter Invoices:</span>
+          {/* All Invoices Comprehensive Filter Toolbar */}
+          <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 space-y-3 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="font-bold text-white flex items-center gap-2 text-sm">
+                <FileText size={16} className="text-blue-400" />
+                All Invoices Data Register ({filteredInvoices.length} of {invoices.length})
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={handleExportZohoSalesRegister}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <FileSpreadsheet size={13} /> Export Register (CSV)
+                </button>
+                <button
+                  onClick={() => setIsZohoSyncModalOpen(true)}
+                  className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-sm transition-colors"
+                >
+                  <Share2 size={13} /> Push Zoho
+                </button>
+                <button
+                  onClick={() => {
+                    setZohoTargetInvoice(null);
+                    setIsZohoPayloadModalOpen(true);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-bold text-xs inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <Layers size={13} /> JSON Payload
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5 pt-2 border-t border-slate-800">
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-2.5 text-slate-500" />
+                <input
+                  type="text"
+                  placeholder="Inv #, CN #, E-Way..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-2.5 py-1.5 text-white text-xs"
+                />
+              </div>
+
+              <select
+                value={filterParty}
+                onChange={(e) => setFilterParty(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white text-xs"
+              >
+                <option value="ALL">All Parties ({invoicePartyNames.length})</option>
+                {invoicePartyNames.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={filterStatus}
+                onChange={(e) => setFilterStatus(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white text-xs"
+              >
+                <option value="ALL">All Statuses</option>
+                <option value="UNPAID">UNPAID</option>
+                <option value="PARTIAL">PARTIAL</option>
+                <option value="PAID">PAID</option>
+              </select>
+
               <select
                 value={filterType}
                 onChange={(e) => setFilterType(e.target.value)}
                 className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-semibold text-xs"
               >
-                <option value="ALL">All Invoices ({invoices.length})</option>
-                <option value="CASH">💵 Cash Settlement Invoices ({cashSettledInvoices.length})</option>
-                <option value="ONLINE">🏦 Online / Bank Settlement ({onlineSettledInvoices.length})</option>
-                <option value="REGISTERED_GST">📄 GST Tax Invoices ({gstInvoicesCount})</option>
-                <option value="CASH_NON_GST">📑 Cash Non-GST Invoices ({cashInvoicesCount})</option>
-                <option value="UNPAID">⚠️ Unpaid / Overdue Invoices</option>
-                <option value="ZOHO_PENDING">⚡ Pending Zoho Books Push ({invoices.length - zohoSyncedCount})</option>
+                <option value="ALL">All Types &amp; CNs</option>
+                <option value="REGISTERED_GST">GST Tax Invoices ({gstInvoicesCount})</option>
+                <option value="CASH_NON_GST">Cash Non-GST ({cashInvoicesCount})</option>
+                <option value="WITH_CREDIT_NOTE">Discount / Credit Note Applied</option>
+                <option value="CASH">Cash Settled ({cashSettledInvoices.length})</option>
+                <option value="ONLINE">Online / Bank ({onlineSettledInvoices.length})</option>
+                <option value="UNPAID">Pending Due</option>
+                <option value="ZOHO_PENDING">Pending Zoho Push</option>
               </select>
-            </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative w-48">
-                <Search size={14} className="absolute left-2.5 top-2.5 text-slate-500" />
+              <select
+                value={filterInvoiceDp}
+                onChange={(e) => setFilterInvoiceDp(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white text-xs"
+              >
+                <option value="ALL">All Dispatch Points</option>
+                {dispatchPoints.map((dp) => (
+                  <option key={dp.id} value={dp.id}>
+                    {dp.name}
+                  </option>
+                ))}
+              </select>
+
+              <div className="flex items-center gap-1.5">
                 <input
-                  type="text"
-                  placeholder="Search #, outlet, E-Way..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-1.5 text-white text-xs"
+                  type="date"
+                  value={filterDateFrom}
+                  onChange={(e) => setFilterDateFrom(e.target.value)}
+                  className="w-1/2 bg-slate-950 border border-slate-700 rounded-lg px-1.5 py-1.5 text-white text-[11px] font-mono"
+                  title="Invoice Date From"
+                />
+                <input
+                  type="date"
+                  value={filterDateTo}
+                  onChange={(e) => setFilterDateTo(e.target.value)}
+                  className="w-1/2 bg-slate-950 border border-slate-700 rounded-lg px-1.5 py-1.5 text-white text-[11px] font-mono"
+                  title="Invoice Date To"
                 />
               </div>
-
-              {/* Zoho Push & Export Controls */}
-              <button
-                onClick={() => setIsZohoSyncModalOpen(true)}
-                className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-sm transition-colors"
-              >
-                <Share2 size={13} /> Push Data to Zoho
-              </button>
-
-              <button
-                onClick={handleExportZohoSalesRegister}
-                className="px-3 py-1.5 rounded-lg bg-emerald-800/80 hover:bg-emerald-700 text-emerald-100 border border-emerald-600/40 font-bold text-xs inline-flex items-center gap-1.5 transition-colors"
-              >
-                <FileSpreadsheet size={13} /> Export Zoho CSV
-              </button>
-
-              <button
-                onClick={() => {
-                  setZohoTargetInvoice(null);
-                  setIsZohoPayloadModalOpen(true);
-                }}
-                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-bold text-xs inline-flex items-center gap-1.5 transition-colors"
-              >
-                <Layers size={13} /> View Zoho API Payload
-              </button>
             </div>
+
+            {(filterType !== 'ALL' || filterStatus !== 'ALL' || filterParty !== 'ALL' || filterInvoiceDp !== 'ALL' || filterDateFrom || filterDateTo || searchQuery) && (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFilterType('ALL');
+                    setFilterStatus('ALL');
+                    setFilterParty('ALL');
+                    setFilterInvoiceDp('ALL');
+                    setFilterDateFrom('');
+                    setFilterDateTo('');
+                    setSearchQuery('');
+                  }}
+                  className="text-[11px] text-amber-300 hover:text-amber-200 font-semibold"
+                >
+                  Clear All Invoice Filters
+                </button>
+              </div>
+            )}
           </div>
 
-          {/* Invoices Table */}
+          {/* All Invoices Permanent Data Table */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs text-slate-300">
                 <thead className="bg-slate-950 text-slate-400 font-semibold border-b border-slate-800 uppercase text-[10px] tracking-wider">
                   <tr>
-                    <th className="py-3 px-4">Invoice # & Date</th>
-                    <th className="py-3 px-4">Retailer Outlet</th>
-                    <th className="py-3 px-4">Type & E-Way</th>
-                    <th className="py-3 px-4 text-center">Settlement Mode</th>
-                    <th className="py-3 px-4 text-right">Total Amount</th>
+                    <th className="py-3 px-4">Invoice # &amp; Date</th>
+                    <th className="py-3 px-4">Party / Dispatch Point</th>
+                    <th className="py-3 px-4">Type &amp; Credit Note</th>
+                    <th className="py-3 px-4 text-center">Settlement</th>
+                    <th className="py-3 px-4 text-right">Net Payable (Gross / Disc)</th>
                     <th className="py-3 px-4 text-right">Paid Amount</th>
                     <th className="py-3 px-4 text-center">Status</th>
-                    <th className="py-3 px-4 text-center">Zoho Books</th>
-                    <th className="py-3 px-4 text-center">Lock Control</th>
+                    <th className="py-3 px-4 text-center">Lock</th>
                     <th className="py-3 px-4 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800 font-mono">
-                  {filteredInvoices.map((inv) => {
-                    const remaining = inv.total_amount - inv.paid_amount;
-                    const payInfo = getInvoicePaymentInfo(inv);
+                  {filteredInvoices.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-10 text-center text-slate-400 font-sans">
+                        No invoices match the selected filters.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredInvoices.map((inv) => {
+                      const netTotal = getInvoiceNetTotal(inv);
+                      const grossTotal = inv.gross_amount ?? inv.total_amount;
+                      const discountAmt = inv.is_credit_note_discount ? Number(inv.credit_note_discount_amount) || 0 : 0;
+                      const remaining = Math.max(0, netTotal - inv.paid_amount);
+                      const payInfo = getInvoicePaymentInfo(inv);
+                      const dpObj = dispatchPoints.find((d) => d.id === inv.dispatch_point_id);
 
-                    return (
-                      <tr key={inv.id} className="hover:bg-slate-800/50 transition-colors">
-                        <td className="py-3 px-4">
-                          <div className="font-bold text-white">{inv.invoice_number}</div>
-                          <div className="text-[10px] text-slate-500">{inv.invoice_date}</div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="font-sans font-semibold text-white">{inv.retailer_name}</div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              inv.invoice_type === 'REGISTERED_GST'
-                                ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
-                                : 'bg-slate-800 text-slate-400 border border-slate-700'
-                            }`}
-                          >
-                            {inv.invoice_type === 'REGISTERED_GST' ? 'GST Tax Inv' : 'Cash Non-GST'}
-                          </span>
-                          {inv.is_credit_note_discount && (
-                            <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                              Credit Note {inv.credit_note_number || ''} (-₹{(inv.credit_note_discount_amount || 0).toLocaleString('en-IN')})
-                            </span>
-                          )}
-                          {inv.e_way_bill_no && (
-                            <div className="text-[9px] text-slate-500 font-mono mt-0.5">
-                              E-Way: {inv.e_way_bill_no}
-                            </div>
-                          )}
-                        </td>
-
-                        {/* Settlement Mode Tag (Cash vs Online) */}
-                        <td className="py-3 px-4 text-center">
-                          {payInfo.category === 'CASH' && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 inline-flex items-center gap-1">
-                              💵 CASH
-                            </span>
-                          )}
-                          {payInfo.category === 'ONLINE' && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 inline-flex items-center gap-1">
-                              🏦 ONLINE ({payInfo.primaryMode})
-                            </span>
-                          )}
-                          {payInfo.category === 'MIXED' && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-purple-500/20 text-purple-300 border border-purple-500/30 inline-flex items-center gap-1">
-                              🔄 MIXED (CASH+UPI)
-                            </span>
-                          )}
-                          {payInfo.category === 'CREDIT' && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 inline-flex items-center gap-1">
-                              ⏳ CREDIT DUE
-                            </span>
-                          )}
-                        </td>
-
-                        <td className="py-3 px-4 text-right font-bold text-white">
-                          ₹{(inv.total_amount || 0).toLocaleString('en-IN')}
-                        </td>
-                        <td className="py-3 px-4 text-right text-emerald-400">
-                          ₹{(inv.paid_amount || 0).toLocaleString('en-IN')}
-                        </td>
-                        <td className="py-3 px-4 text-center">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
-                              inv.status === 'PAID'
-                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                : inv.status === 'PARTIAL'
-                                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                                : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                            }`}
-                          >
-                            {inv.status}
-                          </span>
-                          {remaining > 0 && inv.status !== 'UNPAID' && (
-                            <div className="text-[9px] text-rose-400 mt-0.5">
-                              Due: ₹{(remaining || 0).toLocaleString('en-IN')}
-                            </div>
-                          )}
-                        </td>
-
-                        {/* Zoho Sync Column */}
-                        <td className="py-3 px-4 text-center">
-                          {inv.zoho_synced ? (
-                            <span className="px-2 py-0.5 rounded bg-purple-950/80 text-purple-300 border border-purple-500/40 text-[10px] font-bold inline-flex items-center gap-1">
-                              <CheckCircle2 size={11} className="text-purple-400" /> SYNCED
-                            </span>
-                          ) : (
-                            <button
-                              onClick={() => handlePushSingleInvoiceToZoho(inv)}
-                              className="px-2 py-0.5 rounded bg-purple-900/40 text-purple-300 border border-purple-500/30 hover:bg-purple-800/60 text-[10px] font-bold inline-flex items-center gap-1"
-                              title="Push this individual invoice to Zoho Books"
+                      return (
+                        <tr key={inv.id} className="hover:bg-slate-800/50 transition-colors">
+                          <td className="py-3 px-4">
+                            <div className="font-bold text-white">{inv.invoice_number}</div>
+                            <div className="text-[10px] text-slate-500">{inv.invoice_date}</div>
+                          </td>
+                          <td className="py-3 px-4 font-sans">
+                            <div className="font-semibold text-white">{inv.retailer_name}</div>
+                            <div className="text-[10px] text-slate-400">{dpObj?.name || 'Dispatch Point'}</div>
+                          </td>
+                          <td className="py-3 px-4 font-sans">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                inv.invoice_type === 'REGISTERED_GST'
+                                  ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                                  : 'bg-slate-800 text-slate-300 border border-slate-700'
+                              }`}
                             >
-                              <Share2 size={10} /> Push Zoho
-                            </button>
-                          )}
-                        </td>
+                              {inv.invoice_type === 'REGISTERED_GST' ? 'GST Tax Inv' : 'Cash Non-GST'}
+                            </span>
+                            {discountAmt > 0 && (
+                              <div className="mt-1">
+                                <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 font-mono">
+                                  {inv.credit_note_number || 'CN'} (-₹{discountAmt.toLocaleString('en-IN')})
+                                </span>
+                              </div>
+                            )}
+                            {inv.e_way_bill_no && (
+                              <div className="text-[9px] text-slate-500 font-mono mt-0.5">
+                                E-Way: {inv.e_way_bill_no}
+                              </div>
+                            )}
+                          </td>
 
-                        <td className="py-3 px-4 text-center">
-                          {inv.is_locked ? (
-                            <button
-                              onClick={() => handleToggleLockInvoice(inv)}
-                              className="px-2 py-1 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold inline-flex items-center gap-1 hover:bg-emerald-900/60"
-                              title="Locked & Reconciled by Accountant. Click to unlock."
+                          {/* Settlement Mode Tag */}
+                          <td className="py-3 px-4 text-center font-sans">
+                            {payInfo.category === 'CASH' && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 inline-flex items-center gap-1">
+                                CASH
+                              </span>
+                            )}
+                            {payInfo.category === 'ONLINE' && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 inline-flex items-center gap-1">
+                                {payInfo.primaryMode}
+                              </span>
+                            )}
+                            {payInfo.category === 'MIXED' && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-purple-500/20 text-purple-300 border border-purple-500/30 inline-flex items-center gap-1">
+                                MIXED
+                              </span>
+                            )}
+                            {payInfo.category === 'CREDIT' && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 inline-flex items-center gap-1">
+                                CREDIT DUE
+                              </span>
+                            )}
+                          </td>
+
+                          <td className="py-3 px-4 text-right">
+                            <div className="font-bold text-white">₹{netTotal.toLocaleString('en-IN')}</div>
+                            {discountAmt > 0 && (
+                              <div className="text-[9px] text-slate-400">
+                                Gross ₹{grossTotal.toLocaleString('en-IN')}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-right text-emerald-400">
+                            ₹{(inv.paid_amount || 0).toLocaleString('en-IN')}
+                          </td>
+                          <td className="py-3 px-4 text-center font-sans">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
+                                inv.status === 'PAID'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                  : inv.status === 'PARTIAL'
+                                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                  : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                              }`}
                             >
-                              <Lock size={12} /> Locked 🔒
-                            </button>
-                          ) : (
-                            <button
-                              onClick={() => handleToggleLockInvoice(inv)}
-                              className="px-2 py-1 rounded bg-slate-800 text-slate-400 border border-slate-700 text-[10px] font-bold inline-flex items-center gap-1 hover:bg-slate-700 hover:text-white"
-                              title="Click to Lock & Reconcile invoice"
-                            >
-                              <Unlock size={12} /> Open Ledger
-                            </button>
-                          )}
-                        </td>
+                              {inv.status}
+                            </span>
+                            {remaining > 0 && inv.status !== 'UNPAID' && (
+                              <div className="text-[9px] text-rose-400 mt-0.5 font-mono">
+                                Due: ₹{remaining.toLocaleString('en-IN')}
+                              </div>
+                            )}
+                          </td>
 
-                        <td className="py-3 px-4 text-right space-x-1.5 font-sans">
-                          {/* Inspect Details Button */}
-                          <button
-                            onClick={() => setSelectedInvoiceForDetail(inv)}
-                            className="px-2 py-1 rounded bg-indigo-900/50 text-indigo-200 border border-indigo-500/40 hover:bg-indigo-800/70 text-[10px] font-bold inline-flex items-center gap-1"
-                            title="Inspect complete invoice lines, cash/online settlement details, and Zoho payload"
-                          >
-                            <Eye size={12} /> Details
-                          </button>
-
-                          <button
-                            onClick={() => setSelectedInvoiceForPrint(inv)}
-                            className="px-2 py-1 rounded bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700 text-[10px] font-semibold inline-flex items-center gap-1"
-                          >
-                            <Printer size={12} /> Print
-                          </button>
-
-                          <button
-                            onClick={() => handleOpenPartialPayInvoice(inv)}
-                            className="px-2 py-1 rounded bg-blue-900/40 text-blue-300 border border-blue-500/30 hover:bg-blue-800/60 text-[10px] font-semibold inline-flex items-center gap-1"
-                          >
-                            <Edit3 size={12} /> Partial Pay
-                          </button>
-
-                          {inv.status !== 'PAID' && (
-                            <>
+                          <td className="py-3 px-4 text-center font-sans">
+                            {inv.is_locked ? (
                               <button
-                                onClick={() => {
-                                  setCreditNoteInvoice(inv);
-                                  setCreditNoteAmt('');
-                                  setCreditNoteNum(`CN-${Date.now().toString().slice(-5)}`);
-                                  setCreditNoteReason('');
-                                }}
-                                className="px-2 py-1 rounded bg-purple-900/50 hover:bg-purple-800/70 text-purple-200 border border-purple-500/30 text-[10px] font-semibold inline-flex items-center gap-1"
-                                title="Issue occasional BE Credit Note discount against this invoice"
+                                onClick={() => handleToggleLockInvoice(inv)}
+                                className="px-2 py-1 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold inline-flex items-center gap-1 hover:bg-emerald-900/60"
+                                title="Locked & Reconciled. Click to unlock."
                               >
-                                Credit Note
+                                <Lock size={12} /> Locked
                               </button>
+                            ) : (
                               <button
-                                onClick={() => {
-                                  setSelectedInvoiceForPayment(inv);
-                                  setPayRetailerId(inv.retailer_id || '');
-                                  setPayAmount(remaining);
-                                  setIsRecordPaymentOpen(true);
-                                }}
-                                className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold inline-flex items-center gap-1"
+                                onClick={() => handleToggleLockInvoice(inv)}
+                                className="px-2 py-1 rounded bg-slate-800 text-slate-400 border border-slate-700 text-[10px] font-bold inline-flex items-center gap-1 hover:bg-slate-700 hover:text-white"
+                                title="Click to Lock & Reconcile invoice"
                               >
-                                <Plus size={12} /> Record Pay
+                                <Unlock size={12} /> Open
                               </button>
-                            </>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                            )}
+                          </td>
+
+                          <td className="py-3 px-4 text-right space-x-1.5 font-sans whitespace-nowrap">
+                            <button
+                              onClick={() => setSelectedInvoiceForDetail(inv)}
+                              className="px-2 py-1 rounded bg-indigo-900/50 text-indigo-200 border border-indigo-500/40 hover:bg-indigo-800/70 text-[10px] font-bold inline-flex items-center gap-1"
+                            >
+                              <Eye size={12} /> View
+                            </button>
+
+                            <button
+                              onClick={() => setSelectedInvoiceForPrint(inv)}
+                              className="px-2 py-1 rounded bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700 text-[10px] font-semibold inline-flex items-center gap-1"
+                            >
+                              <Printer size={12} /> Print
+                            </button>
+
+                            <button
+                              onClick={() => handleOpenPartialPayInvoice(inv)}
+                              className="px-2 py-1 rounded bg-blue-900/40 text-blue-300 border border-blue-500/30 hover:bg-blue-800/60 text-[10px] font-semibold inline-flex items-center gap-1"
+                            >
+                              <Edit3 size={12} /> Partial Pay
+                            </button>
+
+                            {inv.status !== 'PAID' && (
+                              <>
+                                <button
+                                  onClick={() => {
+                                    setCreditNoteInvoice(inv);
+                                    setCreditNoteAmt('');
+                                    setCreditNoteNum(`CN-${Date.now().toString().slice(-5)}`);
+                                    setCreditNoteReason('');
+                                  }}
+                                  className="px-2 py-1 rounded bg-purple-900/50 hover:bg-purple-800/70 text-purple-200 border border-purple-500/30 text-[10px] font-semibold inline-flex items-center gap-1"
+                                  title="Issue additional Credit Note discount"
+                                >
+                                  Credit Note
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setSelectedInvoiceForPayment(inv);
+                                    setPayRetailerId(inv.retailer_id || '');
+                                    setPayAmount(remaining);
+                                    setIsRecordPaymentOpen(true);
+                                  }}
+                                  className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold inline-flex items-center gap-1"
+                                >
+                                  <Plus size={12} /> Record Pay
+                                </button>
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
@@ -2290,81 +2877,7 @@ export const BillingInvoicing: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 4: CREDIT LIMIT & OVERDUE DEBT AUDIT */}
-      {activeTab === 'CREDIT_AUDIT' && (
-        <div className="space-y-4">
-          <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl space-y-2">
-            <div className="flex items-center justify-between text-xs font-bold">
-              <span className="text-white flex items-center gap-2">
-                <ShieldAlert size={16} className="text-rose-400" />
-                Live Party Credit Liability &amp; Fund Shortage Audit
-              </span>
-              <span className="text-slate-400 font-mono">
-                {creditExceededParties.length} Parties Exceeding Credit Limits
-              </span>
-            </div>
-            <p className="text-xs text-slate-400">
-              Real-time over-limit liability across Retailers, Distributors, and CFS accounts (Total Liability = Non-Cancelled Orders - Verified Payments - Explicit Credit Notes).
-            </p>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {creditExceededParties.length === 0 ? (
-              <div className="md:col-span-2 p-8 text-center bg-slate-900 border border-slate-800 rounded-2xl text-xs text-slate-400">
-                No active parties currently exceed their approved credit limits.
-              </div>
-            ) : (
-              creditExceededParties.map((party) => (
-                <div key={`${party.partyKind}_${party.id}`} className="p-4 bg-slate-900 border border-rose-500/40 rounded-2xl space-y-3">
-                  <div className="flex justify-between items-start gap-2">
-                    <div>
-                      <div className="text-sm font-bold text-white flex items-center gap-2">
-                        <span>{party.name}</span>
-                        <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[9px] text-slate-300 uppercase">
-                          {party.categoryLabel}
-                        </span>
-                      </div>
-                      <div className="text-xs text-slate-400 mt-0.5">
-                        {party.routeOrLocation} {party.mobileOrPhone ? `| ${party.mobileOrPhone}` : ''}
-                      </div>
-                    </div>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-rose-500/20 text-rose-300 border border-rose-500/30 shrink-0">
-                      SHORTAGE ₹{party.fund_shortage.toLocaleString('en-IN')}
-                    </span>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-2 p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs font-mono">
-                    <div>
-                      <span className="text-slate-400 block text-[10px] font-sans">Credit Limit</span>
-                      <strong className="text-white">₹{party.credit_limit.toLocaleString('en-IN')}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[10px] font-sans">Total Liability</span>
-                      <strong className="text-rose-400">₹{party.total_liability.toLocaleString('en-IN')}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[10px] font-sans">Remaining Credit</span>
-                      <strong className="text-emerald-400">₹{party.remaining_credit.toLocaleString('en-IN')}</strong>
-                    </div>
-                  </div>
-
-                  <div className="flex justify-end gap-2 pt-2 border-t border-slate-800 text-xs">
-                    <button
-                      onClick={() => {
-                        setEditingCreditParty(party);
-                        setNewCreditLimitVal(party.credit_limit + 25000);
-                      }}
-                      className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg"
-                    >
-                      Adjust Approved Credit Limit
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      )}
+      {/* DUPLICATE CREDIT_AUDIT TAB REMOVED (Canonical Credit Gate lives in Credit > Party Ledger & Credit Gate) */}
 
       {/* PRINT / VIEW GST TAX INVOICE MODAL */}
       {selectedInvoiceForPrint && (
@@ -2413,7 +2926,7 @@ export const BillingInvoicing: React.FC = () => {
                 <div className="text-sm font-bold text-white">{selectedInvoiceForPrint.retailer_name}</div>
               </div>
 
-              {/* Tax Breakup Summary */}
+              {/* Tax & Discount Breakup Summary */}
               <div className="space-y-1.5 font-mono text-xs pt-2">
                 <div className="flex justify-between text-slate-400">
                   <span>Subtotal (Taxable Value):</span>
@@ -2427,9 +2940,23 @@ export const BillingInvoicing: React.FC = () => {
                   <span>SGST (9%):</span>
                   <span>₹{(selectedInvoiceForPrint.sgst || 0).toLocaleString('en-IN')}</span>
                 </div>
+                {selectedInvoiceForPrint.is_credit_note_discount && (selectedInvoiceForPrint.credit_note_discount_amount || 0) > 0 && (
+                  <>
+                    <div className="flex justify-between text-slate-300 pt-1 border-t border-slate-800/70">
+                      <span>Gross Invoice Total:</span>
+                      <span>₹{(selectedInvoiceForPrint.gross_amount ?? selectedInvoiceForPrint.total_amount).toLocaleString('en-IN')}</span>
+                    </div>
+                    <div className="flex justify-between text-purple-300 font-semibold">
+                      <span>
+                        Credit Note Discount ({selectedInvoiceForPrint.credit_note_number || 'CN'}):
+                      </span>
+                      <span>- ₹{(selectedInvoiceForPrint.credit_note_discount_amount || 0).toLocaleString('en-IN')}</span>
+                    </div>
+                  </>
+                )}
                 <div className="flex justify-between text-white font-bold text-sm pt-2 border-t border-slate-800">
-                  <span>Grand Total Invoice Value:</span>
-                  <span className="text-emerald-400">₹{(selectedInvoiceForPrint.total_amount || 0).toLocaleString('en-IN')}</span>
+                  <span>Net Payable Invoice Value:</span>
+                  <span className="text-emerald-400">₹{getInvoiceNetTotal(selectedInvoiceForPrint).toLocaleString('en-IN')}</span>
                 </div>
               </div>
 
@@ -3511,6 +4038,200 @@ export const BillingInvoicing: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* GENERATE INVOICE & DISCOUNT / AUTO CREDIT NOTE MODAL (STRICT DELIVERED ORDERS) */}
+      {invoiceModalOrder && (() => {
+        const fin = getOrderFinancialSummary(invoiceModalOrder, skus);
+        const subtotal = fin.productValue || Math.round(invoiceModalOrder.total_amount);
+        const tax = invModalType === 'REGISTERED_GST' ? fin.gstAmount : 0;
+        const grossTotal = invModalType === 'REGISTERED_GST' ? fin.totalAmountWithGst : subtotal;
+        const rawDiscountVal = Math.max(0, Number(invDiscountValue) || 0);
+        const computedDiscountAmt =
+          invDiscountType === 'FLAT'
+            ? Math.min(grossTotal, Math.round(rawDiscountVal * 100) / 100)
+            : invDiscountType === 'PERCENT'
+            ? Math.min(grossTotal, Math.round(((grossTotal * rawDiscountVal) / 100) * 100) / 100)
+            : 0;
+        const netPayable = Math.max(0, Math.round((grossTotal - computedDiscountAmt) * 100) / 100);
+
+        return (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="bg-slate-900 border border-purple-500/40 rounded-2xl w-full max-w-lg p-6 text-slate-200 space-y-4 shadow-2xl">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                <div>
+                  <span className="text-[10px] font-mono text-emerald-400 uppercase font-bold">
+                    Delivered Order &rarr; Generate Final Invoice
+                  </span>
+                  <h2 className="text-sm font-bold text-white">
+                    {invoiceModalOrder.order_number} — {invoiceModalOrder.retailer_name_raw}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setInvoiceModalOrder(null)}
+                  className="text-slate-400 hover:text-white text-xs bg-slate-800 px-2 py-1 rounded-lg"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleCreateInvoiceFromOrder(invoiceModalOrder, invModalType, {
+                    discountType: invDiscountType,
+                    discountValue: rawDiscountVal,
+                    creditNoteNumber: invCreditNoteNum,
+                    creditNoteReason: invCreditNoteReason,
+                  });
+                }}
+                className="space-y-4 text-xs"
+              >
+                {/* Invoice Type Switch */}
+                <div>
+                  <label className="block text-slate-400 mb-1.5 font-semibold">Invoice Format</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setInvModalType('REGISTERED_GST')}
+                      className={`py-2 px-3 rounded-xl font-bold border text-xs ${
+                        invModalType === 'REGISTERED_GST'
+                          ? 'bg-blue-600 text-white border-blue-500'
+                          : 'bg-slate-950 text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      Registered GST Tax Invoice
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setInvModalType('CASH_NON_GST')}
+                      className={`py-2 px-3 rounded-xl font-bold border text-xs ${
+                        invModalType === 'CASH_NON_GST'
+                          ? 'bg-amber-600 text-white border-amber-500'
+                          : 'bg-slate-950 text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      Cash Non-GST Invoice
+                    </button>
+                  </div>
+                </div>
+
+                {/* Optional Discount / Automatic Credit Note */}
+                <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-purple-300">Optional Invoice Discount &amp; Auto Credit Note</span>
+                    <div className="flex items-center gap-1 bg-slate-900 p-0.5 rounded-lg border border-slate-800">
+                      {(['NONE', 'FLAT', 'PERCENT'] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() => {
+                            setInvDiscountType(mode);
+                            if (mode === 'NONE') setInvDiscountValue('');
+                          }}
+                          className={`px-2 py-1 rounded text-[10px] font-bold ${
+                            invDiscountType === mode
+                              ? 'bg-purple-600 text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {mode === 'NONE' ? 'No Discount' : mode === 'FLAT' ? 'Flat (₹)' : 'Percent (%)'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {invDiscountType !== 'NONE' && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">
+                          {invDiscountType === 'FLAT' ? 'Discount Amount (₹)' : 'Discount Percentage (%)'}
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={invDiscountType === 'PERCENT' ? 100 : grossTotal}
+                          step="0.01"
+                          value={invDiscountValue}
+                          onChange={(e) => setInvDiscountValue(e.target.value)}
+                          placeholder={invDiscountType === 'FLAT' ? 'e.g. 500' : 'e.g. 2.5'}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono font-bold"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">Auto Credit Note #</label>
+                        <input
+                          type="text"
+                          value={invCreditNoteNum}
+                          onChange={(e) => setInvCreditNoteNum(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono"
+                          required
+                        />
+                      </div>
+                      <div className="sm:col-span-2">
+                        <label className="block text-[11px] text-slate-400 mb-1">Discount / Credit Note Reason</label>
+                        <input
+                          type="text"
+                          value={invCreditNoteReason}
+                          onChange={(e) => setInvCreditNoteReason(e.target.value)}
+                          placeholder="e.g. Trade scheme / short supply / cash discount"
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+                          required
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Live Calculation Breakdown */}
+                <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl font-mono space-y-1.5 text-xs">
+                  <div className="flex justify-between text-slate-400">
+                    <span className="font-sans">Taxable Subtotal:</span>
+                    <span>₹{subtotal.toLocaleString('en-IN')}</span>
+                  </div>
+                  {invModalType === 'REGISTERED_GST' && (
+                    <div className="flex justify-between text-slate-400">
+                      <span className="font-sans">GST (CGST + SGST):</span>
+                      <span>₹{tax.toLocaleString('en-IN')}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between text-slate-200 font-semibold">
+                    <span className="font-sans">Gross Invoice Total:</span>
+                    <span>₹{grossTotal.toLocaleString('en-IN')}</span>
+                  </div>
+                  {computedDiscountAmt > 0 && (
+                    <div className="flex justify-between text-purple-300 font-semibold">
+                      <span className="font-sans">Credit Note Discount ({invCreditNoteNum}):</span>
+                      <span>- ₹{computedDiscountAmt.toLocaleString('en-IN')}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between text-white font-extrabold text-sm pt-2 border-t border-slate-800">
+                    <span className="font-sans">Final Net Payable Invoice:</span>
+                    <span className="text-emerald-400">₹{netPayable.toLocaleString('en-IN')}</span>
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setInvoiceModalOrder(null)}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl font-semibold"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl font-bold flex items-center gap-1.5 shadow-lg shadow-purple-900/40"
+                  >
+                    <CheckCircle2 size={14} /> Confirm &amp; Post Invoice
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

@@ -6,6 +6,11 @@ import {
   CreditPartyCategory,
   PartyCreditRecord,
 } from '../../utils/creditLedger';
+import {
+  getISTDateString,
+  getOrderEffectiveDispatchDate,
+  isOrderAlreadyDispatched,
+} from '../../utils/dispatchBatching';
 import { KPICard } from '../common/KPICard';
 import {
   AlertTriangle,
@@ -40,7 +45,8 @@ import {
   Trash2,
   Edit2,
   Users,
-  Database
+  Database,
+  Calendar
 } from 'lucide-react';
 
 export const CreditManagement: React.FC = () => {
@@ -103,6 +109,12 @@ export const CreditManagement: React.FC = () => {
   const [selectedPaymentForProof, setSelectedPaymentForProof] = useState<Payment | null>(null);
   const [selectedPaymentForSplit, setSelectedPaymentForSplit] = useState<Payment | null>(null);
   const [selectedPartyForLedger, setSelectedPartyForLedger] = useState<PartyCreditRecord | null>(null);
+  const [ledgerDateFrom, setLedgerDateFrom] = useState<string>('');
+  const [ledgerDateTo, setLedgerDateTo] = useState<string>('');
+  const [ledgerDispatchStatusFilter, setLedgerDispatchStatusFilter] = useState<
+    'ALL' | 'PENDING_CONFIRMATION' | 'QUEUED_FOR_DISPATCH' | 'DISPATCHED' | 'INVOICED' | 'CANCELLED'
+  >('ALL');
+  const [ledgerDispatchDateFilter, setLedgerDispatchDateFilter] = useState<string>('');
 
   // Adjust Credit Limit & Remove Party Modals
   const [adjustingParty, setAdjustingParty] = useState<PartyCreditRecord | null>(null);
@@ -1515,21 +1527,62 @@ export const CreditManagement: React.FC = () => {
           (entityId && matchIdSet.has(entityId)) ||
           (entityName && matchNameSet.has(entityName.trim().toLowerCase()));
 
-        const matchedInvoices = invoices.filter((i) => matchesParty(i.retailer_id, i.retailer_name));
+        const isWithinLedgerDates = (rawDate?: string | null) => {
+          if (!ledgerDateFrom && !ledgerDateTo) return true;
+          if (!rawDate) return false;
+          const ymd = getISTDateString(rawDate);
+          if (ledgerDateFrom && ymd < ledgerDateFrom) return false;
+          if (ledgerDateTo && ymd > ledgerDateTo) return false;
+          return true;
+        };
+
+        const matchesOrderDispatchFilters = (ord: typeof orders[number]) => {
+          if (!isWithinLedgerDates(ord.order_date)) return false;
+          if (ledgerDispatchDateFilter) {
+            const effDispatchDate = getOrderEffectiveDispatchDate(ord);
+            if (effDispatchDate !== ledgerDispatchDateFilter) return false;
+          }
+          if (ledgerDispatchStatusFilter === 'ALL') return true;
+          if (ledgerDispatchStatusFilter === 'CANCELLED') return ord.status === 'CANCELLED';
+          if (ledgerDispatchStatusFilter === 'PENDING_CONFIRMATION') {
+            return ['PENDING_VERIFICATION', 'VERIFIED', 'VERIFIED_BY_BILLING', 'PUNCHED', 'FLAGGED', 'CLEARED'].includes(ord.status);
+          }
+          if (ledgerDispatchStatusFilter === 'QUEUED_FOR_DISPATCH') {
+            return (
+              !isOrderAlreadyDispatched(ord) &&
+              ['CONFIRMED', 'PUNCHED_TO_PRINCIPAL', 'APPROVED', 'INVOICED'].includes(ord.status)
+            );
+          }
+          if (ledgerDispatchStatusFilter === 'DISPATCHED') {
+            return isOrderAlreadyDispatched(ord);
+          }
+          if (ledgerDispatchStatusFilter === 'INVOICED') {
+            return ord.status === 'INVOICED' || Boolean(ord.invoiced_at);
+          }
+          return true;
+        };
+
+        const matchedInvoices = invoices.filter(
+          (i) => matchesParty(i.retailer_id, i.retailer_name) && isWithinLedgerDates(i.invoice_date)
+        );
         const matchedAllOrders = orders.filter(
           (o) =>
-            matchesParty(o.retailer_id, o.retailer_name_raw) ||
-            (liveParty.role === 'DISTRIBUTOR' &&
-              o.created_by_user_id === liveParty.linkedUserId &&
-              (o.channel === 'DISTRIBUTOR' || o.order_source_role === 'DISTRIBUTOR'))
+            (matchesParty(o.retailer_id, o.retailer_name_raw) ||
+              (liveParty.role === 'DISTRIBUTOR' &&
+                o.created_by_user_id === liveParty.linkedUserId &&
+                (o.channel === 'DISTRIBUTOR' || o.order_source_role === 'DISTRIBUTOR'))) &&
+            matchesOrderDispatchFilters(o)
         );
         const matchedNonCancelledOrders = matchedAllOrders.filter((o) => o.status !== 'CANCELLED');
         const matchedCancelledOrders = matchedAllOrders.filter((o) => o.status === 'CANCELLED');
         const matchedPayments = payments.filter(
-          (p) => p.status === 'VERIFIED' && matchesParty(p.retailer_id, p.retailer_name)
+          (p) =>
+            p.status === 'VERIFIED' &&
+            matchesParty(p.retailer_id, p.retailer_name) &&
+            isWithinLedgerDates(p.payment_date)
         );
         const matchedLedgerEntries = (partyLedger || [])
-          .filter((le) => matchesParty(le.party_id, le.party_name))
+          .filter((le) => matchesParty(le.party_id, le.party_name) && isWithinLedgerDates(le.created_at))
           .slice(0, 25);
 
         return (
@@ -1654,18 +1707,77 @@ export const CreditManagement: React.FC = () => {
                 </div>
               )}
 
-              {/* Orders, Invoices & Payments Timeline */}
+              {/* Orders, Invoices & Payments Timeline with Date & Dispatch Filters */}
               <div className="space-y-2">
-                <span className="font-bold text-white text-xs block">
-                  All Orders (Active Reservations &amp; Cancelled Reversals), Invoices &amp; Verified Payments
-                </span>
-                <div className="border border-slate-800 rounded-xl overflow-hidden text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-bold text-white text-xs block">
+                    All Orders (Active Reservations &amp; Cancelled Reversals), Invoices &amp; Verified Payments
+                  </span>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                    <div className="flex items-center gap-1">
+                      <Calendar size={12} className="text-indigo-400" />
+                      <span className="text-slate-400">From:</span>
+                      <input
+                        type="date"
+                        value={ledgerDateFrom}
+                        onChange={(e) => setLedgerDateFrom(e.target.value)}
+                        className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-mono"
+                      />
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <span className="text-slate-400">To:</span>
+                      <input
+                        type="date"
+                        value={ledgerDateTo}
+                        onChange={(e) => setLedgerDateTo(e.target.value)}
+                        className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-mono"
+                      />
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <span className="text-slate-400">Dispatch Batch:</span>
+                      <input
+                        type="date"
+                        value={ledgerDispatchDateFilter}
+                        onChange={(e) => setLedgerDispatchDateFilter(e.target.value)}
+                        className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-mono"
+                      />
+                    </div>
+                    <select
+                      value={ledgerDispatchStatusFilter}
+                      onChange={(e) => setLedgerDispatchStatusFilter(e.target.value as any)}
+                      className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white"
+                    >
+                      <option value="ALL">All Dispatch Statuses</option>
+                      <option value="PENDING_CONFIRMATION">Pre-Confirmation</option>
+                      <option value="QUEUED_FOR_DISPATCH">Queued for Dispatch</option>
+                      <option value="DISPATCHED">Dispatched / Delivered</option>
+                      <option value="INVOICED">Invoiced</option>
+                      <option value="CANCELLED">Cancelled</option>
+                    </select>
+                    {(ledgerDateFrom || ledgerDateTo || ledgerDispatchDateFilter || ledgerDispatchStatusFilter !== 'ALL') && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLedgerDateFrom('');
+                          setLedgerDateTo('');
+                          setLedgerDispatchDateFilter('');
+                          setLedgerDispatchStatusFilter('ALL');
+                        }}
+                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold"
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="border border-slate-800 rounded-xl overflow-x-auto text-xs">
                   <table className="w-full text-left">
                     <thead>
                       <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 uppercase text-[10px] font-semibold">
                         <th className="py-2.5 px-3">Date</th>
                         <th className="py-2.5 px-3">Type</th>
                         <th className="py-2.5 px-3">Doc / Reference #</th>
+                        <th className="py-2.5 px-3">Dispatch Batch / Date</th>
                         <th className="py-2.5 px-3 text-right">Debit (Liability +)</th>
                         <th className="py-2.5 px-3 text-right">Credit (Cleared -)</th>
                         <th className="py-2.5 px-3 text-center">Status / Action</th>
@@ -1676,8 +1788,8 @@ export const CreditManagement: React.FC = () => {
                         matchedInvoices.length === 0 &&
                         matchedPayments.length === 0 && (
                           <tr>
-                            <td colSpan={6} className="py-6 text-center text-slate-500 font-sans">
-                              No orders, invoices, or payment entries recorded yet for {liveParty.name}.
+                            <td colSpan={7} className="py-6 text-center text-slate-500 font-sans">
+                              No orders, invoices, or payment entries match the selected filters for {liveParty.name}.
                             </td>
                           </tr>
                         )}
@@ -1685,11 +1797,25 @@ export const CreditManagement: React.FC = () => {
                       {/* Active Non-Cancelled Orders (reserves credit immediately from PENDING_VERIFICATION onward) */}
                       {matchedNonCancelledOrders.map((ord, idx) => (
                         <tr key={`${ord.id || ord.order_number}_${idx}`} className="hover:bg-slate-800/30">
-                          <td className="py-2 px-3 text-slate-400">{ord.order_date}</td>
+                          <td className="py-2 px-3 text-slate-400">{getISTDateString(ord.order_date)}</td>
                           <td className="py-2 px-3 font-sans text-amber-300 font-semibold">
                             ORDER ({ord.status})
                           </td>
                           <td className="py-2 px-3 font-bold text-white">{ord.order_number}</td>
+                          <td className="py-2 px-3 text-slate-300">
+                            {['CONFIRMED', 'PUNCHED_TO_PRINCIPAL', 'APPROVED', 'DISPATCHED', 'INVOICED', 'DELIVERED'].includes(ord.status) ? (
+                              <div>
+                                <span className="text-cyan-300 font-semibold">{getOrderEffectiveDispatchDate(ord)}</span>
+                                {ord.dispatched_at && (
+                                  <div className="text-[9px] text-emerald-400">
+                                    Dispatched: {getISTDateString(ord.dispatched_at)}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-slate-500 font-sans text-[10px]">Awaiting Confirmation</span>
+                            )}
+                          </td>
                           <td className="py-2 px-3 text-right text-rose-400 font-bold">
                             ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                           </td>
@@ -1705,9 +1831,10 @@ export const CreditManagement: React.FC = () => {
                       {/* Cancelled Orders (Released Credit) */}
                       {matchedCancelledOrders.map((ord, idx) => (
                         <tr key={`cancel_${ord.id || ord.order_number}_${idx}`} className="hover:bg-slate-800/30 opacity-65">
-                          <td className="py-2 px-3 text-slate-500">{ord.order_date}</td>
+                          <td className="py-2 px-3 text-slate-500">{getISTDateString(ord.order_date)}</td>
                           <td className="py-2 px-3 font-sans text-slate-400">ORDER CANCELLED</td>
                           <td className="py-2 px-3 line-through text-slate-400">{ord.order_number}</td>
+                          <td className="py-2 px-3 text-slate-500">—</td>
                           <td className="py-2 px-3 text-right text-slate-500 line-through">
                             ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
                           </td>
@@ -1735,6 +1862,7 @@ export const CreditManagement: React.FC = () => {
                               )}
                             </td>
                             <td className="py-2 px-3 font-bold text-white">{inv.invoice_number}</td>
+                            <td className="py-2 px-3 text-slate-500">—</td>
                             <td className="py-2 px-3 text-right text-slate-300">
                               {alreadyHasOrder ? (
                                 <span className="text-[10px] text-slate-500 font-sans">Included via Order</span>
@@ -1774,6 +1902,7 @@ export const CreditManagement: React.FC = () => {
                           <td className="py-2 px-3 text-slate-400">{pay.payment_date}</td>
                           <td className="py-2 px-3 font-sans text-emerald-300">PAYMENT ({pay.payment_mode})</td>
                           <td className="py-2 px-3 font-bold text-emerald-300">{pay.payment_number}</td>
+                          <td className="py-2 px-3 text-slate-500">—</td>
                           <td className="py-2 px-3 text-right text-slate-500">-</td>
                           <td className="py-2 px-3 text-right text-emerald-400 font-bold">-₹{pay.amount.toLocaleString('en-IN')}</td>
                           <td className="py-2 px-3 text-center">

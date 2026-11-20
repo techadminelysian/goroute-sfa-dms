@@ -1,4 +1,6 @@
-import { Order, OrderLine, SKU, StockLedgerEntry } from '../types';
+import { Company, Order, OrderLine, SKU, StockLedgerEntry } from '../types';
+import { computeNextDayDispatchAssignment } from './dispatchBatching';
+import { resolveOrderPrimaryDispatchPointId, UNMAPPED_DISPATCH_POINT_ID } from './dispatchRouting';
 
 export interface DepotSkuStockInfo {
   skuId: string;
@@ -127,7 +129,8 @@ export function evaluateOrdersAgainstDepotStock(
   companyId: string,
   stockLedger: StockLedgerEntry[],
   allOrders: Order[],
-  skus: SKU[]
+  skus: SKU[],
+  companies: Company[] = []
 ): Record<string, OrderDepotEvaluation> {
   const results: Record<string, OrderDepotEvaluation> = {};
 
@@ -147,7 +150,14 @@ export function evaluateOrdersAgainstDepotStock(
   };
 
   for (const ord of targetOrders) {
-    const dpId = ord.dispatch_point_id || 'dp_sahibabad';
+    const resolvedFromCompany =
+      companies.length > 0
+        ? resolveOrderPrimaryDispatchPointId(ord, companies, skus)
+        : UNMAPPED_DISPATCH_POINT_ID;
+    const dpId =
+      resolvedFromCompany !== UNMAPPED_DISPATCH_POINT_ID
+        ? resolvedFromCompany
+        : (ord.dispatch_point_id || UNMAPPED_DISPATCH_POINT_ID);
     const rem = getRemainingForDepot(dpId);
     const allLines = ord.lines || [];
 
@@ -282,6 +292,7 @@ export function buildSplitOrdersForDepotAndPO(
   shortageOrder: Order;
 } {
   const now = new Date().toISOString();
+  const dispatchAssignment = computeNextDayDispatchAssignment(now);
   const baseSplitSeq = (order.split_sequence || 0) + 1;
   const stkOrderId = `ord_stk_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const stkOrderNumber = order.order_number.endsWith('-STK')
@@ -330,6 +341,9 @@ export function buildSplitOrdersForDepotAndPO(
     fulfillment_source: 'DEPOT_STOCK',
     parent_order_id: order.id,
     split_sequence: baseSplitSeq,
+    confirmed_at: dispatchAssignment.confirmed_at,
+    dispatch_date: dispatchAssignment.dispatch_date,
+    dispatch_batch_id: dispatchAssignment.dispatch_batch_id,
     lines: confirmedFin.lines,
     total_amount: confirmedFin.totalAmount,
     original_total_amount: confirmedFin.totalAmount,

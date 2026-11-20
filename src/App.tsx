@@ -105,7 +105,7 @@ export default function App() {
   const moduleRoleRules: Record<string, string[]> = {
     home: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER', 'ACCOUNTANT'],
     orders: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER'],
-    inventory: ['ADMIN', 'SUB_ADMIN'],
+    inventory: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ORDER_PUNCHER'],
     billing: ['ADMIN', 'SUB_ADMIN', 'BILLING', 'ACCOUNTANT'],
     credit: ['ADMIN', 'SUB_ADMIN', 'ACCOUNTANT'],
     claims: ['ADMIN', 'SUB_ADMIN'],

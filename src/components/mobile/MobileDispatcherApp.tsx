@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../../data/store';
 import {
   StockLedgerEntry,
@@ -13,6 +13,12 @@ import {
   serializeDispatchMatrixToCsv,
   resolveDispatchPointSupervisor
 } from '../../utils/dispatchRouting';
+import {
+  getTodayISTDateString,
+  getTomorrowISTDateString,
+  partitionDispatchOrdersForDate,
+  getOrderEffectiveDispatchDate
+} from '../../utils/dispatchBatching';
 import {
   Warehouse,
   Truck,
@@ -49,7 +55,9 @@ import {
   Edit3,
   Languages,
   Download,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Calendar,
+  ArrowRight
 } from 'lucide-react';
 
 export interface DemandSKUItem {
@@ -77,28 +85,49 @@ export interface DemandGroup {
 export const MobileDispatcherApp: React.FC = () => {
   const {
     activeTenant,
+    currentUser,
     dispatchPoints,
     companies,
     skus,
     stockLedger,
     orders,
+    purchaseOrders = [],
     retailers,
     users,
     addStockLedgerEntry,
     updateStockLedgerAck,
     updateOrderStatus,
+    inwardPOStock,
+    markOrdersDelivered,
+    carryForwardOrdersToDispatchDate,
+    finalizeDispatchBatch,
     language,
     setLanguage
   } = useAppStore();
 
-  // Selected Warehouse / Depot ID (Defaults to first DP e.g. Central Depot)
-  const [selectedDpId, setSelectedDpId] = useState<string>(dispatchPoints[0]?.id || 'dp_central');
+  // Selected Warehouse / Depot ID (Defaults strictly to first configured Firestore DP)
+  const [selectedDpId, setSelectedDpId] = useState<string>(dispatchPoints[0]?.id || '');
+
+  useEffect(() => {
+    if (dispatchPoints.length > 0 && !dispatchPoints.some((dp) => dp.id === selectedDpId)) {
+      setSelectedDpId(dispatchPoints[0].id);
+    }
+  }, [dispatchPoints, selectedDpId]);
 
   // Active Main Navigation Tab:
   // 'CONSOLIDATED_DEMAND' | 'INWARD_DOCK' | 'INSTITUTIONAL_ORDERS' | 'PENDING_PROOFS' | 'WAREHOUSE_STOCK'
   const [activeTab, setActiveTab] = useState<
     'CONSOLIDATED_DEMAND' | 'INWARD_DOCK' | 'INSTITUTIONAL_ORDERS' | 'PENDING_PROOFS' | 'WAREHOUSE_STOCK'
   >('CONSOLIDATED_DEMAND');
+
+  // Daily Fresh Dispatch Batch Date Filter (Defaults strictly to Tomorrow IST)
+  const todayIST = getTodayISTDateString();
+  const tomorrowIST = getTomorrowISTDateString();
+  const [selectedDispatchDate, setSelectedDispatchDate] = useState<string>(tomorrowIST);
+  const [showPriorBacklog, setShowPriorBacklog] = useState<boolean>(false);
+  const [dispatchActionNotice, setDispatchActionNotice] = useState<string | null>(null);
+  const [confirmMobileFinalize, setConfirmMobileFinalize] = useState<boolean>(false);
+  const [poInwardNotice, setPoInwardNotice] = useState<string | null>(null);
 
   // Filter for Consolidated Demand Recipient Category
   // 'ALL' | 'COMMISSION_AGENT' | 'SUB_DISTRIBUTOR' | 'DELIVERY_EXECUTIVE'
@@ -160,14 +189,14 @@ export const MobileDispatcherApp: React.FC = () => {
   );
 
   // Orders assigned to this depot (strictly scoped via Principal Company -> Dispatch Point mapping)
-  const pendingOrdersForDepot = orders.filter(
-    (o) =>
-      doesOrderBelongToDispatchPoint(o, selectedDpId, companies, skus) &&
-      (o.status === 'CONFIRMED' ||
-        o.status === 'PUNCHED_TO_PRINCIPAL' ||
-        o.status === 'APPROVED' ||
-        (o.status === 'INVOICED' && isOrderAwaitingPhysicalDispatch(o, stockLedger)))
+  // Partitioned strictly by selectedDispatchDate (Tomorrow IST by default) so prior un-dispatched backlog stays isolated.
+  const dpScopedOrders = orders.filter((o) =>
+    doesOrderBelongToDispatchPoint(o, selectedDpId, companies, skus, dispatchPoints)
   );
+  const {
+    freshBatchOrders: pendingOrdersForDepot,
+    priorBacklogOrders: priorBacklogForDepot,
+  } = partitionDispatchOrdersForDate(dpScopedOrders, selectedDispatchDate);
 
   // Separate Institutional Direct Orders vs General Beat Orders
   const institutionalOrders = pendingOrdersForDepot.filter(
@@ -283,9 +312,8 @@ export const MobileDispatcherApp: React.FC = () => {
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    const today = new Date().toISOString().split('T')[0];
     const safeCode = (matrix.dispatchPointCode || selectedDpId).replace(/[^A-Za-z0-9_-]/g, '_');
-    const filename = `Dispatch_Matrix_${safeCode}_${today}.csv`;
+    const filename = `Dispatch_Matrix_${safeCode}_${selectedDispatchDate}.csv`;
     link.setAttribute('href', url);
     link.setAttribute('download', filename);
     document.body.appendChild(link);
@@ -293,6 +321,40 @@ export const MobileDispatcherApp: React.FC = () => {
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
     setMatrixExportNotice(`Exported ${filename} (${matrix.rows.length} SKUs × ${matrix.parties.length} Parties)`);
+  };
+
+  const handleFinalizeMobileBatch = () => {
+    const ids = pendingOrdersForDepot.map((o) => o.id);
+    if (ids.length === 0) {
+      setDispatchActionNotice(`No pending orders in batch ${selectedDispatchDate} to finalize.`);
+      setConfirmMobileFinalize(false);
+      return;
+    }
+    const res = finalizeDispatchBatch(
+      ids,
+      resolveDispatchPointSupervisor(currentDepot, users).supervisorName || 'Depot Dispatcher'
+    );
+    setConfirmMobileFinalize(false);
+    setDispatchActionNotice(res.message);
+  };
+
+  const handleCarryForwardDepotBacklog = (orderIds: string[]) => {
+    if (orderIds.length === 0) return;
+    const res = carryForwardOrdersToDispatchDate(
+      orderIds,
+      tomorrowIST,
+      resolveDispatchPointSupervisor(currentDepot, users).supervisorName || 'Depot Dispatcher'
+    );
+    setDispatchActionNotice(res.message);
+  };
+
+  const handleClearDepotBacklog = (orderIds: string[]) => {
+    if (orderIds.length === 0) return;
+    const res = finalizeDispatchBatch(
+      orderIds,
+      resolveDispatchPointSupervisor(currentDepot, users).supervisorName || 'Depot Dispatcher'
+    );
+    setDispatchActionNotice(res.message);
   };
 
   const allDemandGroups = Object.values(demandGroupMap);
@@ -378,15 +440,16 @@ export const MobileDispatcherApp: React.FC = () => {
       addStockLedgerEntry(newEntry);
     });
 
-    // Update status of all linked orders in this group to DISPATCHED
+    // Update status of all linked orders in this group to DISPATCHED (stockLedger already adjusted above)
     adjustingGroup.orders.forEach((ord) => {
-      updateOrderStatus(ord.id, 'DISPATCHED');
+      updateOrderStatus(ord.id, 'DISPATCHED', {
+        skipAutoStockDeduction: true,
+        preserveInvoicedStatus: true,
+      });
     });
 
-    alert(
-      `Outward Stock Gate Pass ${outpassNo} Issued for ${adjustingGroup.recipientName}!\n\n` +
-        `Warehouse stock debited. Gate Pass generated for vehicle ${allocationVehicleNo}.\n` +
-        `Proof of handover queued for signature / photo verification.`
+    setDispatchActionNotice(
+      `Outward Stock Gate Pass ${outpassNo} issued for ${adjustingGroup.recipientName} (Vehicle ${allocationVehicleNo}). Handover proof queued.`
     );
 
     setAdjustingGroup(null);
@@ -395,23 +458,6 @@ export const MobileDispatcherApp: React.FC = () => {
 
   // Direct Institutional Order Dispatch Handler
   const handleDispatchInstitutionalOrder = (order: Order) => {
-    let hasStockIssue = false;
-    (order.lines || []).forEach((line) => {
-      const available = stockBalanceMap[line.sku_id] || 0;
-      if (line.quantity > available) {
-        hasStockIssue = true;
-      }
-    });
-
-    if (
-      hasStockIssue &&
-      !confirm(
-        `Warning: Stock for Institutional Order ${order.order_number} exceeds available warehouse balance. Proceed with partial dispatch?`
-      )
-    ) {
-      return;
-    }
-
     const outpassNo = `OUTPASS-INST-${Math.floor(1000 + Math.random() * 9000)}`;
 
     (order.lines || [])
@@ -446,8 +492,11 @@ export const MobileDispatcherApp: React.FC = () => {
       addStockLedgerEntry(newEntry);
     });
 
-    updateOrderStatus(order.id, 'DISPATCHED');
-    alert(`Direct Institutional Order #${order.order_number} Dispatched!\nGate Pass ${outpassNo} issued.`);
+    updateOrderStatus(order.id, 'DISPATCHED', {
+      skipAutoStockDeduction: true,
+      preserveInvoicedStatus: true,
+    });
+    setDispatchActionNotice(`Direct Institutional Order #${order.order_number} dispatched (${outpassNo}).`);
     setActiveTab('PENDING_PROOFS');
   };
 
@@ -661,31 +710,101 @@ export const MobileDispatcherApp: React.FC = () => {
         <div className="space-y-3 text-xs">
           {/* Header Banner & Recipient Category Filters */}
           <div className="p-3 bg-slate-900 border border-slate-800 rounded-2xl space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <span className="font-bold text-white flex items-center gap-1.5 text-xs text-amber-300">
-                <Sun size={15} className="text-amber-400" /> Billing Exec Verified Demand Sheet
+                <Sun size={15} className="text-amber-400" /> Fresh Dispatch Sheet ({selectedDispatchDate})
               </span>
-              <button
-                type="button"
-                onClick={handleExportDepotMatrixCsv}
-                className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center gap-1"
-                title="Export SKU-vs-Party Dispatch Sheet Matrix CSV for this depot"
-              >
-                <FileSpreadsheet size={11} /> Export SKU-vs-Party CSV
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleExportDepotMatrixCsv}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center gap-1"
+                  title="Export SKU-vs-Party Dispatch Sheet Matrix CSV for this depot"
+                >
+                  <FileSpreadsheet size={11} /> Matrix CSV
+                </button>
+                <button
+                  type="button"
+                  disabled={pendingOrdersForDepot.length === 0}
+                  onClick={() => setConfirmMobileFinalize(true)}
+                  className="px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white font-bold text-[10px] flex items-center gap-1"
+                >
+                  <CheckCircle2 size={11} /> Finalize ({pendingOrdersForDepot.length})
+                </button>
+              </div>
             </div>
 
-            {matrixExportNotice && (
-              <div className="px-2.5 py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-[10px] text-emerald-200 flex items-center justify-between">
-                <span>{matrixExportNotice}</span>
-                <button type="button" onClick={() => setMatrixExportNotice(null)} className="text-emerald-400 hover:text-white">
+            {/* Dispatch Batch Date Selector */}
+            <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-[10px]">
+              <button
+                type="button"
+                onClick={() => setSelectedDispatchDate(tomorrowIST)}
+                className={`flex-1 py-1 px-2 rounded-lg font-bold flex items-center justify-center gap-1 ${
+                  selectedDispatchDate === tomorrowIST ? 'bg-emerald-600 text-white' : 'text-slate-400'
+                }`}
+              >
+                <Calendar size={10} /> Tomorrow ({tomorrowIST.slice(5)})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedDispatchDate(todayIST)}
+                className={`flex-1 py-1 px-2 rounded-lg font-bold ${
+                  selectedDispatchDate === todayIST ? 'bg-blue-600 text-white' : 'text-slate-400'
+                }`}
+              >
+                Today ({todayIST.slice(5)})
+              </button>
+              <input
+                type="date"
+                value={selectedDispatchDate}
+                onChange={(e) => e.target.value && setSelectedDispatchDate(e.target.value)}
+                className="bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-0.5 text-[10px] text-white font-mono"
+                aria-label="Mobile depot dispatch date"
+              />
+            </div>
+
+            {confirmMobileFinalize && (
+              <div className="p-2.5 rounded-xl bg-amber-950/60 border border-amber-500/40 text-[10px] text-amber-100 space-y-2">
+                <div>
+                  Mark all <strong>{pendingOrdersForDepot.length}</strong> fresh order(s) for <strong>{selectedDispatchDate}</strong> as Dispatched and close this batch?
+                </div>
+                <div className="flex items-center gap-2 justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmMobileFinalize(false)}
+                    className="px-2.5 py-1 rounded-lg bg-slate-800 text-slate-200 font-semibold"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleFinalizeMobileBatch}
+                    className="px-2.5 py-1 rounded-lg bg-amber-600 text-white font-bold"
+                  >
+                    Confirm Dispatched
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {(matrixExportNotice || dispatchActionNotice) && (
+              <div className="px-2.5 py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-[10px] text-emerald-200 flex items-center justify-between gap-2">
+                <span>{dispatchActionNotice || matrixExportNotice}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMatrixExportNotice(null);
+                    setDispatchActionNotice(null);
+                  }}
+                  className="text-emerald-400 hover:text-white"
+                >
                   <X size={11} />
                 </button>
               </div>
             )}
 
             <p className="text-[10px] text-slate-400 leading-tight">
-              Synced automatically for confirmed orders at {currentDepot?.name || selectedDpId} ({allDemandGroups.length} allocation queues).
+              Batch {selectedDispatchDate} for {currentDepot?.name || selectedDpId}: {allDemandGroups.length} fresh allocation queue(s). ({priorBacklogForDepot.length} prior backlog isolated)
             </p>
 
             {/* Recipient Category Filter Buttons */}
@@ -866,32 +985,190 @@ export const MobileDispatcherApp: React.FC = () => {
                       )}
                     </div>
 
-                    {/* Outward Stock Allocation & Shortage/Excess Adjustment Button */}
-                    <button
-                      onClick={() => handleOpenAllocationModal(group)}
-                      className="w-full py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-amber-900/30"
-                    >
-                      <SlidersHorizontal size={15} /> Review Demand & Adjust Shortage/Excess
-                    </button>
+                    {/* Outward Stock Allocation & Online Delivery Confirmation Buttons */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => handleOpenAllocationModal(group)}
+                        className="py-2.5 px-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-extrabold text-[11px] flex items-center justify-center gap-1 shadow-md shadow-amber-900/30"
+                      >
+                        <SlidersHorizontal size={14} /> Dispatch / Adjust
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const res = markOrdersDelivered({
+                            orderIds: group.orders.map((o) => o.id),
+                            deliveredByName: currentUser?.name || 'Depot Dispatcher',
+                            proofRef: `MOB-DEL-${selectedDispatchDate.slice(5)}`,
+                            notes: `Delivered online to ${group.recipientName}`,
+                          });
+                          setDispatchActionNotice(res.message);
+                        }}
+                        className="py-2.5 px-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-[11px] flex items-center justify-center gap-1 shadow-md shadow-emerald-900/30"
+                      >
+                        <CheckCircle2 size={14} /> Mark Delivered
+                      </button>
+                    </div>
                   </div>
                 );
               })
             )}
           </div>
+
+          {/* Collapsible Prior Un-dispatched Backlog (Isolated from Fresh Matrix & Demand) */}
+          {priorBacklogForDepot.length > 0 && (
+            <div className="bg-slate-900 border border-amber-500/35 rounded-2xl overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setShowPriorBacklog((prev) => !prev)}
+                className="w-full p-3 bg-amber-950/25 flex items-center justify-between text-left"
+              >
+                <div>
+                  <div className="text-[11px] font-bold text-amber-200 flex items-center gap-1.5">
+                    <Clock size={13} className="text-amber-400" />
+                    Prior Un-dispatched Backlog ({priorBacklogForDepot.length})
+                  </div>
+                  <div className="text-[9px] text-slate-400">
+                    Isolated from {selectedDispatchDate} fresh sheet. Carry forward or clear.
+                  </div>
+                </div>
+                {showPriorBacklog ? (
+                  <ChevronDown size={15} className="text-amber-300" />
+                ) : (
+                  <ChevronRight size={15} className="text-amber-300" />
+                )}
+              </button>
+
+              {showPriorBacklog && (
+                <div className="p-3 space-y-2 border-t border-slate-800">
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => handleCarryForwardDepotBacklog(priorBacklogForDepot.map((o) => o.id))}
+                      className="flex-1 py-1.5 px-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] flex items-center justify-center gap-1"
+                    >
+                      <ArrowRight size={11} /> Carry All to Tomorrow
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleClearDepotBacklog(priorBacklogForDepot.map((o) => o.id))}
+                      className="flex-1 py-1.5 px-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center justify-center gap-1"
+                    >
+                      <CheckCircle2 size={11} /> Mark All Clear
+                    </button>
+                  </div>
+
+                  {priorBacklogForDepot.map((ord) => (
+                    <div
+                      key={ord.id}
+                      className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl space-y-1.5 text-[10px]"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="font-bold text-white">{ord.retailer_name_raw}</div>
+                          <div className="font-mono text-[9px] text-amber-300">
+                            {ord.order_number} • Sched: {getOrderEffectiveDispatchDate(ord)}
+                          </div>
+                        </div>
+                        <span className="font-mono font-bold text-emerald-400">
+                          ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                        </span>
+                      </div>
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleCarryForwardDepotBacklog([ord.id])}
+                          className="flex-1 py-1 rounded-lg bg-indigo-600/80 text-white font-bold text-[9px]"
+                        >
+                          Carry Forward
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleClearDepotBacklog([ord.id])}
+                          className="flex-1 py-1 rounded-lg bg-emerald-600/80 text-white font-bold text-[9px]"
+                        >
+                          Mark Dispatched
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
       {/* ------------------------------------------------------------- */}
-      {/* TAB 2: INWARD FACTORY DOCK LOGGING (SPOT GRN) */}
+      {/* TAB 2: INWARD FACTORY DOCK LOGGING (PO DOCK + SPOT GRN) */}
       {/* ------------------------------------------------------------- */}
       {activeTab === 'INWARD_DOCK' && (
-        <form onSubmit={handleInwardSubmit} className="space-y-3 text-xs">
+        <div className="space-y-3 text-xs">
+          {/* Incoming Principal POs Queue */}
+          <div className="p-3 bg-slate-900 border border-emerald-500/30 rounded-2xl space-y-2.5">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
+                <Truck size={15} /> Incoming Principal POs ({purchaseOrders.filter((p) => p.status !== 'INWARDED_AT_DEPOT' && p.status !== 'CANCELLED').length})
+              </h3>
+            </div>
+            {poInwardNotice && (
+              <div className="p-2 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 text-[10px] flex items-center justify-between gap-2">
+                <span>{poInwardNotice}</span>
+                <button type="button" onClick={() => setPoInwardNotice(null)} className="text-emerald-300">
+                  <X size={11} />
+                </button>
+              </div>
+            )}
+            {purchaseOrders.filter((p) => p.status !== 'INWARDED_AT_DEPOT' && p.status !== 'CANCELLED').length === 0 ? (
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-[11px] text-slate-400 text-center">
+                No pending Principal POs awaiting physical inward docking.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {purchaseOrders
+                  .filter((p) => p.status !== 'INWARDED_AT_DEPOT' && p.status !== 'CANCELLED')
+                  .map((po) => (
+                    <div
+                      key={po.id}
+                      className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-mono font-bold text-blue-400 truncate">
+                          {po.po_number} • <span className="text-white font-sans">{po.company_name}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          {po.items.length} SKUs • {po.total_quantity} pcs • ₹{po.total_amount.toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          inwardPOStock(
+                            po.id,
+                            selectedDpId,
+                            `CH-${po.company_code}-${Date.now().toString().slice(-4)}`,
+                            inwardVehicleNo || 'DEPOT-TRUCK',
+                            currentUser?.name || 'Mobile Dispatcher'
+                          );
+                          setPoInwardNotice(`PO #${po.po_number} (${po.total_quantity} pcs) inwarded into ${currentDepot?.name || selectedDpId} stock ledger!`);
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] shrink-0"
+                      >
+                        Receive &amp; Inward
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            )}
+          </div>
+
+          <form onSubmit={handleInwardSubmit} className="space-y-3 text-xs">
           <div className="p-3 bg-slate-900 border border-slate-800 rounded-2xl space-y-1">
             <h3 className="font-bold text-white flex items-center gap-1.5 text-xs text-emerald-400">
-              <ArrowDownRight size={15} /> Factory Inward Consignment Verification
+              <ArrowDownRight size={15} /> Spot Factory Inward Consignment (Manual GRN)
             </h3>
             <p className="text-[10px] text-slate-400">
-              Spot entry for stock arriving from manufacturing plant/C&F at {currentDepot.name} dock.
+              Spot entry for stock arriving from manufacturing plant/C&amp;F at {currentDepot.name} dock.
             </p>
           </div>
 
@@ -1033,7 +1310,8 @@ export const MobileDispatcherApp: React.FC = () => {
               <CheckCircle2 size={15} /> Confirm GRN & Credit Warehouse Inventory
             </button>
           </div>
-        </form>
+          </form>
+        </div>
       )}
 
       {/* ------------------------------------------------------------- */}
@@ -1134,10 +1412,75 @@ export const MobileDispatcherApp: React.FC = () => {
       )}
 
       {/* ------------------------------------------------------------- */}
-      {/* TAB 4: RECEIVER PROOFS & GATE PASS CONFIRMATION */}
+      {/* TAB 4: RECEIVER PROOFS & ONLINE DELIVERY COMPLETION */}
       {/* ------------------------------------------------------------- */}
       {activeTab === 'PENDING_PROOFS' && (
         <div className="space-y-3 text-xs">
+          {/* Section A: Dispatched Orders Awaiting Final Delivery Status */}
+          {(() => {
+            const awaitingDeliveryOrders = orders.filter(
+              (o) =>
+                (o.status === 'CONFIRMED' || o.status === 'DISPATCHED') &&
+                doesOrderBelongToDispatchPoint(o, selectedDpId, companies, skus, dispatchPoints)
+            );
+            return (
+              <div className="p-3 bg-slate-900 border border-emerald-500/30 rounded-2xl space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
+                    <CheckCircle2 size={15} /> Confirm Online Order Delivery ({awaitingDeliveryOrders.length})
+                  </span>
+                  <span className="text-[10px] text-slate-400">Unlocks Invoicing</span>
+                </div>
+                {dispatchActionNotice && (
+                  <div className="p-2 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 text-[10px] flex items-center justify-between">
+                    <span>{dispatchActionNotice}</span>
+                    <button type="button" onClick={() => setDispatchActionNotice(null)}>
+                      <X size={11} />
+                    </button>
+                  </div>
+                )}
+                {awaitingDeliveryOrders.length === 0 ? (
+                  <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-[11px] text-slate-400 text-center">
+                    No confirmed/dispatched orders pending final delivery confirmation for {currentDepot?.name}.
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {awaitingDeliveryOrders.slice(0, 12).map((ord) => (
+                      <div
+                        key={ord.id}
+                        className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-mono font-bold text-blue-400 truncate">
+                            {ord.order_number} • <span className="text-white font-sans">{ord.retailer_name_raw}</span>
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            ₹{(ord.total_amount || 0).toLocaleString('en-IN')} • {ord.status} • Batch {getOrderEffectiveDispatchDate(ord)}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const res = markOrdersDelivered({
+                              orderIds: [ord.id],
+                              deliveredByName: currentUser?.name || 'Mobile Dispatcher',
+                              proofRef: `MOB-${ord.order_number.replace('#', '')}`,
+                              notes: 'Confirmed delivered online via Dispatcher Mobile App',
+                            });
+                            setDispatchActionNotice(res.message);
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] shrink-0"
+                        >
+                          Mark Delivered
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           <div className="p-3 bg-slate-900 border border-slate-800 rounded-2xl flex items-center justify-between">
             <span className="font-bold text-white flex items-center gap-1.5 text-xs text-amber-400">
               <Clock size={15} /> Pending Receiver Handover Proofs

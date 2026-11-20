@@ -3,7 +3,7 @@ import { useAppStore } from '../../data/store';
 import { Company, DispatchPoint, User, UserRole } from '../../types';
 import { validateStoreName, validateGSTIN } from '../../utils/validators';
 import { generateSecurePassword, isValidMobileNumber, sanitizeMobileNumber, getPlatformForRole } from '../../utils/authClient';
-import { resolveDispatchPointSupervisor } from '../../utils/dispatchRouting';
+import { resolveDispatchPointSupervisor, UNMAPPED_DISPATCH_POINT_LABEL } from '../../utils/dispatchRouting';
 import { CAMappingMatrix } from './CAMappingMatrix';
 import { BEAbsenceRemappingTool } from './BEAbsenceRemappingTool';
 import { CompanySKUAccessMatrix } from './CompanySKUAccessMatrix';
@@ -609,7 +609,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
         contact_person: r.contact_person || 'Manager',
         email: r.email || 'sales@company.com',
         phone: r.phone || '+91 98000 00000',
-        dispatch_point_id: existing?.dispatch_point_id || (dispatchPoints.length > 0 ? dispatchPoints[0].id : 'dp_central'),
+        dispatch_point_id: existing?.dispatch_point_id || '',
       };
     });
 
@@ -719,7 +719,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
         return;
       }
       selectedDpId = effectiveUsrDispatchPointId;
-      selectedDpName = dispatchPoints.find((dp) => dp.id === selectedDpId)?.name || 'Central Depot';
+      selectedDpName = dispatchPoints.find((dp) => dp.id === selectedDpId)?.name || UNMAPPED_DISPATCH_POINT_LABEL;
     }
 
     // 4b. Billing Executive Assignment (For CFS, Sales Executives, and Distributors)
@@ -1084,7 +1084,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                             </div>
                           ) : (
                             <span className="px-2 py-0.5 rounded bg-amber-950/60 border border-amber-500/40 text-amber-300 text-[10px] font-mono">
-                              Unassigned
+                              {UNMAPPED_DISPATCH_POINT_LABEL}
                             </span>
                           );
                         })()}
@@ -1319,7 +1319,7 @@ export const MasterConfigViews: React.FC<{ type: 'COMPANIES' | 'DISPATCH' | 'USE
                 <span className="text-slate-400">Assigned Dispatch Point:</span>
                 <span className="font-semibold text-white flex items-center gap-1 text-[11px]">
                   <Warehouse size={12} className="text-blue-400" />
-                  {dispatchPoints.find((dp) => dp.id === deletingCompany.dispatch_point_id)?.name || 'Unassigned'}
+                  {dispatchPoints.find((dp) => dp.id === deletingCompany.dispatch_point_id)?.name || UNMAPPED_DISPATCH_POINT_LABEL}
                 </span>
               </div>
               <div className="flex items-center justify-between">

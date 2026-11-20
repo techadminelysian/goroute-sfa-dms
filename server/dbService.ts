@@ -23,7 +23,7 @@ import {
 } from '../src/types';
 import { hashPassword } from './authService';
 import { getPlatformForRole } from '../src/utils/authClient';
-import { syncDispatchPointsForUsers } from '../src/utils/dispatchRouting';
+import { syncDispatchPointsForUsers, resolveOrderPrimaryDispatchPointId, UNMAPPED_DISPATCH_POINT_ID } from '../src/utils/dispatchRouting';
 import { computeUserLiveCreditProfile, PartyCreditProfile } from '../src/utils/creditLedger';
 
 export interface DatabaseSchema {
@@ -196,7 +196,7 @@ function normalizeServerOrder(docId: string, raw: any): Order {
     retailer_id: raw.retailer_id || null,
     beat_id: raw.beat_id || undefined,
     beat_name: raw.beat_name || '',
-    dispatch_point_id: raw.dispatch_point_id || 'dp_sahibabad',
+    dispatch_point_id: raw.dispatch_point_id || '',
     billing_executive_id: raw.billing_executive_id || null,
     created_by_user_id: raw.created_by_user_id || '',
     commission_agent_id: raw.commission_agent_id || null,
@@ -225,6 +225,9 @@ function normalizeServerOrder(docId: string, raw: any): Order {
     split_sequence: raw.split_sequence != null ? Number(raw.split_sequence) : undefined,
     dispatched_at: raw.dispatched_at || null,
     invoiced_at: raw.invoiced_at || null,
+    confirmed_at: raw.confirmed_at || null,
+    dispatch_date: raw.dispatch_date || null,
+    dispatch_batch_id: raw.dispatch_batch_id || null,
     firestore_doc_id: docId,
   });
 }
@@ -319,16 +322,31 @@ export async function initDatabase(): Promise<DatabaseSchema> {
       tenantSettings[d.id] = d.data() as TenantSettings;
     });
 
+    const loadedCompanies = companiesSnap.docs.map((d) => d.data() as Company);
+    const loadedDispatchPoints = dispatchPointsSnap.docs.map((d) => d.data() as DispatchPoint);
+    const loadedSkus = skusSnap.docs.map((d) => d.data() as SKU);
+    const validDpIds = new Set(loadedDispatchPoints.map((d) => d.id));
+    const normalizedOrders = deduplicateOrders(ordersSnap.docs.map((d) => normalizeServerOrder(d.id, d.data()))).map((ord) => {
+      const resolvedDp = resolveOrderPrimaryDispatchPointId(ord, loadedCompanies, loadedSkus, loadedDispatchPoints);
+      if (resolvedDp !== UNMAPPED_DISPATCH_POINT_ID) {
+        return { ...ord, dispatch_point_id: resolvedDp };
+      }
+      if (!ord.dispatch_point_id || !validDpIds.has(ord.dispatch_point_id)) {
+        return { ...ord, dispatch_point_id: UNMAPPED_DISPATCH_POINT_ID };
+      }
+      return ord;
+    });
+
     inMemoryDb = {
       tenants: tenantsSnap.docs.map((d) => d.data() as Tenant),
       tenantSettings,
-      companies: companiesSnap.docs.map((d) => d.data() as Company),
-      dispatchPoints: dispatchPointsSnap.docs.map((d) => d.data() as DispatchPoint),
-      skus: skusSnap.docs.map((d) => d.data() as SKU),
+      companies: loadedCompanies,
+      dispatchPoints: loadedDispatchPoints,
+      skus: loadedSkus,
       beats: beatsSnap.docs.map((d) => d.data() as Beat),
       retailers: retailersSnap.docs.map((d) => d.data() as Retailer),
       distributors: distributorsSnap.docs.map((d) => d.data() as DistributorInstitution),
-      orders: deduplicateOrders(ordersSnap.docs.map((d) => normalizeServerOrder(d.id, d.data()))),
+      orders: normalizedOrders,
       purchaseOrders: [],
       workflowNotifications: [],
       stockLedger: stockLedgerSnap.docs.map((d) => d.data() as StockLedgerEntry),
@@ -418,13 +436,50 @@ export function findDbUserByMobile(mobileNumber: string): User | undefined {
 }
 
 export async function findDbUserByMobileLive(mobileNumber: string): Promise<User | undefined> {
-  const cached = findDbUserByMobile(mobileNumber);
-  if (cached) return cached;
-
   const target = sanitizeMobile(mobileNumber);
   if (!target) return undefined;
 
   const db = getFirestoreDb();
+  const cached = findDbUserByMobile(target);
+  if (cached) {
+    if (db) {
+      const targetDocId = cached.firestore_doc_id || cached.id;
+      if (targetDocId) {
+        try {
+          const freshSnap = await getDoc(doc(db, 'users', targetDocId));
+          if (freshSnap.exists()) {
+            const u = freshSnap.data() as User;
+            const refreshed: User = {
+              ...cached,
+              ...u,
+              id: u.id || freshSnap.id,
+              firestore_doc_id: freshSnap.id,
+              platform: getPlatformForRole(u.role || cached.role),
+              company_scope: Array.isArray(u.company_scope) ? u.company_scope : [],
+              credit_limit: u.credit_limit !== undefined && u.credit_limit !== null ? Number(u.credit_limit) : cached.credit_limit,
+              current_outstanding:
+                u.current_outstanding !== undefined && u.current_outstanding !== null
+                  ? Number(u.current_outstanding)
+                  : cached.current_outstanding,
+              credit_gate_enabled: u.credit_gate_enabled === false ? false : true,
+              distributor_id: u.distributor_id ?? cached.distributor_id ?? null,
+            };
+            const idx = inMemoryDb.users.findIndex(
+              (usr) => usr.id === refreshed.id || usr.firestore_doc_id === freshSnap.id
+            );
+            if (idx >= 0) {
+              inMemoryDb.users[idx] = refreshed;
+            }
+            return refreshed;
+          }
+        } catch (err) {
+          console.warn('[DATABASE] Live user doc refresh warning:', err);
+        }
+      }
+    }
+    return cached;
+  }
+
   if (!db) return undefined;
 
   try {
@@ -608,7 +663,7 @@ export function addDbUser(userData: {
     salt: salt,
     role: userData.role,
     company_scope: Array.isArray(userData.company_scope) ? [...userData.company_scope] : [],
-    dispatch_point_id: userData.dispatch_point_id !== undefined ? userData.dispatch_point_id : (userData.role === 'DISPATCHER' ? 'dp_central' : null),
+    dispatch_point_id: userData.dispatch_point_id !== undefined ? userData.dispatch_point_id : null,
     billing_executive_id: userData.billing_executive_id || null,
     beat_id: userData.beat_id || null,
     platform: getPlatformForRole(userData.role),

@@ -1,6 +1,16 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useAppStore } from '../../data/store';
 import { KPICard } from '../common/KPICard';
+import {
+  buildDispatchBatchHistorySummaries,
+  getOrderEffectiveDispatchDate,
+  isOrderAlreadyDispatched,
+} from '../../utils/dispatchBatching';
+import {
+  doesOrderBelongToDispatchPoint,
+  getEffectiveLineCompanyId,
+  UNMAPPED_DISPATCH_POINT_ID,
+} from '../../utils/dispatchRouting';
 import {
   BarChart3,
   TrendingUp,
@@ -10,7 +20,15 @@ import {
   Building,
   DollarSign,
   AlertTriangle,
-  ArrowUpRight
+  ArrowUpRight,
+  Calendar,
+  Truck,
+  Download,
+  ChevronDown,
+  ChevronUp,
+  Warehouse,
+  CheckCircle2,
+  Clock
 } from 'lucide-react';
 
 export const ReportingLayer: React.FC = () => {
@@ -18,6 +36,7 @@ export const ReportingLayer: React.FC = () => {
     activeTenant,
     activeTenantSettings,
     companies,
+    dispatchPoints = [],
     skus,
     orders,
     invoices,
@@ -27,8 +46,21 @@ export const ReportingLayer: React.FC = () => {
   } = useAppStore();
 
   const [activeReportTab, setActiveReportTab] = useState<
-    'SALES_VS_COLLECTION' | 'INVENTORY_VARIANCE' | 'CLAIMS_AGING' | 'CHANNEL_PERFORMANCE' | 'OUTSTANDING_CREDIT'
+    | 'SALES_VS_COLLECTION'
+    | 'INVENTORY_VARIANCE'
+    | 'CLAIMS_AGING'
+    | 'CHANNEL_PERFORMANCE'
+    | 'OUTSTANDING_CREDIT'
+    | 'DISPATCH_BATCH_HISTORY'
   >('SALES_VS_COLLECTION');
+
+  // Dispatch Batch History Filters
+  const [batchFromDate, setBatchFromDate] = useState<string>('');
+  const [batchToDate, setBatchToDate] = useState<string>('');
+  const [batchDpFilter, setBatchDpFilter] = useState<string>('ALL');
+  const [batchCompanyFilter, setBatchCompanyFilter] = useState<string>('ALL');
+  const [batchStatusFilter, setBatchStatusFilter] = useState<'ALL' | 'QUEUED' | 'PARTIAL' | 'FINALIZED'>('ALL');
+  const [expandedBatchKey, setExpandedBatchKey] = useState<string | null>(null);
 
   // Sales vs Collection Stats
   const totalSalesValue = orders.reduce((sum, o) => sum + o.total_amount, 0);
@@ -106,6 +138,14 @@ export const ReportingLayer: React.FC = () => {
             }`}
           >
             5. Outstanding & Credit
+          </button>
+          <button
+            onClick={() => setActiveReportTab('DISPATCH_BATCH_HISTORY')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
+              activeReportTab === 'DISPATCH_BATCH_HISTORY' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Truck size={12} /> 6. Dispatch Batch History
           </button>
         </div>
       </div>
@@ -375,6 +415,346 @@ export const ReportingLayer: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Report 6: Dispatch Batch History */}
+      {activeReportTab === 'DISPATCH_BATCH_HISTORY' && (() => {
+        const companyScopedOrders = orders.filter((ord) => {
+          if (batchDpFilter !== 'ALL' && !doesOrderBelongToDispatchPoint(ord, batchDpFilter, companies, skus, dispatchPoints)) {
+            return false;
+          }
+          if (batchCompanyFilter !== 'ALL') {
+            const matchesComp =
+              ord.company_id === batchCompanyFilter ||
+              (ord.company_ids || []).includes(batchCompanyFilter) ||
+              (ord.lines || []).some((l) => getEffectiveLineCompanyId(l, ord, skus) === batchCompanyFilter);
+            if (!matchesComp) return false;
+          }
+          return true;
+        });
+
+        const allBatches = buildDispatchBatchHistorySummaries(
+          companyScopedOrders,
+          dispatchPoints,
+          companies,
+          skus
+        );
+
+        const filteredBatches = allBatches.filter((b) => {
+          if (batchFromDate && b.dispatchDate < batchFromDate) return false;
+          if (batchToDate && b.dispatchDate > batchToDate) return false;
+          if (batchStatusFilter !== 'ALL' && b.status !== batchStatusFilter) return false;
+          return true;
+        });
+
+        const totalBatchOrders = filteredBatches.reduce((s, b) => s + b.totalOrders, 0);
+        const totalDispatched = filteredBatches.reduce((s, b) => s + b.dispatchedCount, 0);
+        const totalPending = filteredBatches.reduce((s, b) => s + b.pendingCount, 0);
+        const totalBatchValue = filteredBatches.reduce((s, b) => s + b.totalValue, 0);
+
+        const handleExportBatchHistoryCsv = () => {
+          const headers = [
+            'Dispatch Date',
+            'Batch ID',
+            'Dispatch Point',
+            'Principal Companies',
+            'Parties',
+            'Total Orders',
+            'Dispatched Orders',
+            'Pending Orders',
+            'Invoiced Orders',
+            'Total Units',
+            'Total Value (INR)',
+            'Batch Status',
+          ];
+          const rows = filteredBatches.map((b) =>
+            [
+              `"${b.dispatchDate}"`,
+              `"${b.batchId}"`,
+              `"${b.dispatchPointName} (${b.dispatchPointCode})"`,
+              `"${b.companyNames.join('; ').replace(/"/g, '""')}"`,
+              `"${b.partyNames.join('; ').replace(/"/g, '""')}"`,
+              b.totalOrders,
+              b.dispatchedCount,
+              b.pendingCount,
+              b.invoicedCount,
+              b.totalUnits,
+              b.totalValue,
+              `"${b.status}"`,
+            ].join(',')
+          );
+          const csv = [headers.join(','), ...rows].join('\n');
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.setAttribute('href', url);
+          link.setAttribute('download', `Dispatch_Batch_History_${new Date().toISOString().split('T')[0]}.csv`);
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        };
+
+        return (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Truck size={16} className="text-indigo-400" />
+                  Daily Dispatch Batch History &amp; Fulfillment Audit
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Chronological audit of D+1 daily dispatch batches across Dispatch Points, Principal Companies, and Dispatched vs Queued states.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleExportBatchHistoryCsv}
+                disabled={filteredBatches.length === 0}
+                className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-bold text-xs flex items-center gap-1.5"
+              >
+                <Download size={14} /> Export Batch History CSV
+              </button>
+            </div>
+
+            {/* Filters Bar */}
+            <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex flex-wrap items-center gap-3 text-xs">
+              <div className="flex items-center gap-1.5">
+                <Calendar size={13} className="text-indigo-400" />
+                <span className="text-slate-400">From:</span>
+                <input
+                  type="date"
+                  value={batchFromDate}
+                  onChange={(e) => setBatchFromDate(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white font-mono"
+                />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-slate-400">To:</span>
+                <input
+                  type="date"
+                  value={batchToDate}
+                  onChange={(e) => setBatchToDate(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white font-mono"
+                />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Warehouse size={13} className="text-cyan-400" />
+                <select
+                  value={batchDpFilter}
+                  onChange={(e) => setBatchDpFilter(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-white"
+                >
+                  <option value="ALL">All Dispatch Points</option>
+                  {dispatchPoints.map((dp) => (
+                    <option key={dp.id} value={dp.id}>
+                      {dp.name} ({dp.code})
+                    </option>
+                  ))}
+                  <option value={UNMAPPED_DISPATCH_POINT_ID}>⚠ Unmapped Dispatch Point</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Building size={13} className="text-purple-400" />
+                <select
+                  value={batchCompanyFilter}
+                  onChange={(e) => setBatchCompanyFilter(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-white"
+                >
+                  <option value="ALL">All Principal Companies</option>
+                  {companies.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} ({c.code})
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <select
+                value={batchStatusFilter}
+                onChange={(e) => setBatchStatusFilter(e.target.value as any)}
+                className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-white"
+              >
+                <option value="ALL">All Batch Statuses</option>
+                <option value="QUEUED">Queued (Un-dispatched)</option>
+                <option value="PARTIAL">Partially Dispatched</option>
+                <option value="FINALIZED">Finalized (100% Dispatched)</option>
+              </select>
+              {(batchFromDate || batchToDate || batchDpFilter !== 'ALL' || batchCompanyFilter !== 'ALL' || batchStatusFilter !== 'ALL') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBatchFromDate('');
+                    setBatchToDate('');
+                    setBatchDpFilter('ALL');
+                    setBatchCompanyFilter('ALL');
+                    setBatchStatusFilter('ALL');
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold"
+                >
+                  Reset Filters
+                </button>
+              )}
+            </div>
+
+            {/* Summary Metrics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                <div className="text-[10px] text-slate-400 font-sans">Filtered Batches</div>
+                <div className="text-lg font-bold text-white mt-0.5">{filteredBatches.length}</div>
+              </div>
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                <div className="text-[10px] text-slate-400 font-sans">Dispatched / Total Orders</div>
+                <div className="text-lg font-bold text-emerald-400 mt-0.5">
+                  {totalDispatched} / {totalBatchOrders}
+                </div>
+              </div>
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                <div className="text-[10px] text-slate-400 font-sans">Pending Un-dispatched</div>
+                <div className="text-lg font-bold text-amber-300 mt-0.5">{totalPending}</div>
+              </div>
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                <div className="text-[10px] text-slate-400 font-sans">Total Batch Value</div>
+                <div className="text-lg font-bold text-indigo-300 mt-0.5">
+                  ₹{totalBatchValue.toLocaleString('en-IN')}
+                </div>
+              </div>
+            </div>
+
+            {/* Batch Table */}
+            <div className="overflow-x-auto border border-slate-800 rounded-xl">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase text-[10px] font-semibold">
+                    <th className="py-2.5 px-3">Dispatch Date</th>
+                    <th className="py-2.5 px-3">Dispatch Point</th>
+                    <th className="py-2.5 px-3">Companies</th>
+                    <th className="py-2.5 px-3 text-right">Orders</th>
+                    <th className="py-2.5 px-3 text-right">Dispatched</th>
+                    <th className="py-2.5 px-3 text-right">Units</th>
+                    <th className="py-2.5 px-3 text-right">Value (₹)</th>
+                    <th className="py-2.5 px-3 text-center">Status</th>
+                    <th className="py-2.5 px-3 text-right">Details</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70 text-slate-200">
+                  {filteredBatches.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-8 text-center text-slate-500">
+                        No dispatch batches match the current filters.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredBatches.map((batch) => {
+                      const rowKey = `${batch.dispatchDate}__${batch.dispatchPointId}`;
+                      const isExpanded = expandedBatchKey === rowKey;
+                      return (
+                        <React.Fragment key={rowKey}>
+                          <tr className="hover:bg-slate-800/40">
+                            <td className="py-2.5 px-3 font-mono font-bold text-indigo-300">
+                              {batch.dispatchDate}
+                              <div className="text-[10px] text-slate-500 font-normal">{batch.batchId}</div>
+                            </td>
+                            <td className="py-2.5 px-3 font-semibold text-white">
+                              {batch.dispatchPointId === UNMAPPED_DISPATCH_POINT_ID ? (
+                                <span className="px-2 py-0.5 rounded bg-amber-950/70 text-amber-300 border border-amber-500/40 text-[11px] font-bold">
+                                  {batch.dispatchPointName}
+                                </span>
+                              ) : (
+                                <>
+                                  {batch.dispatchPointName}{' '}
+                                  <span className="font-mono text-[10px] text-cyan-400">({batch.dispatchPointCode})</span>
+                                </>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-300 max-w-xs truncate">
+                              {batch.companyNames.length > 0 ? batch.companyNames.join(', ') : '—'}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono font-bold">{batch.totalOrders}</td>
+                            <td className="py-2.5 px-3 text-right font-mono">
+                              <span className="text-emerald-400 font-bold">{batch.dispatchedCount}</span>
+                              {batch.pendingCount > 0 && (
+                                <span className="text-amber-300"> ({batch.pendingCount} pend)</span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono">{batch.totalUnits.toLocaleString()}</td>
+                            <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400">
+                              ₹{batch.totalValue.toLocaleString('en-IN')}
+                            </td>
+                            <td className="py-2.5 px-3 text-center">
+                              {batch.status === 'FINALIZED' ? (
+                                <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold inline-flex items-center gap-1">
+                                  <CheckCircle2 size={10} /> FINALIZED
+                                </span>
+                              ) : batch.status === 'PARTIAL' ? (
+                                <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-bold">
+                                  PARTIAL
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-bold inline-flex items-center gap-1">
+                                  <Clock size={10} /> QUEUED
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-right">
+                              <button
+                                type="button"
+                                onClick={() => setExpandedBatchKey(isExpanded ? null : rowKey)}
+                                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-[11px] inline-flex items-center gap-1"
+                              >
+                                {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                                {isExpanded ? 'Hide' : 'Orders'}
+                              </button>
+                            </td>
+                          </tr>
+                          {isExpanded && (
+                            <tr className="bg-slate-950/80">
+                              <td colSpan={9} className="p-3">
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                                  {batch.orders.map((ord) => (
+                                    <div
+                                      key={ord.id}
+                                      className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between gap-2 text-[11px]"
+                                    >
+                                      <div>
+                                        <div className="font-mono font-bold text-indigo-300 flex items-center gap-1.5">
+                                          {ord.order_number}
+                                          <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 text-[9px]">
+                                            {ord.fulfillment_source === 'DEPOT_STOCK' ? 'DEPOT' : 'PO'}
+                                          </span>
+                                        </div>
+                                        <div className="text-slate-200 font-semibold">{ord.retailer_name_raw}</div>
+                                        <div className="text-[10px] text-slate-400 font-mono">
+                                          Batch Date: {getOrderEffectiveDispatchDate(ord)}
+                                          {ord.dispatched_at ? ` • Dispatched: ${ord.dispatched_at.split('T')[0]}` : ''}
+                                        </div>
+                                      </div>
+                                      <div className="text-right font-mono">
+                                        <div className="font-bold text-emerald-400">
+                                          ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                                        </div>
+                                        <span
+                                          className={`text-[9px] font-bold ${
+                                            isOrderAlreadyDispatched(ord) ? 'text-emerald-400' : 'text-amber-300'
+                                          }`}
+                                        >
+                                          {ord.status}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

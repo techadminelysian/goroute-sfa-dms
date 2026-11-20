@@ -321,7 +321,7 @@ export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
       retailer_id: null,
       retailer_name_raw: '',
       beat_name: '',
-      dispatch_point_id: 'dp_sahibabad',
+      dispatch_point_id: '',
       created_by_user_id: '',
       order_date: new Date().toISOString(),
       delivery_date: '',
@@ -403,7 +403,7 @@ export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
     retailer_id: raw.retailer_id || null,
     beat_id: raw.beat_id || undefined,
     beat_name: raw.beat_name || '',
-    dispatch_point_id: raw.dispatch_point_id || 'dp_sahibabad',
+    dispatch_point_id: raw.dispatch_point_id || '',
     billing_executive_id: raw.billing_executive_id || null,
     created_by_user_id: raw.created_by_user_id || '',
     commission_agent_id: raw.commission_agent_id || null,
@@ -432,6 +432,9 @@ export const normalizeFirestoreOrder = (docId: string, raw: any): Order => {
     split_sequence: raw.split_sequence != null ? Number(raw.split_sequence) : undefined,
     dispatched_at: raw.dispatched_at || null,
     invoiced_at: raw.invoiced_at || null,
+    confirmed_at: raw.confirmed_at || null,
+    dispatch_date: raw.dispatch_date || null,
+    dispatch_batch_id: raw.dispatch_batch_id || null,
     firestore_doc_id: docId,
   });
 };

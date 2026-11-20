@@ -53,12 +53,22 @@ import {
   AlertOctagon,
 } from 'lucide-react';
 import { CrateTrackingSection } from './CrateTrackingSection';
-import { resolveDispatchPointSupervisor } from '../../utils/dispatchRouting';
+import {
+  resolveDispatchPointSupervisor,
+  resolveOrderPrimaryDispatchPointId,
+} from '../../utils/dispatchRouting';
+import {
+  getOrderEffectiveDispatchDate,
+  getTodayISTDateString,
+  getTomorrowISTDateString,
+} from '../../utils/dispatchBatching';
 
 export const InventoryTally: React.FC = () => {
   const {
     activeTenant,
     activeTenantSettings,
+    activeRole,
+    currentUser,
     dispatchPoints,
     companies,
     skus,
@@ -71,6 +81,7 @@ export const InventoryTally: React.FC = () => {
     addStockLedgerEntry,
     updateStockLedgerAck,
     updateOrderStatus,
+    markOrdersDelivered,
     inwardPOStock,
     markNotificationAsRead,
     returnableAssetLedger,
@@ -79,11 +90,34 @@ export const InventoryTally: React.FC = () => {
     checkRetailerCrateAlert,
   } = useAppStore();
 
-  // Active Dispatch Point / Location Filter (Defaults to first DP e.g. Central Warehouse)
-  const [selectedDpId, setSelectedDpId] = useState<string>(dispatchPoints[0]?.id || 'dp_central');
+  // Active Dispatch Point / Location Filter (Defaults strictly to first configured Firestore DP)
+  const [selectedDpId, setSelectedDpId] = useState<string>(dispatchPoints[0]?.id || '');
 
-  // Module Sub-Tab View: 'SNAPSHOT' | 'INWARD' | 'OUTWARD' | 'HISTORY' | 'CRATES'
-  const [activeSubTab, setActiveSubTab] = useState<'SNAPSHOT' | 'INWARD' | 'OUTWARD' | 'HISTORY' | 'CRATES'>('SNAPSHOT');
+  useEffect(() => {
+    if (dispatchPoints.length > 0 && !dispatchPoints.some((dp) => dp.id === selectedDpId)) {
+      setSelectedDpId(dispatchPoints[0].id);
+    }
+  }, [dispatchPoints, selectedDpId]);
+
+  // Module Sub-Tab View: 'DELIVERY_ENTRY' | 'INWARD' | 'SNAPSHOT' | 'OUTWARD' | 'HISTORY' | 'CRATES'
+  const [activeSubTab, setActiveSubTab] = useState<
+    'DELIVERY_ENTRY' | 'INWARD' | 'SNAPSHOT' | 'OUTWARD' | 'HISTORY' | 'CRATES'
+  >(activeRole === 'BILLING' || activeRole === 'ORDER_PUNCHER' ? 'DELIVERY_ENTRY' : 'SNAPSHOT');
+
+  // Offline Sheet & Delivery Entry State
+  const [deliveryBatchFilter, setDeliveryBatchFilter] = useState<'ALL' | 'TOMORROW' | 'TODAY'>('ALL');
+  const [deliveryDpScope, setDeliveryDpScope] = useState<'SELECTED' | 'ALL'>('ALL');
+  const [deliverySearch, setDeliverySearch] = useState('');
+  const [selectedDeliveryIds, setSelectedDeliveryIds] = useState<string[]>([]);
+  const [deliveryProofInput, setDeliveryProofInput] = useState('');
+  const [deliveryNotesInput, setDeliveryNotesInput] = useState('');
+  const [deliveryModalOrder, setDeliveryModalOrder] = useState<Order | null>(null);
+  const [modalProofRef, setModalProofRef] = useState('');
+  const [modalDeliveredBy, setModalDeliveredBy] = useState(currentUser?.name || 'Billing Executive');
+  const [modalCratesIssued, setModalCratesIssued] = useState<number>(0);
+  const [modalCratesReturned, setModalCratesReturned] = useState<number>(0);
+  const [modalNotes, setModalNotes] = useState('');
+  const [deliveryBanner, setDeliveryBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Principle PO Inward Docking Modal State
   const [inwardingPO, setInwardingPO] = useState<any | null>(null);
@@ -194,10 +228,36 @@ export const InventoryTally: React.FC = () => {
 
   const totalVariancesCount = depotLedger.filter((st) => (st.variance_quantity || 0) !== 0).length;
 
-  // Pending Orders assigned to this Depot awaiting Hard Gate dispatch
-  const pendingDispatchOrders = orders.filter(
-    (o) => o.dispatch_point_id === selectedDpId && (o.status === 'PUNCHED' || o.status === 'APPROVED')
-  );
+  // Orders awaiting Delivery confirmation (Confirmed / Dispatched via Offline Sheet or Mobile Dispatcher)
+  const pendingDeliveryOrders = orders.filter((o) => {
+    const eligible =
+      o.status === 'CONFIRMED' ||
+      o.status === 'DISPATCHED' ||
+      o.status === 'PUNCHED_TO_PRINCIPAL' ||
+      o.status === 'PRINCIPAL_DISPATCHED' ||
+      o.status === 'APPROVED';
+    if (!eligible) return false;
+    if (deliveryDpScope === 'SELECTED' && selectedDpId) {
+      const resolvedDp = resolveOrderPrimaryDispatchPointId(o, companies, skus, dispatchPoints);
+      if (resolvedDp !== selectedDpId) return false;
+    }
+    const effDate = getOrderEffectiveDispatchDate(o);
+    if (deliveryBatchFilter === 'TOMORROW' && effDate !== getTomorrowISTDateString()) return false;
+    if (deliveryBatchFilter === 'TODAY' && effDate !== getTodayISTDateString()) return false;
+    if (deliverySearch.trim()) {
+      const q = deliverySearch.toLowerCase();
+      return (
+        o.order_number.toLowerCase().includes(q) ||
+        o.retailer_name_raw.toLowerCase().includes(q) ||
+        (o.commission_agent_name || '').toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
+
+  const recentlyDeliveredOrders = orders
+    .filter((o) => o.status === 'DELIVERED')
+    .slice(0, 8);
 
   // Filtered History Entries
   const filteredHistory = depotLedger.filter((st) => {
@@ -336,9 +396,12 @@ export const InventoryTally: React.FC = () => {
 
     addStockLedgerEntry(newEntry);
 
-    // Hard Gate logic: if linked to order, mark order DISPATCHED
+    // Hard Gate logic: if linked to order, mark order DISPATCHED (stockLedger already written above)
     if (outwardLinkedOrderId) {
-      updateOrderStatus(outwardLinkedOrderId, 'DISPATCHED');
+      updateOrderStatus(outwardLinkedOrderId, 'DISPATCHED', {
+        skipAutoStockDeduction: true,
+        preserveInvoicedStatus: true,
+      });
     }
 
     // Automatically prompt for acknowledgment handoff
@@ -377,7 +440,10 @@ export const InventoryTally: React.FC = () => {
       });
     });
 
-    updateOrderStatus(order.id, 'DISPATCHED');
+    updateOrderStatus(order.id, 'DISPATCHED', {
+      skipAutoStockDeduction: true,
+      preserveInvoicedStatus: true,
+    });
     alert(`Hard Gate Passed! Order #${order.order_number} converted to stock ledger entry & marked DISPATCHED.`);
   };
 
@@ -614,113 +680,384 @@ export const InventoryTally: React.FC = () => {
       {/* Sub-Navigation Tabs */}
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs font-semibold">
         <button
-          onClick={() => setActiveSubTab('SNAPSHOT')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${
-            activeSubTab === 'SNAPSHOT'
-              ? 'bg-blue-600 text-white font-bold shadow-md shadow-blue-900/30'
+          onClick={() => setActiveSubTab('DELIVERY_ENTRY')}
+          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
+            activeSubTab === 'DELIVERY_ENTRY'
+              ? 'bg-purple-600 text-white font-bold shadow-md shadow-purple-900/30'
               : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
           }`}
         >
-          <Layers size={15} />
-          5.1 Depot Inventory Snapshot & Hard Gate
+          <Truck size={15} />
+          Offline Sheet & Delivery Entry ({pendingDeliveryOrders.length})
         </button>
 
         <button
           onClick={() => setActiveSubTab('INWARD')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${
+          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
             activeSubTab === 'INWARD'
               ? 'bg-emerald-600 text-white font-bold shadow-md shadow-emerald-900/30'
               : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
           }`}
         >
           <ArrowDownRight size={15} />
-          5.2 (A) Log Inward Stock (Principal Arrival)
+          Inward Stock (PO Arrival & Challans)
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab('SNAPSHOT')}
+          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
+            activeSubTab === 'SNAPSHOT'
+              ? 'bg-blue-600 text-white font-bold shadow-md shadow-blue-900/30'
+              : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+          }`}
+        >
+          <Layers size={15} />
+          Depot Stock Snapshot
         </button>
 
         <button
           onClick={() => setActiveSubTab('OUTWARD')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${
+          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
             activeSubTab === 'OUTWARD'
               ? 'bg-blue-600 text-white font-bold shadow-md shadow-blue-900/30'
               : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
           }`}
         >
           <ArrowUpRight size={15} />
-          5.2 (B) Log Outward Allocation & Proof
+          Outward Allocation & Proof
         </button>
 
         <button
           onClick={() => setActiveSubTab('HISTORY')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${
+          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
             activeSubTab === 'HISTORY'
               ? 'bg-blue-600 text-white font-bold shadow-md shadow-blue-900/30'
               : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
           }`}
         >
           <FileText size={15} />
-          5.3 Movement History & Audit Trail ({depotLedger.length})
+          Movement History ({depotLedger.length})
         </button>
 
         <button
           onClick={() => setActiveSubTab('CRATES')}
-          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${
+          className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap ${
             activeSubTab === 'CRATES'
               ? 'bg-amber-600 text-white font-bold shadow-md shadow-amber-900/30'
               : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
           }`}
         >
           <Package size={15} />
-          5.4 Returnable Assets (Crates & Leakage)
+          Returnable Assets (Crates)
         </button>
       </div>
 
       {/* ------------------------------------------------------------- */}
-      {/* SUB-TAB 5.1: DEPOT INVENTORY SNAPSHOT & HARD GATE */}
+      {/* SUB-TAB: OFFLINE SHEET & DELIVERY ENTRY (BE / OFFICE STAFF) */}
       {/* ------------------------------------------------------------- */}
-      {activeSubTab === 'SNAPSHOT' && (
-        <div className="space-y-6">
-          {/* HARD GATE ORDERS PENDING DISPATCH */}
-          {pendingDispatchOrders.length > 0 && (
-            <div className="p-4 bg-slate-900 border border-blue-500/40 rounded-2xl space-y-3 shadow-sm bg-gradient-to-r from-blue-950/40 to-slate-900">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-xs font-bold text-blue-300">
-                  <ShieldCheck size={16} className="text-blue-400" />
-                  Hard Gate Dispatch Verification Active ({pendingDispatchOrders.length} Orders Awaiting Gate Entry)
-                </div>
-                <span className="text-[10px] text-slate-400">
-                  System blocks order dispatch completion until matching outward entry is created
+      {activeSubTab === 'DELIVERY_ENTRY' && (
+        <div className="space-y-5">
+          {deliveryBanner && (
+            <div
+              className={`p-3 rounded-xl border flex items-center justify-between gap-3 text-xs ${
+                deliveryBanner.type === 'success'
+                  ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+                  : 'bg-rose-950/60 border-rose-500/40 text-rose-200'
+              }`}
+            >
+              <div className="flex items-center gap-2 font-semibold">
+                <CheckCircle2 size={15} />
+                <span>{deliveryBanner.text}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeliveryBanner(null)}
+                className="text-slate-300 hover:text-white text-[11px] font-semibold"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {/* Explainer + Filter Bar */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Truck size={17} className="text-purple-400" />
+                  Offline Dispatch Sheet & Delivery Entry Queue
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Use this queue when the Dispatcher submits a completed paper Dispatch Sheet offline, or to verify deliveries before invoicing. Marking an order <strong className="text-emerald-300">DELIVERED</strong> unlocks it in <strong className="text-white">Billing &rarr; Ready to Invoice</strong>.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                <span className="px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 font-semibold">
+                  Pending Delivery: <strong className="text-amber-300">{pendingDeliveryOrders.length}</strong>
+                </span>
+                <span className="px-2.5 py-1 rounded-lg bg-emerald-950/50 border border-emerald-500/30 text-emerald-300 font-semibold">
+                  Delivered &amp; Invoice-Ready: <strong>{orders.filter((o) => o.status === 'DELIVERED').length}</strong>
                 </span>
               </div>
+            </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {pendingDispatchOrders.map((ord, idx) => (
-                  <div
-                    key={`${ord.id || ord.order_number}_${idx}`}
-                    className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between gap-3 text-xs"
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-800 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-1">
+                  {(['ALL', 'TOMORROW', 'TODAY'] as const).map((scope) => (
+                    <button
+                      key={scope}
+                      type="button"
+                      onClick={() => setDeliveryBatchFilter(scope)}
+                      className={`px-2.5 py-1 rounded text-[11px] font-semibold ${
+                        deliveryBatchFilter === scope
+                          ? 'bg-purple-600 text-white'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {scope === 'ALL' ? 'All Queued Batches' : scope === 'TOMORROW' ? 'Tomorrow (D+1)' : 'Today Dispatch'}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-1">
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryDpScope('ALL')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-semibold ${
+                      deliveryDpScope === 'ALL' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                    }`}
                   >
-                    <div>
-                      <div className="font-mono font-bold text-white flex items-center gap-2">
-                        {ord.order_number}
-                        <span className="text-[10px] font-sans text-slate-400 font-normal">
-                          ({ord.retailer_name_raw})
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-slate-400 mt-0.5">
-                        Amount: <span className="text-emerald-400 font-mono font-bold">₹{ord.total_amount.toLocaleString('en-IN')}</span> | Lines: {(ord.lines || []).length}
+                    All Dispatch Points
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryDpScope('SELECTED')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-semibold ${
+                      deliveryDpScope === 'SELECTED' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {currentDepot?.code || 'Selected DP'} Only
+                  </button>
+                </div>
+
+                <div className="relative">
+                  <Search size={13} className="absolute left-2.5 top-2 text-slate-500" />
+                  <input
+                    type="text"
+                    placeholder="Order # or Party..."
+                    value={deliverySearch}
+                    onChange={(e) => setDeliverySearch(e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-1 text-white w-48"
+                  />
+                </div>
+              </div>
+
+              {/* Bulk Paper-Sheet Delivery Action */}
+              {selectedDeliveryIds.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 bg-emerald-950/40 border border-emerald-500/40 px-3 py-1.5 rounded-xl">
+                  <span className="text-emerald-300 font-bold">
+                    {selectedDeliveryIds.length} selected
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="Sheet / Challan Ref #"
+                    value={deliveryProofInput}
+                    onChange={(e) => setDeliveryProofInput(e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-white text-[11px] w-36"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Notes (optional)"
+                    value={deliveryNotesInput}
+                    onChange={(e) => setDeliveryNotesInput(e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-white text-[11px] w-36"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const res = markOrdersDelivered({
+                        orderIds: selectedDeliveryIds,
+                        deliveredByName: currentUser?.name || 'Billing Executive',
+                        proofRef: deliveryProofInput || `SHEET-${new Date().toISOString().slice(0, 10)}`,
+                        notes: deliveryNotesInput || 'Confirmed via Offline Dispatch Sheet entry',
+                      });
+                      setDeliveryBanner({
+                        type: res.success ? 'success' : 'error',
+                        text: res.message,
+                      });
+                      if (res.success) {
+                        setSelectedDeliveryIds([]);
+                        setDeliveryProofInput('');
+                        setDeliveryNotesInput('');
+                      }
+                    }}
+                    className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] flex items-center gap-1"
+                  >
+                    <CheckCircle2 size={13} /> Mark Selected Delivered
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {pendingDeliveryOrders.length === 0 ? (
+              <div className="p-8 text-center bg-slate-950/60 border border-dashed border-slate-800 rounded-xl text-slate-400 text-xs">
+                No Confirmed or Dispatched orders currently awaiting Delivery confirmation under the selected filters.
+              </div>
+            ) : (
+              <div className="overflow-x-auto border border-slate-800 rounded-xl">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 uppercase tracking-wider font-semibold text-[10px]">
+                      <th className="py-2.5 px-3 w-8">
+                        <input
+                          type="checkbox"
+                          checked={
+                            pendingDeliveryOrders.length > 0 &&
+                            pendingDeliveryOrders.every((o) => selectedDeliveryIds.includes(o.id))
+                          }
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setSelectedDeliveryIds(pendingDeliveryOrders.map((o) => o.id));
+                            } else {
+                              setSelectedDeliveryIds([]);
+                            }
+                          }}
+                          className="rounded border-slate-700 bg-slate-900"
+                        />
+                      </th>
+                      <th className="py-2.5 px-3">Order &amp; Batch Date</th>
+                      <th className="py-2.5 px-3">Party / Channel</th>
+                      <th className="py-2.5 px-3">Dispatch Point &amp; Source</th>
+                      <th className="py-2.5 px-3 text-right">Order Value (₹)</th>
+                      <th className="py-2.5 px-3 text-center">Current Stage</th>
+                      <th className="py-2.5 px-3 text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800 text-slate-200">
+                    {pendingDeliveryOrders.map((ord) => {
+                      const dpId = resolveOrderPrimaryDispatchPointId(ord, companies, skus, dispatchPoints);
+                      const dpObj = dispatchPoints.find((d) => d.id === dpId);
+                      const effDate = getOrderEffectiveDispatchDate(ord);
+                      const checked = selectedDeliveryIds.includes(ord.id);
+
+                      return (
+                        <tr key={ord.id} className={`hover:bg-slate-800/40 ${checked ? 'bg-purple-950/20' : ''}`}>
+                          <td className="py-2.5 px-3">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setSelectedDeliveryIds((prev) => [...prev, ord.id]);
+                                } else {
+                                  setSelectedDeliveryIds((prev) => prev.filter((id) => id !== ord.id));
+                                }
+                              }}
+                              className="rounded border-slate-700 bg-slate-900"
+                            />
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <div className="font-mono font-bold text-blue-400">{ord.order_number}</div>
+                            <div className="text-[10px] text-slate-400">
+                              Dispatch Batch: <strong className="text-slate-200">{effDate}</strong> • {(ord.lines || []).length} SKUs
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <div className="font-semibold text-white">{ord.retailer_name_raw}</div>
+                            <div className="text-[10px] text-slate-400">
+                              {ord.channel} • {ord.commission_agent_name || ord.order_raiser_name || 'Direct'}
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <div className="font-semibold text-slate-200">{dpObj?.name || 'Dispatch Point'}</div>
+                            <span
+                              className={`inline-block mt-0.5 px-1.5 py-0.2 rounded text-[9px] font-bold border ${
+                                ord.fulfillment_source === 'DEPOT_STOCK'
+                                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                  : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                              }`}
+                            >
+                              {ord.fulfillment_source === 'DEPOT_STOCK' ? 'Depot Stock' : 'Principal PO'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400">
+                            ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                          </td>
+                          <td className="py-2.5 px-3 text-center">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                                ord.status === 'DISPATCHED'
+                                  ? 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+                                  : 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
+                              }`}
+                            >
+                              {ord.status}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDeliveryModalOrder(ord);
+                                setModalProofRef(`SHEET-${ord.order_number.replace('#', '')}`);
+                                setModalDeliveredBy(currentUser?.name || 'Billing Executive');
+                                setModalCratesIssued(ord.crates_issued || 0);
+                                setModalCratesReturned(ord.crates_returned || 0);
+                                setModalNotes('');
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] inline-flex items-center gap-1"
+                            >
+                              <CheckCircle2 size={12} /> Record Delivery
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Recently Delivered Orders (Unlocked for Invoicing) */}
+          {recentlyDeliveredOrders.length > 0 && (
+            <div className="bg-slate-900 border border-emerald-500/30 rounded-2xl p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-bold text-emerald-300 uppercase tracking-wider flex items-center gap-2">
+                  <CheckCircle2 size={14} /> Recently Marked Delivered (Ready in Billing &rarr; Ready to Invoice)
+                </h4>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs">
+                {recentlyDeliveredOrders.map((ord) => (
+                  <div
+                    key={ord.id}
+                    className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-mono font-bold text-white truncate">{ord.order_number}</div>
+                      <div className="text-[11px] text-slate-400 truncate">{ord.retailer_name_raw}</div>
+                      <div className="text-[10px] text-emerald-400 truncate">
+                        {ord.delivered_by ? `By ${ord.delivered_by}` : 'Delivered'}
+                        {ord.delivery_proof_ref ? ` • ${ord.delivery_proof_ref}` : ''}
                       </div>
                     </div>
-
-                    <button
-                      onClick={() => handleGateOrderDispatch(ord)}
-                      className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1 shadow-sm"
-                    >
-                      <CheckCircle2 size={14} /> Pass Gate & Dispatch
-                    </button>
+                    <div className="text-right font-mono font-bold text-emerald-400 shrink-0">
+                      ₹{(ord.total_amount || 0).toLocaleString('en-IN')}
+                    </div>
                   </div>
                 ))}
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ------------------------------------------------------------- */}
+      {/* SUB-TAB: DEPOT INVENTORY SNAPSHOT */}
+      {/* ------------------------------------------------------------- */}
+      {activeSubTab === 'SNAPSHOT' && (
+        <div className="space-y-6">
 
           {/* DEPOT LIVE STOCK TABLE PER SKU & COMPANY */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4 shadow-sm">
@@ -1859,6 +2196,127 @@ export const InventoryTally: React.FC = () => {
                 <CheckCircle2 size={15} /> Confirm Physical Inward & Update Depot Ledger
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================= */}
+      {/* MODAL 4: RECORD SINGLE ORDER DELIVERY (OFFLINE SHEET / PROOF) */}
+      {/* ============================================================= */}
+      {deliveryModalOrder && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-emerald-500/50 rounded-2xl w-full max-w-md p-6 text-slate-200 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Truck size={18} className="text-emerald-400" />
+                  Confirm Delivery — {deliveryModalOrder.order_number}
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {deliveryModalOrder.retailer_name_raw} • ₹{(deliveryModalOrder.total_amount || 0).toLocaleString('en-IN')}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeliveryModalOrder(null)}
+                className="p-1.5 text-slate-400 hover:text-white rounded-lg bg-slate-800"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const res = markOrdersDelivered({
+                  orderIds: [deliveryModalOrder.id],
+                  deliveredByName: modalDeliveredBy || currentUser?.name || 'Billing Executive',
+                  proofRef: modalProofRef,
+                  notes: modalNotes,
+                  cratesIssued: modalCratesIssued,
+                  cratesReturned: modalCratesReturned,
+                });
+                setDeliveryBanner({
+                  type: res.success ? 'success' : 'error',
+                  text: res.message,
+                });
+                setDeliveryModalOrder(null);
+              }}
+              className="space-y-3 text-xs"
+            >
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-400 mb-1 font-semibold">Delivered / Verified By</label>
+                  <input
+                    type="text"
+                    value={modalDeliveredBy}
+                    onChange={(e) => setModalDeliveredBy(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl p-2 text-white"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1 font-semibold">Sheet / Gate Pass Ref #</label>
+                  <input
+                    type="text"
+                    value={modalProofRef}
+                    onChange={(e) => setModalProofRef(e.target.value)}
+                    placeholder="e.g. SHEET-102 / POD"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl p-2 text-white font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-400 mb-1 font-semibold">Crates Issued</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={modalCratesIssued}
+                    onChange={(e) => setModalCratesIssued(Number(e.target.value) || 0)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl p-2 text-white font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1 font-semibold">Empty Crates Returned</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={modalCratesReturned}
+                    onChange={(e) => setModalCratesReturned(Number(e.target.value) || 0)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl p-2 text-white font-mono"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-400 mb-1 font-semibold">Delivery Notes / Receiver Name</label>
+                <textarea
+                  rows={2}
+                  value={modalNotes}
+                  onChange={(e) => setModalNotes(e.target.value)}
+                  placeholder="Optional delivery remarks or party receiver name..."
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl p-2 text-white"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setDeliveryModalOrder(null)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-xl"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl flex items-center gap-1.5"
+                >
+                  <CheckCircle2 size={14} /> Mark Delivered &amp; Unlock Invoice
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

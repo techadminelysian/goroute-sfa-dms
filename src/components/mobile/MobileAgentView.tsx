@@ -16,7 +16,9 @@ import {
 import {
   getDispatchPickupBreakdown,
   resolveDispatchPointIdForCompany,
-  SplitDispatchBreakdown
+  SplitDispatchBreakdown,
+  UNMAPPED_DISPATCH_POINT_ID,
+  UNMAPPED_DISPATCH_POINT_LABEL
 } from '../../utils/dispatchRouting';
 import { computeUserLiveCreditProfile, PartyCreditProfile } from '../../utils/creditLedger';
 import { fetchLivePartyCreditFromFirestore } from '../../firebase/firestoreService';
@@ -940,16 +942,17 @@ export const MobileAgentView: React.FC = () => {
       string,
       { dpId: string; dpName: string; dpCode: string; address: string; companyNames: string[]; units: number }
     >();
-    const defaultDpId = dispatchPoints[0]?.id || 'dp_central';
     (mobileCompanyGroups || []).forEach((g) => {
       const comp = (companies || []).find((c) => c.id === g.companyId);
-      const dpId = resolveDispatchPointIdForCompany(g.companyId, companies, defaultDpId);
-      const dpObj = dispatchPoints.find((d) => d.id === dpId);
+      const dpId = resolveDispatchPointIdForCompany(g.companyId, companies, dispatchPoints);
+      const dpObj = dpId !== UNMAPPED_DISPATCH_POINT_ID
+        ? dispatchPoints.find((d) => d.id === dpId)
+        : undefined;
       const units = (g.lines || []).reduce((s, l) => s + (l.quantity || 0), 0);
       const existing = dpBucketMap.get(dpId) || {
         dpId,
-        dpName: dpObj?.name || dpId,
-        dpCode: dpObj?.code || 'DP',
+        dpName: dpObj?.name || UNMAPPED_DISPATCH_POINT_LABEL,
+        dpCode: dpObj?.code || 'UNMAPPED',
         address: dpObj?.address || '',
         companyNames: [],
         units: 0,
@@ -1046,7 +1049,7 @@ export const MobileAgentView: React.FC = () => {
       {},
       activeAgent,
       users,
-      dispatchPoints[0]?.id || 'dp_central'
+      ''
     );
 
     const distinctCompanyIds = Array.from(new Set((mobileCompanyGroups || []).map((g) => g.companyId))) as string[];
@@ -1089,7 +1092,11 @@ export const MobileAgentView: React.FC = () => {
     const hasBelow = allCompiledLines.some((l) => l.is_below_cost);
 
     const assignedBEId = caMapping.billing_executive_id || activeAgent?.billing_executive_id || 'usr_billing_1';
-    const assignedDPId = caMapping.dispatch_point_id || activeAgent?.dispatch_point_id || dispatchPoints[0]?.id || 'dp_central';
+    const assignedDPId = resolveDispatchPointIdForCompany(
+      distinctCompanyIds[0] || '',
+      companies,
+      dispatchPoints
+    );
 
     const combinedOrder: Order = {
       id: orderId,
@@ -2063,13 +2070,15 @@ export const MobileAgentView: React.FC = () => {
                           const dpId = resolveDispatchPointIdForCompany(
                             group.companyId,
                             companies,
-                            dispatchPoints[0]?.id || 'dp_central'
+                            dispatchPoints
                           );
-                          const dpObj = dispatchPoints.find((d) => d.id === dpId);
+                          const dpObj = dpId !== UNMAPPED_DISPATCH_POINT_ID
+                            ? dispatchPoints.find((d) => d.id === dpId)
+                            : undefined;
                           return (
-                            <div className="text-[10px] text-cyan-300 flex items-center gap-1">
-                              <Warehouse size={10} className="text-cyan-400 shrink-0" />
-                              <span>Pickup: {dpObj ? `${dpObj.name} (${dpObj.code})` : dpId}</span>
+                            <div className={`text-[10px] flex items-center gap-1 ${dpObj ? 'text-cyan-300' : 'text-amber-300'}`}>
+                              <Warehouse size={10} className={dpObj ? 'text-cyan-400 shrink-0' : 'text-amber-400 shrink-0'} />
+                              <span>Pickup: {dpObj ? `${dpObj.name} (${dpObj.code})` : UNMAPPED_DISPATCH_POINT_LABEL}</span>
                             </div>
                           );
                         })()}
@@ -2601,18 +2610,17 @@ export const MobileAgentView: React.FC = () => {
                       >
                         <Edit2 size={12} /> Edit Lines
                       </button>
-                    ) : ord.status === 'DELIVERED' ? (
-                      <div className="py-2 rounded-xl bg-slate-800 text-slate-500 font-semibold text-[10px] flex items-center justify-center gap-1">
-                        <CheckCircle2 size={12} /> Delivered
+                    ) : ord.status === 'DELIVERED' || ord.status === 'INVOICED' ? (
+                      <div className="py-2 rounded-xl bg-slate-800 text-emerald-400 font-semibold text-[10px] flex items-center justify-center gap-1">
+                        <CheckCircle2 size={12} /> {ord.status === 'INVOICED' ? 'Invoiced' : 'Delivered'}
                       </div>
                     ) : isOrderVerifiedByBilling(ord) ? (
-                      <button
-                        onClick={() => openDeliveryModal(ord)}
-                        className="py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center justify-center gap-1 shadow-sm transition-colors"
-                        title="Billing verified! Hand over goods & log crate movements"
+                      <div
+                        className="py-2 rounded-xl bg-cyan-950/60 border border-cyan-500/30 text-cyan-300 font-semibold text-[9px] flex items-center justify-center gap-1 text-center px-1"
+                        title="Verified by Billing Executive. Dispatch & Delivery managed at Depot."
                       >
-                        <Truck size={12} /> Deliver & Crates
-                      </button>
+                        <Truck size={11} className="text-cyan-400" /> {ord.status === 'DISPATCHED' ? 'Out for Delivery' : 'In Dispatch Queue'}
+                      </div>
                     ) : (
                       <div
                         className="py-2 rounded-xl bg-slate-900 border border-slate-700/60 text-slate-400 font-semibold text-[9px] flex items-center justify-center gap-1 text-center px-1"
@@ -3533,29 +3541,19 @@ export const MobileAgentView: React.FC = () => {
                     </div>
                   </div>
                 ) : isOrderVerifiedByBilling(selectedOrderForDetail) ? (
-                  <div className="p-3.5 bg-emerald-950/30 border border-emerald-500/40 rounded-xl space-y-2.5">
-                    <div className="flex items-center justify-between text-xs font-bold text-emerald-300">
+                  <div className="p-3.5 bg-cyan-950/30 border border-cyan-500/40 rounded-xl space-y-2">
+                    <div className="flex items-center justify-between text-xs font-bold text-cyan-300">
                       <span className="flex items-center gap-1.5">
-                        <Truck size={15} className="text-emerald-400" />
-                        <span>Ready for Final Store Delivery</span>
+                        <Truck size={15} className="text-cyan-400" />
+                        <span>Verified &amp; In Dispatch Pipeline</span>
                       </span>
-                      <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded border border-emerald-500/30">
-                        Billing Verified ✓
+                      <span className="text-[10px] bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded border border-cyan-500/30">
+                        {selectedOrderForDetail.status}
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-300 leading-relaxed">
-                      Billing Executive has audited credit & verified this order. You may now hand over physical goods to the retailer and confirm delivery.
+                      Delivery confirmation and Gate Pass tracking are finalized by the Depot Dispatcher or Billing Office Desk. You can still collect store payments anytime.
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        openDeliveryModal(selectedOrderForDetail);
-                        setSelectedOrderForDetail(null);
-                      }}
-                      className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-900/40 transition-colors"
-                    >
-                      <Truck size={14} /> Mark Order Delivered & Log Crates
-                    </button>
                   </div>
                 ) : (
                   <div className="p-3.5 bg-amber-950/30 border border-amber-500/40 rounded-xl space-y-2">

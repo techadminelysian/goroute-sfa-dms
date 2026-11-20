@@ -410,17 +410,26 @@ export const BEDistributorOrdersView: React.FC<BEDistributorOrdersViewProps> = (
                             >
                               Details
                             </button>
-                            {onNavigateToBilling &&
-                              ['CONFIRMED', 'APPROVED', 'DISPATCHED', 'PUNCHED_TO_PRINCIPAL', 'INVOICED', 'DELIVERED'].includes(ord.status) && (
-                                <button
-                                  type="button"
-                                  onClick={onNavigateToBilling}
-                                  className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
-                                >
-                                  <span>Invoice</span>
-                                  <ChevronRight size={12} />
-                                </button>
-                              )}
+                            {onNavigateToBilling && ord.status === 'DELIVERED' && (
+                              <button
+                                type="button"
+                                onClick={onNavigateToBilling}
+                                className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                              >
+                                <span>Invoice Ready</span>
+                                <ChevronRight size={12} />
+                              </button>
+                            )}
+                            {onNavigateToBilling && ord.status === 'INVOICED' && (
+                              <button
+                                type="button"
+                                onClick={onNavigateToBilling}
+                                className="px-2.5 py-1 rounded bg-blue-950/60 hover:bg-blue-900/60 text-blue-300 border border-blue-800/60 text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                              >
+                                <span>View Invoice</span>
+                                <ChevronRight size={12} />
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>

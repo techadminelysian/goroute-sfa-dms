@@ -4,6 +4,11 @@ import { Order, OrderInvoicingType } from '../../types';
 import { isOrderAssignedToBE, isOrderUnassignedToAnyBE, getOrderFinancialSummary } from '../../utils/caRoutingLogic';
 import { buildPartyCreditRecords, resolveOrderCreditExposure } from '../../utils/creditLedger';
 import { isOnboardingAuthorized } from '../../utils/authClient';
+import {
+  resolveOrderPrimaryDispatchPointId,
+  UNMAPPED_DISPATCH_POINT_ID,
+  UNMAPPED_DISPATCH_POINT_LABEL,
+} from '../../utils/dispatchRouting';
 import { KPICard } from '../common/KPICard';
 import { BEDistributorOnboardingModal } from '../common/BEDistributorOnboardingModal';
 import { BEDistributorOrderPunchModal } from '../common/BEDistributorOrderPunchModal';
@@ -443,7 +448,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
       return !isVerified && !isTerminated;
     });
     const readyToInvoiceOrders = beQueueOrders.filter(
-      (o) => o.status === 'CONFIRMED' || o.status === 'APPROVED' || o.status === 'DISPATCHED' || o.status === 'PUNCHED_TO_PRINCIPAL'
+      (o) => o.status === 'DELIVERED'
     );
 
     const directBEOrders = safeOrders.filter(
@@ -510,12 +515,12 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                   </span>
                 ))
               ) : (
-                <span className="text-amber-400 italic text-[11px]">No Commission Agents currently assigned</span>
+                <span className="text-amber-400 italic text-[11px]">No Field Agents currently assigned</span>
               )}
             </div>
 
             <p className="text-[11px] text-slate-500 mt-1">
-              Showing strictly orders from your assigned Commission Agents • Accounting Sync:{' '}
+              Showing strictly orders from your assigned Field Agents • Accounting Sync:{' '}
               <span className="text-emerald-400 font-semibold">{activeTenantSettings?.accounting_integration || 'ZOHO'}</span>
             </p>
           </div>
@@ -597,9 +602,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           {pendingVerificationOrders.length === 0 ? (
             <div className="p-6 text-center text-slate-400 text-xs bg-slate-950 rounded-xl border border-slate-800 space-y-1">
               <div className="font-semibold text-slate-300">All Clear — No Pending Orders in {currentBEName}&apos;s Queue</div>
-              <p className="text-[11px] text-slate-500">
-                No orders are currently awaiting verification from assigned agents: {assignedCAs.map((a) => a.name).join(', ') || 'None'}.
-              </p>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
@@ -654,16 +656,16 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           )}
         </div>
 
-        {/* Ready to Invoice Queue */}
+        {/* Ready to Invoice Queue (Strictly DELIVERED orders) */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
           <h2 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
             <Receipt size={16} className="text-purple-400" />
-            Pending Invoicing Queue ({readyToInvoiceOrders.length} Orders in Desk Queue)
+            Ready to Invoice Queue — Delivered Orders ({readyToInvoiceOrders.length})
           </h2>
 
           {readyToInvoiceOrders.length === 0 ? (
             <div className="p-6 text-center text-slate-500 text-xs bg-slate-950 rounded-xl border border-slate-800">
-              No orders pending invoicing for {currentBEName}&apos;s assigned agents currently.
+              No delivered orders awaiting invoicing currently.
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
@@ -707,9 +709,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                   Universal BE Queue • Verification Required
                 </span>
               </div>
-              <p className="text-[11px] text-slate-400 mt-0.5">
-                B2B institutional and distributor orders punched directly with custom rates. All orders enter the Billing Executive verification queue for audit review.
-              </p>
             </div>
 
             <div className="flex items-center gap-2">
@@ -733,9 +732,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             <div className="p-6 text-center text-slate-400 text-xs bg-slate-950 rounded-xl border border-slate-800 space-y-2">
               <Building2 size={24} className="mx-auto text-slate-600" />
               <div className="font-semibold text-slate-300">No Direct Client Orders Placed Yet</div>
-              <p className="text-[11px] text-slate-500">
-                You can onboard distributors/institutions and punch direct orders without field agents.
-              </p>
               <button
                 onClick={() => {
                   setSelectedBEClientId(undefined);
@@ -838,9 +834,15 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                       r.id === selectedOrderForReview.retailer_id ||
                       r.name.toLowerCase() === selectedOrderForReview.retailer_name_raw.toLowerCase()
                   );
-                  const dpObj = safeDispatchPoints.find(
-                    (dp) => dp.id === selectedOrderForReview.dispatch_point_id
+                  const resolvedDpId = resolveOrderPrimaryDispatchPointId(
+                    selectedOrderForReview,
+                    companies,
+                    safeSkus,
+                    safeDispatchPoints
                   );
+                  const dpObj = resolvedDpId !== UNMAPPED_DISPATCH_POINT_ID
+                    ? safeDispatchPoints.find((dp) => dp.id === resolvedDpId)
+                    : undefined;
                   const agentObj = (users || []).find(
                     (u) => u.id === selectedOrderForReview.commission_agent_id
                   );
@@ -929,9 +931,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                               <span>
                                 Warehouse:{' '}
                                 <strong className="text-slate-200">
-                                  {dpObj?.name ||
-                                    selectedOrderForReview.dispatch_point_id ||
-                                    'Central Warehouse'}
+                                  {dpObj?.name || UNMAPPED_DISPATCH_POINT_LABEL}
                                 </strong>
                               </span>
                             </div>
@@ -1343,9 +1343,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             <h1 className="text-lg font-bold text-white">
               Omnichannel Order Capture & Verification Queue
             </h1>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Review and verify newly punched orders across GT, MT, E-commerce, and Institutional channels.
-            </p>
           </div>
 
           <button
@@ -1434,7 +1431,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
   // 4. DISPATCHER HOME (Mobile Field Inventory Home)
   // ---------------------------------------------------------------------------
   if (activeRole === 'DISPATCHER') {
-    const dp = dispatchPoints[0] || { name: 'Central Depot', code: 'WH-01' };
+    const dp = dispatchPoints[0] || { name: UNMAPPED_DISPATCH_POINT_LABEL, code: 'UNMAPPED' };
 
     return (
       <div className="space-y-4 max-w-md mx-auto">
@@ -1450,9 +1447,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           <h1 className="text-base font-bold text-white">
             Today's Dispatch Point Stock Snapshot
           </h1>
-          <p className="text-slate-400">
-            Log inward receipts and outward dispatch gate movements matching physical inventory.
-          </p>
         </div>
 
         {/* Stock Ledger Snapshot */}
@@ -1521,9 +1515,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
             <h1 className="text-lg font-bold text-white">
               Accountant Collections Dashboard
             </h1>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Verify payments, reconcile outstanding receivables, and audit retailer credit thresholds.
-            </p>
           </div>
 
           <button
@@ -1623,10 +1614,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
           Field Commission Agent
         </h1>
 
-        <p className="text-slate-300 text-xs">
-          Punch GT store orders directly from field visits with real-time stock and margin validation.
-        </p>
-
         <button
           onClick={() => onNavigate('orders')}
           className="w-full py-3.5 rounded-2xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-900/50 transition-all transform active:scale-95"
@@ -1690,19 +1677,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate, onOpenOnboarding
                       <Lock size={10} /> Pending Verification
                     </span>
                   ) : isVerified ? (
-                    <button
-                      onClick={() => {
-                        updateOrderStatus(ord.id, 'DELIVERED');
-                        setHomeBanner({
-                          type: 'success',
-                          message: `Order ${ord.order_number} marked as DELIVERED and Party Ledger synced.`,
-                        });
-                      }}
-                      className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] rounded-lg shadow-sm flex items-center gap-1 transition-all"
-                      title="Click to mark order delivered to store"
-                    >
-                      <Truck size={10} /> Mark Delivered
-                    </button>
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-semibold inline-flex items-center gap-1">
+                      <CheckCircle2 size={10} /> {ord.status}
+                    </span>
                   ) : (
                     <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300">
                       {ord.status}
